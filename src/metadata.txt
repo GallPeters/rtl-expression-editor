@@ -1,0 +1,19 @@
+[general]
+name=RTL Companion Editor
+qgisMinimumVersion=4.0
+qgisMaximumVersion=4.99
+description=Companion Qt editor for correct RTL rendering of QScintilla-based QGIS expression/filter editors.
+about=
+    QScintilla does not correctly render right-to-left languages such as Hebrew,
+    Arabic, Persian and Urdu. This plugin detects QGIS Expression Builder and
+    Layer Filter / Query Builder dialogs and opens a synchronized native Qt
+    plain-text editor that renders bidirectional text correctly.
+version=1.0.0
+author=RTL Companion Editor Contributors
+email=rtl-companion-editor@qgis.invalid
+tags=rtl,bidi,hebrew,arabic,persian,urdu,expression,filter,qscintilla,editor
+category=Plugins
+experimental=False
+deprecated=False
+hasProcessingProvider=no
+plugin_dependencies=
