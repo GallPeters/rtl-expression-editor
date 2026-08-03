@@ -14,7 +14,7 @@ repository=https://github.com/GallPeters/rtl-expression-editor
 # Optional metadata
 tags=rtl,hebrew,arabic,expression,filter,editor,expression 
 homepage=https://github.com/GallPeters/rtl-expression-editor
-icon=icon.svg
+icon=icon.png
 experimental=False
 deprecated=False
 hasProcessingProvider=no
