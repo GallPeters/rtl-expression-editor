@@ -2,18 +2,31 @@
 name=RTL Expression Editor
 qgisMinimumVersion=4.0
 qgisMaximumVersion=4.99
-description=Fix right-to-left (Hebrew, Arabic, and more) text rendering in QGIS expressions and filters.
-about=QGIS's built-in editor doesn't render RTL and mixed text correctly. This plugin opens a companion editor window that does — and keeps both in sync. Edit in either window; the other updates automatically.
-version=1.0
+description=Fixes right-to-left (Hebrew / Arabic) text rendering in the Expression Builder and the Layer Filter (Query) Builder by transparently overlaying the QScintilla editor with a bidi-capable Qt editor.
+about=QGIS uses QScintilla for its code editors. Scintilla has no proper Unicode bidirectional (BiDi) text support, so mixed Hebrew/English or Arabic/English expressions are rendered incorrectly - glyphs overlap and the text becomes unreadable. This plugin leaves QGIS untouched and simply covers the visible editing area of QgsCodeEditorExpression and QgsCodeEditorSQL widgets with a QPlainTextEdit, which uses Qt's full HarfBuzz/BiDi text engine. The two editors are kept in perfect two-way synchronisation, so every QGIS feature (field / function / operator insertion, validation, preview, OK/Cancel) keeps working exactly as before. Includes syntax highlighting and word completion.
+version=1.1
 author=Jossef Kanter
 email=jossefkan@gmail.com
+
+tracker=https://github.com/GallPeters/rtl-expression-editor
+repository=https://github.com/GallPeters/rtl-expression-editor
+
+# Optional metadata
+tags=rtl,hebrew,arabic,expression,filter,editor,expression 
+homepage=https://github.com/GallPeters/rtl-expression-editor
+icon=icon.svg
 experimental=False
 deprecated=False
-homepage=https://github.com/GallPeters/rtl-expression-editor
-repository=https://github.com/GallPeters/rtl-expression-editor
-tracker=https://github.com/GallPeters/rtl-expression-editor
-tags=gui, expressions, filters, texts, rtl, arabic, hebrew
-icon=icon.png
+hasProcessingProvider=no
+supportsQt6=True
+server=False
+
 changelog=
-     ** v1.0 (26.07.2026):
-          - Initial release.
+
+** v1.1 (03.08.2026):
+    - Make the RTL window match the original window's position and size exactly.
+    - Add syntax highlighting for functions and operators.
+    - Remove the Apply and Cancel buttons.
+
+** v1.0 (26.07.2026):
+    - Initial release.

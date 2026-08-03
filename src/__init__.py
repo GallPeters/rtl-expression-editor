@@ -1,19 +1,19 @@
 # -*- coding: utf-8 -*-
-
 """
-RTL Companion Editor plugin package.
+RTL / BiDi Code Editor for QGIS
+===============================
 
-This file is required by the QGIS plugin loader.
+QGIS plugin entry point.
+
+The whole implementation lives in a single module (``rtl_bidi_editor.py``) on
+purpose: the plugin is one cohesive mechanism (detect editor -> overlay it ->
+keep it in sync) and splitting it would add indirection without any
+maintenance benefit.
 """
 
 
-def classFactory(iface):
-    """
-    QGIS plugin entry point.
+def classFactory(iface):  # noqa: N802  (name mandated by the QGIS plugin API)
+    """Instantiate the plugin. Called by the QGIS plugin manager."""
+    from .rtl_bidi_editor import RtlBidiEditorPlugin
 
-    :param iface: QGIS interface object.
-    :return: Main plugin object.
-    """
-    from .plugin import RtlEditorPlugin
-
-    return RtlEditorPlugin(iface)
+    return RtlBidiEditorPlugin(iface)
