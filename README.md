@@ -2,13 +2,19 @@
 
 Fix right-to-left (Hebrew, Arabic, and more) text rendering in QGIS expressions and filters.
 
-<kbd>
-<img width="658" height="519" alt="image" src="https://github.com/user-attachments/assets/96ac66a1-4fb2-409a-b7cc-a168977c0b57" />
-</kbd>
+**Without** RTL Expression Editor:
 
 <kbd>
-<img width="658" height="519" alt="image" src="https://github.com/user-attachments/assets/94654f15-79ca-4e02-82d7-2dea135929ff" />
+<img width="566" height="452" alt="image" src="https://github.com/user-attachments/assets/e2a4cdf5-660b-4d6f-b513-570d6029dcab" />
 </kbd>
+
+**With** RTL Expression Editor:
+
+<kbd>
+<img width="566" height="449" alt="image" src="https://github.com/user-attachments/assets/48b54cee-95a3-4763-ad69-dce87587e5df" />
+</kbd>
+
+
 
 ## What it does
 
