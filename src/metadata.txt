@@ -2,8 +2,8 @@
 name=RTL Expression Editor
 qgisMinimumVersion=4.0
 qgisMaximumVersion=4.99
-description=Fixes right-to-left (Hebrew / Arabic) text rendering in the Expression Builder and the Layer Filter (Query) Builder by transparently overlaying the QScintilla editor with a bidi-capable Qt editor.
-about=QGIS uses QScintilla for its code editors. Scintilla has no proper Unicode bidirectional (BiDi) text support, so mixed Hebrew/English or Arabic/English expressions are rendered incorrectly - glyphs overlap and the text becomes unreadable. This plugin leaves QGIS untouched and simply covers the visible editing area of QgsCodeEditorExpression and QgsCodeEditorSQL widgets with a QPlainTextEdit, which uses Qt's full HarfBuzz/BiDi text engine. The two editors are kept in perfect two-way synchronisation, so every QGIS feature (field / function / operator insertion, validation, preview, OK/Cancel) keeps working exactly as before. Includes syntax highlighting and word completion.
+description=Improves right-to-left text rendering (Arabic, Hebrew, and more) in QGIS expression and layer filter builders.
+about=The built-in QGIS editor does not always display mixed right-to-left and left-to-right text correctly, causing text to become difficult to read and edit. This plugin adds an improved text editor on top of the existing QGIS editor, providing proper RTL and LTR text support while preserving all QGIS features, including field and function tools, validation, previews, and syntax highlighting. The enhanced editor works seamlessly with QGIS and stays synchronized with the original editor.
 version=1.1
 author=Jossef Kanter
 email=jossefkan@gmail.com
