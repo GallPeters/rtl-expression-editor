@@ -1,0 +1,499 @@
+# -*- coding: utf-8 -*-
+"""
+Settings storage and settings dialog for the RTL / BiDi editor plugin.
+
+This module is **purely additive**.  It knows nothing about the overlay editor
+or the Scintilla synchronisation mechanism; the editor module only ever reads
+booleans and field names from ``Settings``.  Deleting this file would leave the
+RTL editor fully functional (the editor module imports it defensively).
+
+Two pieces live here:
+
+``Settings``
+    A thin, typed facade over ``QgsSettings``.  All keys live under one prefix
+    so they are easy to find in the QGIS settings tree and easy to remove.
+
+``SettingsDialog``
+    Built in code rather than from a ``.ui`` file, to keep the plugin's file
+    count low, consistent with the existing architecture.  It uses the native
+    QGIS widgets ``QgsMapLayerComboBox`` and ``QgsFieldComboBox``, which give
+    dynamic field population and layer tracking for free.
+"""
+
+from __future__ import annotations
+
+from typing import List, Optional
+
+from qgis.PyQt.QtCore import QObject, Qt, pyqtSignal
+from qgis.PyQt.QtWidgets import (
+    QCheckBox,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
+    QGroupBox,
+    QLabel,
+    QMessageBox,
+    QVBoxLayout,
+    QWidget,
+)
+
+from qgis.core import QgsProject, QgsSettings
+
+# Native QGIS selector widgets.  Imported defensively so that a binding change
+# degrades to a clear error message instead of breaking plugin load.
+try:
+    from qgis.gui import QgsFieldComboBox, QgsMapLayerComboBox
+except ImportError:  # pragma: no cover
+    QgsFieldComboBox = None
+    QgsMapLayerComboBox = None
+
+
+#: All keys live under this prefix inside QgsSettings.
+SETTINGS_PREFIX = "plugins/rtl_bidi_editor/"
+
+
+def _log(message: str) -> None:
+    """Report a settings storage problem.
+
+    Settings failures used to be swallowed, which made a read error
+    indistinguishable from "the user has not configured anything yet". They are
+    now always reported.
+    """
+    try:
+        from qgis.core import Qgis, QgsMessageLog
+
+        QgsMessageLog.logMessage(message, "RTL BiDi Editor", Qgis.MessageLevel.Warning)
+    except Exception:
+        pass
+
+
+class _SettingsBus(QObject):
+    """Broadcasts "settings were saved" to whoever cares.
+
+    The autocomplete cache listens to this to drop stale data, and the plugin
+    listens to it to enable/disable the watcher live.  A signal keeps those
+    consumers decoupled from the dialog.
+    """
+
+    changed = pyqtSignal()
+
+
+#: Module-level singleton. Consumers connect to ``BUS.changed``.
+BUS = _SettingsBus()
+
+
+class Settings:
+    """Typed accessors for the plugin's persisted settings.
+
+    Static methods rather than an instance, because there is exactly one
+    settings store and no state worth carrying around.
+    """
+
+    # -- general ----------------------------------------------------------- #
+
+    @staticmethod
+    def _raw(key: str, default=None):
+        """Read a value with no type coercion.
+
+        Deliberately does **not** pass ``type=`` to ``QgsSettings.value()``.
+        That signature is ``value(key, defaultValue, type, section)`` and
+        supplying ``type`` as a keyword raises ``TypeError`` on several PyQGIS
+        builds.  Combined with a silent ``except``, that made every read return
+        its default while writes succeeded - settings appeared to save but never
+        came back.  Reading raw and coercing in Python avoids the whole issue.
+
+        Failures are logged rather than swallowed, so a storage problem is
+        visible instead of masquerading as "not configured".
+        """
+        try:
+            return QgsSettings().value(SETTINGS_PREFIX + key, default)
+        except Exception as exc:
+            _log(f"settings read failed for '{key}': {exc}")
+            return default
+
+    @classmethod
+    def _get_bool(cls, key: str, default: bool) -> bool:
+        """Coerce a stored value to bool.
+
+        QSettings round-trips booleans through the ini file as the strings
+        ``'true'``/``'false'``, so a raw read can return either a real bool or
+        text depending on whether the value has been through a save/reload
+        cycle.  Both are handled.
+        """
+        raw = cls._raw(key, None)
+        if raw is None:
+            return default
+        if isinstance(raw, bool):
+            return raw
+        return str(raw).strip().lower() in ("true", "1", "yes", "on")
+
+    @classmethod
+    def _get_str(cls, key: str, default: str = "") -> str:
+        raw = cls._raw(key, None)
+        if raw is None:
+            return default
+        try:
+            return str(raw)
+        except Exception:
+            return default
+
+    @staticmethod
+    def _set(key: str, value) -> None:
+        """Write a value, then verify it round-trips.
+
+        Booleans are stored as ``'true'``/``'false'`` explicitly so the stored
+        representation is identical whether it was just written or reloaded from
+        disk, which keeps ``_get_bool`` simple.
+        """
+        stored = "true" if value is True else "false" if value is False else value
+        try:
+            settings = QgsSettings()
+            settings.setValue(SETTINGS_PREFIX + key, stored)
+            settings.sync()
+            check = settings.value(SETTINGS_PREFIX + key, None)
+            if check is None:
+                _log(f"settings write for '{key}' did not persist")
+        except Exception as exc:
+            _log(f"settings write failed for '{key}': {exc}")
+
+    @classmethod
+    def dump(cls) -> None:
+        """Print the raw stored values.  Call from the Python Console.
+
+        Use this to distinguish "never saved" from "saved but unreadable":
+
+            from rtl_bidi_editor.rtl_settings import Settings; Settings.dump()
+        """
+        print("=" * 68)
+        print("RTL BiDi editor - raw stored settings")
+        print("=" * 68)
+        try:
+            settings = QgsSettings()
+            print(f"ini file : {settings.fileName()}")
+        except Exception as exc:
+            print(f"could not open QgsSettings: {exc}")
+            return
+        keys = ["enabled", "ac/enabled", "ac/layer_id"] + list(cls.FIELD_KEYS.values())
+        for key in keys:
+            full = SETTINGS_PREFIX + key
+            try:
+                raw = settings.value(full, None)
+                print(f"  {key:28s} raw={raw!r}  type={type(raw).__name__}")
+            except Exception as exc:
+                print(f"  {key:28s} READ ERROR: {exc}")
+        print("-" * 68)
+        print(f"plugin_enabled()       -> {cls.plugin_enabled()}")
+        print(f"autocomplete_enabled() -> {cls.autocomplete_enabled()}")
+        print(f"autocomplete_layer()   -> {cls.autocomplete_layer()}")
+        print(f"autocomplete_is_usable -> {cls.autocomplete_is_usable()}")
+        print("=" * 68)
+
+    @classmethod
+    def plugin_enabled(cls) -> bool:
+        """Master switch.  Defaults to True so existing installs are unchanged."""
+        return cls._get_bool("enabled", True)
+
+    @classmethod
+    def set_plugin_enabled(cls, value: bool) -> None:
+        cls._set("enabled", bool(value))
+
+    # -- custom autocomplete ---------------------------------------------- #
+
+    @classmethod
+    def autocomplete_enabled(cls) -> bool:
+        """Off by default: an opt-in feature must never change behaviour."""
+        return cls._get_bool("ac/enabled", False)
+
+    @classmethod
+    def set_autocomplete_enabled(cls, value: bool) -> None:
+        cls._set("ac/enabled", bool(value))
+
+    @classmethod
+    def layer_id(cls) -> str:
+        return cls._get_str("ac/layer_id", "")
+
+    @classmethod
+    def set_layer_id(cls, value: str) -> None:
+        cls._set("ac/layer_id", value or "")
+
+    #: Logical name -> settings key for every field selector.
+    FIELD_KEYS = {
+        "table": "ac/field_table",
+        "field_names": "ac/field_names",
+        "value": "ac/field_value",
+        "description": "ac/field_description",
+        "group_code": "ac/field_group_code",
+        "group_description": "ac/field_group_description",
+    }
+
+    @classmethod
+    def field(cls, which: str) -> str:
+        return cls._get_str(cls.FIELD_KEYS[which], "")
+
+    @classmethod
+    def set_field(cls, which: str, value: str) -> None:
+        cls._set(cls.FIELD_KEYS[which], value or "")
+
+    # -- convenience ------------------------------------------------------- #
+
+    @classmethod
+    def autocomplete_layer(cls):
+        """Resolve the configured layer, or None if it is gone from the project.
+
+        Returning None on a deleted layer is the graceful-degradation path: the
+        feature simply does nothing rather than raising.
+        """
+        layer_id = cls.layer_id()
+        if not layer_id:
+            return None
+        try:
+            return QgsProject.instance().mapLayer(layer_id)
+        except Exception:
+            return None
+
+    @classmethod
+    def autocomplete_is_usable(cls) -> tuple:
+        """Return ``(usable, reason)`` for the current configuration."""
+        if not cls.autocomplete_enabled():
+            return False, "custom autocomplete is disabled"
+        layer = cls.autocomplete_layer()
+        if layer is None:
+            return False, "configured autocomplete layer is missing from the project"
+        try:
+            available = {f.name() for f in layer.fields()}
+        except Exception:
+            return False, "autocomplete layer has no readable fields"
+        for required in ("field_names", "value"):
+            name = cls.field(required)
+            if not name:
+                return False, f"required field '{required}' is not configured"
+            if name not in available:
+                return False, f"field '{name}' no longer exists in the layer"
+        return True, ""
+
+
+class SettingsDialog(QDialog):
+    """Plugins -> RTL Text Editor -> Settings.
+
+    Layout mirrors the feature spec: a General group with the master switch,
+    then a Custom Autocomplete group whose configuration block is only enabled
+    when the feature is switched on.
+    """
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setWindowTitle("RTL Text Editor - Settings")
+        self.setMinimumWidth(480)
+
+        root = QVBoxLayout(self)
+
+        # -- General ------------------------------------------------------- #
+        general = QGroupBox("General", self)
+        general_layout = QVBoxLayout(general)
+        self.chk_enabled = QCheckBox("Enable RTL Text Editor plugin", general)
+        self.chk_enabled.setToolTip(
+            "When unchecked the plugin stays installed but inactive: no overlay "
+            "editor is created and QGIS behaves exactly as without the plugin."
+        )
+        general_layout.addWidget(self.chk_enabled)
+        root.addWidget(general)
+
+        # -- Custom Autocomplete ------------------------------------------- #
+        ac_group = QGroupBox("Custom Autocomplete", self)
+        ac_layout = QVBoxLayout(ac_group)
+
+        self.chk_ac = QCheckBox("Enable custom autocomplete source", ac_group)
+        self.chk_ac.setToolTip(
+            "Look up allowed values from a project layer and offer them with "
+            "Ctrl+Space while editing an expression or filter."
+        )
+        ac_layout.addWidget(self.chk_ac)
+
+        self.config = QWidget(ac_group)
+        form = QFormLayout(self.config)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        if QgsMapLayerComboBox is None or QgsFieldComboBox is None:
+            form.addRow(
+                QLabel(
+                    "QGIS selector widgets are unavailable in this build; "
+                    "custom autocomplete cannot be configured."
+                )
+            )
+            self.cmb_layer = None
+            self.field_combos = {}
+        else:
+            self.cmb_layer = QgsMapLayerComboBox(self.config)
+            self._apply_vector_filter(self.cmb_layer)
+            self.cmb_layer.setAllowEmptyLayer(True)
+            form.addRow("Layer", self.cmb_layer)
+
+            # (logical name, label, optional?)
+            spec = [
+                ("table", "Table Field Name", True),
+                ("field_names", "Fields Names Field Name", False),
+                ("value", "Values Code Field", False),
+                ("description", "Description Code Field", True),
+                ("group_code", "Group Code Field", True),
+                ("group_description", "Group Description Field", True),
+            ]
+            self.field_combos = {}
+            for key, label, optional in spec:
+                combo = QgsFieldComboBox(self.config)
+                combo.setAllowEmptyFieldName(True)
+                self.field_combos[key] = combo
+                form.addRow(f"{label}{'  (optional)' if optional else ''}", combo)
+
+            self.field_combos["table"].setToolTip(
+                "Field holding the table/category name. Leave empty to match "
+                "values regardless of which table is being edited."
+            )
+            self.field_combos["description"].setToolTip(
+                "Shown beside each value, e.g. 'IL (Israel)'. Only the value is "
+                "ever inserted into the expression."
+            )
+
+            self.cmb_layer.layerChanged.connect(self._on_layer_changed)
+
+        ac_layout.addWidget(self.config)
+
+        self.lbl_warning = QLabel("", ac_group)
+        self.lbl_warning.setWordWrap(True)
+        self.lbl_warning.setStyleSheet("color: #b7791f;")
+        self.lbl_warning.setVisible(False)
+        ac_layout.addWidget(self.lbl_warning)
+
+        root.addWidget(ac_group)
+        root.addStretch(1)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+            self,
+        )
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+        self.chk_ac.toggled.connect(self.config.setEnabled)
+        self.chk_enabled.toggled.connect(ac_group.setEnabled)
+
+        self._load()
+
+    # ------------------------------------------------------------------ #
+    # Helpers
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _apply_vector_filter(combo) -> None:
+        """Restrict the layer combo to vector layers across QGIS versions.
+
+        The filter enum moved between QGIS releases, so try the modern location
+        first and fall back rather than hard-failing.
+        """
+        try:
+            from qgis.core import Qgis as _Qgis
+
+            combo.setFilters(_Qgis.LayerFilter.VectorLayer)
+            return
+        except Exception:
+            pass
+        try:
+            from qgis.core import QgsMapLayerProxyModel
+
+            combo.setFilters(QgsMapLayerProxyModel.Filter.VectorLayer)
+        except Exception:
+            pass  # unfiltered is acceptable
+
+    def _on_layer_changed(self, layer) -> None:
+        """Repopulate every field selector from the newly chosen layer."""
+        for combo in self.field_combos.values():
+            try:
+                combo.setLayer(layer)
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------ #
+    # Load / save
+    # ------------------------------------------------------------------ #
+
+    def _load(self) -> None:
+        self.chk_enabled.setChecked(Settings.plugin_enabled())
+        self.chk_ac.setChecked(Settings.autocomplete_enabled())
+        self.config.setEnabled(self.chk_ac.isChecked())
+
+        if self.cmb_layer is None:
+            return
+
+        missing: List[str] = []
+        layer = Settings.autocomplete_layer()
+        if layer is not None:
+            self.cmb_layer.setLayer(layer)
+            self._on_layer_changed(layer)
+            try:
+                available = {f.name() for f in layer.fields()}
+            except Exception:
+                available = set()
+            for key, combo in self.field_combos.items():
+                saved = Settings.field(key)
+                if not saved:
+                    continue
+                if saved in available:
+                    combo.setField(saved)
+                else:
+                    # Field was deleted from the layer since we saved it.
+                    missing.append(f"{key} -> '{saved}'")
+        elif Settings.layer_id():
+            missing.append("the configured layer is no longer in this project")
+
+        if missing:
+            self.lbl_warning.setText(
+                "Some saved settings could not be restored: "
+                + "; ".join(missing)
+                + ". Please reselect them."
+            )
+            self.lbl_warning.setVisible(True)
+
+    def _on_accept(self) -> None:
+        """Validate, then persist and broadcast."""
+        if self.chk_ac.isChecked() and self.cmb_layer is not None:
+            layer = self.cmb_layer.currentLayer()
+            if layer is None:
+                self._complain("Select the layer that holds the autocomplete definitions.")
+                return
+            for key, label in (
+                ("field_names", "Fields Names Field Name"),
+                ("value", "Values Code Field"),
+            ):
+                if not self.field_combos[key].currentField():
+                    self._complain(f"'{label}' is required.")
+                    return
+            # Grouping only makes sense with both halves configured; warn rather
+            # than block, since a partial choice is harmless (grouping is simply
+            # not applied).
+            has_code = bool(self.field_combos["group_code"].currentField())
+            has_desc = bool(self.field_combos["group_description"].currentField())
+            if has_code != has_desc:
+                QMessageBox.information(
+                    self,
+                    "Grouping incomplete",
+                    "Grouping uses both the Group Code Field and the Group "
+                    "Description Field. With only one set, results will be shown "
+                    "ungrouped.",
+                )
+
+        self._save()
+        BUS.changed.emit()
+        self.accept()
+
+    def _complain(self, message: str) -> None:
+        QMessageBox.warning(self, "Incomplete settings", message)
+
+    def _save(self) -> None:
+        Settings.set_plugin_enabled(self.chk_enabled.isChecked())
+        Settings.set_autocomplete_enabled(self.chk_ac.isChecked())
+        if self.cmb_layer is None:
+            return
+        layer = self.cmb_layer.currentLayer()
+        Settings.set_layer_id(layer.id() if layer is not None else "")
+        for key, combo in self.field_combos.items():
+            Settings.set_field(key, combo.currentField())

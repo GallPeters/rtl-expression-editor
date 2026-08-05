@@ -67,7 +67,13 @@ from qgis.PyQt.QtGui import (
     QTextCursor,
     QTextOption,
 )
-from qgis.PyQt.QtWidgets import QApplication, QCompleter, QPlainTextEdit, QWidget
+from qgis.PyQt.QtWidgets import (
+    QApplication,
+    QCompleter,
+    QPlainTextEdit,
+    QTextEdit,
+    QWidget,
+)
 
 from qgis.core import Qgis, QgsExpression, QgsMessageLog
 
@@ -90,6 +96,21 @@ try:
     from qgis.PyQt.Qsci import QsciScintillaBase
 except ImportError:  # pragma: no cover
     QsciScintillaBase = None
+
+# Optional feature modules (settings + custom autocomplete).  Imported
+# defensively: if either file is missing or fails to import, the RTL editor
+# keeps working exactly as before with the new features simply absent.
+try:
+    from .rtl_settings import BUS as SETTINGS_BUS, Settings, SettingsDialog
+except Exception:  # pragma: no cover
+    SETTINGS_BUS = None
+    Settings = None
+    SettingsDialog = None
+
+try:
+    from .rtl_autocomplete import CustomAutocompleteController
+except Exception:  # pragma: no cover
+    CustomAutocompleteController = None
 
 
 # --------------------------------------------------------------------------- #
@@ -387,6 +408,218 @@ class BidiSyntaxHighlighter(QSyntaxHighlighter):
 # --------------------------------------------------------------------------- #
 
 
+class BracketMatcher(QObject):
+    """Highlights the bracket pair under the caret, like any code editor.
+
+    Complements ``BidiSyntaxHighlighter`` rather than extending it: a
+    ``QSyntaxHighlighter`` colours text per block from the text alone, but
+    bracket matching depends on the *caret*, which the highlighter never sees.
+    The right Qt mechanism is ``QPlainTextEdit.setExtraSelections()``, which
+    paints on top of the document.
+
+    That choice matters for safety: extra selections do **not** modify the
+    document, so no ``textChanged`` is emitted and the overlay -> Scintilla
+    synchronisation is not involved at all.
+
+    Brackets inside string literals, quoted field names and comments are
+    skipped, so ``'a (b'`` does not throw the nesting count off.
+    """
+
+    #: Opening bracket -> its closer.
+    PAIRS = {"(": ")", "[": "]", "{": "}"}
+    CLOSERS = {v: k for k, v in PAIRS.items()}
+
+    #: Above this document size matching is skipped. Expressions and filters are
+    #: far smaller; this only guards against a pathological paste.
+    MAX_CHARS = 200_000
+
+    def __init__(self, editor: QPlainTextEdit):
+        super().__init__(editor)
+        self._editor = editor
+        self._mask_text: Optional[str] = None
+        self._mask: Optional[bytearray] = None
+        self._build_formats()
+        try:
+            editor.cursorPositionChanged.connect(self.refresh)
+            editor.textChanged.connect(self.refresh)
+        except Exception as exc:
+            _log(f"Bracket matching unavailable: {exc}", Qgis.MessageLevel.Info)
+
+    # -- appearance -------------------------------------------------------- #
+
+    def _build_formats(self) -> None:
+        """Colours from the active QGIS code-editor scheme, with fallbacks.
+
+        The fallbacks are deliberately strong colours rather than subtle ones: a
+        scheme role that resolves to something near the editor background would
+        make the highlight invisible, which is indistinguishable from the feature
+        not working at all.
+        """
+        matched_bg = _scheme_color("MatchedBraceBackground", "#b4eeb4")
+        # Guard against a scheme whose matched-brace colour is (nearly) the same
+        # as the editor background, which would render the highlight invisible.
+        background = _scheme_color("Background", "#ffffff")
+        if abs(matched_bg.lightness() - background.lightness()) < 12:
+            matched_bg = QColor("#78d878" if background.lightness() > 128 else "#2f6f2f")
+
+        self._matched = QTextCharFormat()
+        self._matched.setBackground(matched_bg)
+        self._matched.setForeground(_scheme_color("MatchedBraceForeground", "#000000"))
+        self._matched.setFontWeight(QFont.Weight.Bold)
+
+        self._unmatched = QTextCharFormat()
+        self._unmatched.setBackground(_scheme_color("ErrorBackground", "#ffb0b0"))
+        self._unmatched.setForeground(_scheme_color("Error", "#800000"))
+        self._unmatched.setFontWeight(QFont.Weight.Bold)
+
+    # -- literal masking --------------------------------------------------- #
+
+    def _literal_mask(self, text: str) -> bytearray:
+        """Byte per character: 1 where a bracket must be ignored.
+
+        Cached against the text it was built from, so moving the caret around an
+        unchanged document costs nothing.
+        """
+        if text == self._mask_text and self._mask is not None:
+            return self._mask
+
+        n = len(text)
+        mask = bytearray(n)
+        i = 0
+        while i < n:
+            ch = text[i]
+            if ch == "'":  # string literal
+                j = i + 1
+                while j < n and text[j] != "'":
+                    if text[j] == "\\":
+                        j += 1
+                    j += 1
+                end = min(j + 1, n)
+                for k in range(i, end):
+                    mask[k] = 1
+                i = end
+                continue
+            if ch == '"':  # quoted identifier / field name
+                j = i + 1
+                while j < n and text[j] != '"':
+                    j += 1
+                end = min(j + 1, n)
+                for k in range(i, end):
+                    mask[k] = 1
+                i = end
+                continue
+            if ch == "-" and i + 1 < n and text[i + 1] == "-":  # line comment
+                j = text.find("\n", i)
+                end = n if j == -1 else j
+                for k in range(i, end):
+                    mask[k] = 1
+                i = end
+                continue
+            if ch == "/" and i + 1 < n and text[i + 1] == "*":  # block comment
+                j = text.find("*/", i + 2)
+                end = n if j == -1 else j + 2
+                for k in range(i, end):
+                    mask[k] = 1
+                i = end
+                continue
+            i += 1
+
+        self._mask_text = text
+        self._mask = mask
+        return mask
+
+    # -- matching ---------------------------------------------------------- #
+
+    def _find_match(self, text: str, index: int, bracket: str) -> int:
+        """Index of the partner bracket, or -1 when unbalanced."""
+        mask = self._literal_mask(text)
+        if bracket in self.PAIRS:
+            partner, step = self.PAIRS[bracket], 1
+        else:
+            partner, step = self.CLOSERS[bracket], -1
+
+        depth = 0
+        i = index
+        n = len(text)
+        while 0 <= i < n:
+            if not mask[i]:
+                ch = text[i]
+                if ch == bracket:
+                    depth += 1
+                elif ch == partner:
+                    depth -= 1
+                    if depth == 0:
+                        return i
+            i += step
+        return -1
+
+    def refresh(self) -> None:
+        """Recompute the highlight for the current caret position."""
+        editor = self._editor
+        if editor is None:
+            return
+        try:
+            text = editor.toPlainText()
+            if len(text) > self.MAX_CHARS:
+                editor.setExtraSelections([])
+                return
+
+            position = editor.textCursor().position()
+            mask = self._literal_mask(text)
+
+            # Probe the character at the caret first, then the one before it -
+            # the convention every editor uses, so a caret sitting just past a
+            # closing bracket still highlights the pair.
+            for probe in (position, position - 1):
+                if not (0 <= probe < len(text)) or mask[probe]:
+                    continue
+                ch = text[probe]
+                if ch not in self.PAIRS and ch not in self.CLOSERS:
+                    continue
+                partner = self._find_match(text, probe, ch)
+                selections = [self._selection(probe, partner >= 0)]
+                if partner >= 0:
+                    selections.append(self._selection(partner, True))
+                editor.setExtraSelections(selections)
+                return
+
+            editor.setExtraSelections([])
+        except Exception as exc:
+            _log(f"Bracket matching failed: {exc}", Qgis.MessageLevel.Info)
+
+    def _selection(self, index: int, matched: bool):
+        """One-character extra selection at ``index``."""
+        selection = QTextEdit.ExtraSelection()
+        cursor = QTextCursor(self._editor.document())
+        cursor.setPosition(index)
+        cursor.movePosition(
+            QTextCursor.MoveOperation.Right, QTextCursor.MoveMode.KeepAnchor, 1
+        )
+        selection.cursor = cursor
+        selection.format = self._matched if matched else self._unmatched
+        return selection
+
+    def teardown(self) -> None:
+        """Disconnect and clear; safe to call more than once."""
+        editor, self._editor = self._editor, None
+        if editor is None:
+            return
+        for signal_name in ("cursorPositionChanged", "textChanged"):
+            try:
+                getattr(editor, signal_name).disconnect(self.refresh)
+            except Exception:
+                pass
+        try:
+            editor.setExtraSelections([])
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------------------- #
+# The overlay editor
+# --------------------------------------------------------------------------- #
+
+
 class RtlOverlayEditor(QPlainTextEdit):
     """A bidi-capable editor that covers - and mirrors - a ``QgsCodeEditor``.
 
@@ -463,6 +696,32 @@ class RtlOverlayEditor(QPlainTextEdit):
         self._sync_geometry()
         self.show()
         self.raise_()
+
+        # --- matching-bracket highlighting --------------------------------
+        # Paints via setExtraSelections(), which does not modify the document,
+        # so no textChanged is emitted and synchronisation is unaffected.
+        self._bracket_matcher = None
+        try:
+            self._bracket_matcher = BracketMatcher(self)
+            self._bracket_matcher.refresh()
+        except Exception as exc:
+            self._bracket_matcher = None
+            _log(f"Bracket matching unavailable: {exc}", Qgis.MessageLevel.Info)
+
+        # --- optional feature: custom autocomplete source -----------------
+        # Added last, after the editor is fully wired, so a failure here can
+        # never affect synchronisation, geometry or rendering.  The controller
+        # only installs an event filter (for Ctrl+Space) and inserts text via
+        # QTextCursor, so the existing sync path carries its edits unchanged.
+        self._custom_autocomplete = None
+        if CustomAutocompleteController is not None:
+            try:
+                self._custom_autocomplete = CustomAutocompleteController(self)
+            except Exception as exc:
+                self._custom_autocomplete = None
+                _log(
+                    f"Custom autocomplete unavailable: {exc}", Qgis.MessageLevel.Info
+                )
 
     # ------------------------------------------------------------------ #
     # Setup
@@ -849,6 +1108,22 @@ class RtlOverlayEditor(QPlainTextEdit):
         if self._detached:
             return
         self._detached = True
+        # Optional feature teardown first, so it can never interfere with the
+        # existing restore sequence below.
+        controller = getattr(self, "_custom_autocomplete", None)
+        if controller is not None:
+            try:
+                controller.teardown()
+            except Exception:
+                pass
+            self._custom_autocomplete = None
+        matcher = getattr(self, "_bracket_matcher", None)
+        if matcher is not None:
+            try:
+                matcher.teardown()
+            except Exception:
+                pass
+            self._bracket_matcher = None
         try:
             self._disconnect_signals()
         except Exception:
@@ -913,6 +1188,11 @@ class CodeEditorWatcher(QObject):
         """
         app = QApplication.instance()
         if app is None:
+            return
+        # Master switch (Settings -> General).  Default is enabled, so an
+        # existing install behaves identically to before this feature existed.
+        if Settings is not None and not Settings.plugin_enabled():
+            _log("RTL / BiDi editor is disabled in settings.", Qgis.MessageLevel.Info)
             return
         app.installEventFilter(self)
         try:
@@ -1218,21 +1498,82 @@ def overlay_count() -> int:
 class RtlBidiEditorPlugin:
     """QGIS plugin lifecycle.
 
-    Deliberately headless: there is no menu entry, no toolbar button and no
-    dialog.  The requirement is that the user never has to enable or disable
-    anything, so the plugin is active for as long as it is installed.
+    The editor itself remains headless - no toolbar button, and the overlay
+    still appears with no user action.  The only UI is a Settings entry under
+    Plugins -> RTL Text Editor, added for the optional features; the RTL editor
+    keeps working with default settings if it is never opened.
     """
+
+    MENU_TITLE = "&RTL Text Editor"
 
     def __init__(self, iface):
         self.iface = iface
         self._watcher: Optional[CodeEditorWatcher] = None
+        self._settings_action = None
+
+    # -- optional feature: settings UI ----------------------------------- #
+
+    def _add_menu(self) -> None:
+        """Plugins -> RTL Text Editor -> Settings."""
+        if SettingsDialog is None:
+            return
+        try:
+            from qgis.PyQt.QtWidgets import QAction
+
+            self._settings_action = QAction("Settings...", self.iface.mainWindow())
+            self._settings_action.setObjectName("rtlBidiSettingsAction")
+            self._settings_action.triggered.connect(self.open_settings)
+            self.iface.addPluginToMenu(self.MENU_TITLE, self._settings_action)
+        except Exception as exc:
+            self._settings_action = None
+            _log(f"Could not add settings menu: {exc}", Qgis.MessageLevel.Info)
+
+    def _remove_menu(self) -> None:
+        if self._settings_action is None:
+            return
+        try:
+            self.iface.removePluginMenu(self.MENU_TITLE, self._settings_action)
+        except Exception:
+            pass
+        self._settings_action = None
+
+    def open_settings(self) -> None:
+        if SettingsDialog is None:
+            return
+        try:
+            SettingsDialog(self.iface.mainWindow()).exec()
+        except Exception as exc:
+            _log(f"Settings dialog failed: {exc}", Qgis.MessageLevel.Warning)
+
+    def apply_settings(self) -> None:
+        """React to the master switch being toggled, without a restart.
+
+        Enabling re-installs the watcher; disabling detaches every live overlay,
+        which restores the original Scintilla editors through the existing
+        detach() path.
+        """
+        if Settings is None or self._watcher is None:
+            return
+        try:
+            if Settings.plugin_enabled():
+                self._watcher.install()  # idempotent
+            else:
+                self._watcher.uninstall()
+                _log("RTL / BiDi editor disabled.", Qgis.MessageLevel.Info)
+        except Exception as exc:
+            _log(f"Could not apply settings: {exc}", Qgis.MessageLevel.Warning)
+
+    # -- lifecycle -------------------------------------------------------- #
 
     def initGui(self) -> None:  # noqa: N802 (QGIS plugin API)
         global _WATCHER
         try:
+            self._add_menu()
             self._watcher = CodeEditorWatcher()
             _WATCHER = self._watcher
             self._watcher.install()
+            if SETTINGS_BUS is not None:
+                SETTINGS_BUS.changed.connect(self.apply_settings)
             _log("RTL / BiDi editor active.", Qgis.MessageLevel.Success)
             _dbg(
                 f"watching editor classes {sorted(TARGET_EDITOR_CLASSES)}; "
@@ -1244,6 +1585,12 @@ class RtlBidiEditorPlugin:
     def unload(self) -> None:
         global _WATCHER
         _WATCHER = None
+        if SETTINGS_BUS is not None:
+            try:
+                SETTINGS_BUS.changed.disconnect(self.apply_settings)
+            except Exception:
+                pass
+        self._remove_menu()
         if self._watcher is None:
             return
         try:
