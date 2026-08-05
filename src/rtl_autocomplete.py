@@ -629,18 +629,34 @@ class AutocompleteCache(QObject):
             # than that failure mode. `wanted` is kept for diagnostics.
             _ = wanted
 
+            # Deduplicate on the whole entry, not on the value alone.
+            #
+            # A value is legitimately allowed to repeat under different groups or
+            # with a different description - e.g. code 610 meaning 'mosque' in
+            # group 2300 and 'greenhouse' in group 2301. Keying only on the value
+            # discarded the second row, and where that row was a group's only
+            # member the entire group disappeared from the popup.
+            #
+            # Using the full tuple still collapses genuinely identical rows,
+            # which is all the dedup was ever meant to do.
             seen = set()
             for feature in layer.getFeatures(request):
                 value = self._as_text(feature, f_value)
-                if not value or value in seen:
+                if not value:
                     continue
-                seen.add(value)
+                description = self._as_text(feature, f_desc)
+                group_code = self._as_text(feature, f_gcode)
+                group_description = self._as_text(feature, f_gdesc)
+                key = (value, description, group_code, group_description)
+                if key in seen:
+                    continue
+                seen.add(key)
                 entries.append(
                     AutocompleteEntry(
                         value=value,
-                        description=self._as_text(feature, f_desc),
-                        group_code=self._as_text(feature, f_gcode),
-                        group_description=self._as_text(feature, f_gdesc),
+                        description=description,
+                        group_code=group_code,
+                        group_description=group_description,
                     )
                 )
                 if len(entries) >= QUERY_LIMIT:
