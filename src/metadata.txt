@@ -3,14 +3,7 @@ name=RTL Expression Editor
 qgisMinimumVersion=4.0
 qgisMaximumVersion=4.99
 description=Fixes RTL (right-to-left) text rendering in QGIS expression and layer filter builders.
-about=QGIS's built-in editor (QScintilla) does not display RTL (right-to-left) text correctly, especially when it is mixed with LTR (left-to-right) text, making expressions and layer filters difficult to read and edit.
-
-This plugin places an enhanced editor directly above the original one. The enhanced editor renders mixed RTL and LTR text correctly while remaining fully synchronized with the original editor beneath it. This preserves all existing QGIS functionality, including field and function tools, validation, value previews, syntax highlighting, and more.
-
-The plugin also provides an optional advanced auto-complete system. You can configure a project layer and its fields as the source of allowed values, along with optional value descriptions, groups, and group descriptions. The suggestions automatically adapt to the field being queried and the current layer.
-
-When a custom auto-complete source is configured, an optional Read Mode slider button becomes available. Read Mode displays value descriptions instead of stored codes, making expressions much easier to understand. If the same code has different descriptions in different groups, the selected description is saved in the project and restored automatically, ensuring Read Mode always displays the correct description.
-
+about=QGIS's built-in editor (QScintilla) does not display RTL (right-to-left) text correctly, especially when it is mixed with LTR (left-to-right) text, making expressions and layer filters difficult to read and edit. This plugin places an enhanced editor directly above the original one. The enhanced editor renders mixed RTL and LTR text correctly while remaining fully synchronized with the original editor beneath it. This preserves all existing QGIS functionality, including field and function tools, validation, value previews, syntax highlighting, and more. The plugin also provides an optional advanced auto-complete system. You can configure a project layer and its fields as the source of allowed values, along with optional value descriptions, groups, and group descriptions. The suggestions automatically adapt to the field being queried and the current layer. When a custom auto-complete source is configured, an optional Read Mode slider button becomes available. Read Mode displays value descriptions instead of stored codes, making expressions much easier to understand. If the same code has different descriptions in different groups, the selected description is saved in the project and restored automatically, ensuring Read Mode always displays the correct description.
 version=1.2
 author=Jossef Kanter
 email=jossefkan@gmail.com
