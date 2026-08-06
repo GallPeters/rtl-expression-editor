@@ -64,6 +64,8 @@ _SQ_STRING_RE = re.compile(r"'(?:[^'\\\n]|\\.)*'")
 
 #: Roles used to carry the insertable value on popup items.
 VALUE_ROLE = int(Qt.ItemDataRole.UserRole) + 1
+#: Description carried alongside the value, for remembering the user's choice.
+DESC_ROLE = int(Qt.ItemDataRole.UserRole) + 2
 
 
 #: Diagnostic logging for the Ctrl+Space path.
@@ -475,6 +477,55 @@ class AutocompleteCache(QObject):
         self._memo[key] = entries
         return entries
 
+    def lookup_field_names(self, table_candidates: Sequence[str]) -> List[str]:
+        """Distinct values of the Fields Names column for this table context.
+
+        Powers field-name completion: the user types a quote and gets the list
+        of fields that actually have definitions, instead of having to remember
+        them. Memoised under a reserved key alongside the value lookups.
+        """
+        usable, _ = Settings.autocomplete_is_usable()
+        if not usable:
+            return []
+        self._sync_layer_hooks()
+
+        key = ("\x00field-names", "|".join(sorted(t.lower() for t in table_candidates)))
+        cached = self._memo.get(key)
+        if cached is not None:
+            return [entry.value for entry in cached]
+
+        layer = Settings.autocomplete_layer()
+        f_names = Settings.field("field_names")
+        f_table = Settings.field("table")
+        names: List[str] = []
+        seen = set()
+        try:
+            request = QgsFeatureRequest()
+            if f_table and table_candidates:
+                column = QgsExpression.quotedColumnRef(f_table)
+                ors = " OR ".join(
+                    f"lower(trim({column})) = {QgsExpression.quotedString(t.lower())}"
+                    for t in table_candidates
+                )
+                request.setFilterExpression(ors)
+            request.setLimit(QUERY_LIMIT)
+            try:
+                request.setFlags(QgsFeatureRequest.Flag.NoGeometry)
+            except Exception:
+                pass
+            for feature in layer.getFeatures(request):
+                value = self._as_text(feature, f_names)
+                if value and value.lower() not in seen:
+                    seen.add(value.lower())
+                    names.append(value)
+        except Exception as exc:
+            _dbg(f"Field-name lookup failed: {exc}")
+            return []
+
+        names.sort(key=str.lower)
+        self._memo[key] = [AutocompleteEntry(value=n) for n in names]
+        return names
+
     def _query(self, field_name: str, table_candidates: Sequence[str]) -> List[AutocompleteEntry]:
         """Run up to four increasingly permissive passes until one finds rows.
 
@@ -744,6 +795,7 @@ class AutocompletePopup(QListWidget):
                 self.addItem(self._make_header(current_group or "Ungrouped"))
             item = QListWidgetItem(("    " if grouped else "") + entry.display)
             item.setData(VALUE_ROLE, entry.value)
+            item.setData(DESC_ROLE, entry.description)
             if entry.description:
                 item.setToolTip(entry.description)
             self.addItem(item)
@@ -859,6 +911,8 @@ class CustomAutocompleteController(QObject):
         self._popup: Optional[AutocompletePopup] = None
         self._entries: List[AutocompleteEntry] = []
         self._field_name = ""
+        #: True while the popup lists field names rather than values.
+        self._field_mode = False
         #: True while a key event is being re-sent to the editor, to stop the
         #: editor branch of eventFilter from re-entering the popup handler.
         self._forwarding = False
@@ -1182,6 +1236,18 @@ class CustomAutocompleteController(QObject):
             return
 
         text_before = editor.toPlainText()[: editor.textCursor().position()]
+
+        # Field-name mode: the caret sits inside an unterminated double quote,
+        # i.e. the user typed `"` (optionally followed by a partial name) and
+        # wants to know which fields have definitions. Detected by quote parity
+        # on the string-scrubbed text - the same test detect_field_name() uses.
+        scrubbed = _SQ_STRING_RE.sub(
+            lambda m: " " * (m.end() - m.start()), text_before
+        )
+        if scrubbed.count('"') % 2 == 1:
+            self._offer_field_names()
+            return
+
         field_name = detect_field_name(text_before)
         if not field_name:
             self._notice('Place the caret after a quoted field, e.g. "NAME" = ')
@@ -1194,6 +1260,7 @@ class CustomAutocompleteController(QObject):
         # override cursor is a classic source of stuck-cursor artefacts.
         self._entries = cache().lookup(field_name, tables)
         self._field_name = field_name
+        self._field_mode = False
 
         if not self._entries:
             if Settings.field("table") and not tables:
@@ -1208,6 +1275,29 @@ class CustomAutocompleteController(QObject):
                 )
             return
 
+        self._refilter(show=True)
+
+    def _offer_field_names(self) -> None:
+        """Populate the popup with field names rather than values."""
+        editor = self._editor
+        sci = getattr(editor, "_sci", None)
+        tables = resolve_table_candidates(sci if sci is not None else editor)
+
+        try:
+            names = cache().lookup_field_names(tables)
+        except Exception as exc:
+            _dbg(f"Field-name lookup raised: {exc}")
+            names = []
+
+        if not names:
+            self._notice(
+                "No field names defined"
+                + (f" for table '{tables[0]}'" if tables else "")
+            )
+            return
+
+        self._field_mode = True
+        self._entries = [AutocompleteEntry(value=n) for n in names]
         self._refilter(show=True)
 
     def _notice(self, text: str) -> None:
@@ -1290,6 +1380,13 @@ class CustomAutocompleteController(QObject):
         if self._popup is None:
             return
         value = self._popup.current_value()
+        chosen_description = ""
+        try:
+            item = self._popup.currentItem()
+            if item is not None:
+                chosen_description = str(item.data(DESC_ROLE) or "")
+        except Exception:
+            pass
         self.hide_popup()
         if not value or self._editor is None:
             return
@@ -1306,9 +1403,36 @@ class CustomAutocompleteController(QObject):
                 QTextCursor.MoveMode.KeepAnchor,
                 token_len,
             )
+        # In field-name mode, close the quote for the user unless one is already
+        # sitting to the right of the caret - the same courtesy every editor
+        # extends when completing a bracketed or quoted token.
+        if self._field_mode:
+            text = self._editor.toPlainText()
+            after = text[cursor.position():cursor.position() + 1]
+            if after != '"':
+                value = value + '"'
+
         cursor.insertText(value)
         cursor.endEditBlock()
         self._editor.setTextCursor(cursor)
+
+        # Record which meaning was chosen, so read mode can resolve a code that
+        # has several. Stores the choice, not a copy of the expression - see
+        # ChoiceMemory for why that distinction matters.
+        if not self._field_mode and chosen_description:
+            try:
+                from .rtl_readmode import ChoiceMemory
+
+                sci = getattr(self._editor, "_sci", None)
+                tables = resolve_table_candidates(sci if sci is not None else self._editor)
+                ChoiceMemory.remember(
+                    tables[0] if tables else "",
+                    self._field_name,
+                    value,
+                    chosen_description,
+                )
+            except Exception as exc:
+                _dbg(f"Could not remember choice: {exc}")
 
     def hide_popup(self) -> None:
         """Close the list and hand the caret back to the editor."""

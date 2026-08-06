@@ -27,6 +27,7 @@ from typing import List, Optional
 from qgis.PyQt.QtCore import QObject, Qt, pyqtSignal
 from qgis.PyQt.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -173,7 +174,12 @@ class Settings:
         except Exception as exc:
             print(f"could not open QgsSettings: {exc}")
             return
-        keys = ["enabled", "ac/enabled", "ac/layer_id"] + list(cls.FIELD_KEYS.values())
+        keys = [
+            "enabled",
+            "ac/enabled",
+            "ac/layer_id",
+            "ac/default_read_mode",
+        ] + list(cls.FIELD_KEYS.values())
         for key in keys:
             full = SETTINGS_PREFIX + key
             try:
@@ -235,6 +241,19 @@ class Settings:
         cls._set(cls.FIELD_KEYS[which], value or "")
 
     # -- convenience ------------------------------------------------------- #
+
+    @classmethod
+    def default_read_mode(cls) -> bool:
+        """Whether the editor opens in description (read-only) mode.
+
+        Defaults to False - edit mode - so the editor behaves exactly as before
+        for anyone who does not opt in.
+        """
+        return cls._get_bool("ac/default_read_mode", False)
+
+    @classmethod
+    def set_default_read_mode(cls, value: bool) -> None:
+        cls._set("ac/default_read_mode", bool(value))
 
     @classmethod
     def autocomplete_layer(cls):
@@ -355,6 +374,15 @@ class SettingsDialog(QDialog):
 
             self.cmb_layer.layerChanged.connect(self._on_layer_changed)
 
+        self.cmb_mode = QComboBox(self.config)
+        self.cmb_mode.addItem("Edit mode (show codes)", False)
+        self.cmb_mode.addItem("Read mode (show descriptions)", True)
+        self.cmb_mode.setToolTip(
+            "Mode the editor starts in. The in-editor switch changes it at any "
+            "time; the saved expression always keeps the original codes."
+        )
+        form.addRow("Default editor mode", self.cmb_mode)
+
         ac_layout.addWidget(self.config)
 
         self.lbl_warning = QLabel("", ac_group)
@@ -419,6 +447,11 @@ class SettingsDialog(QDialog):
     def _load(self) -> None:
         self.chk_enabled.setChecked(Settings.plugin_enabled())
         self.chk_ac.setChecked(Settings.autocomplete_enabled())
+        try:
+            index = self.cmb_mode.findData(Settings.default_read_mode())
+            self.cmb_mode.setCurrentIndex(max(0, index))
+        except Exception:
+            pass
         self.config.setEnabled(self.chk_ac.isChecked())
 
         if self.cmb_layer is None:
@@ -491,6 +524,10 @@ class SettingsDialog(QDialog):
     def _save(self) -> None:
         Settings.set_plugin_enabled(self.chk_enabled.isChecked())
         Settings.set_autocomplete_enabled(self.chk_ac.isChecked())
+        try:
+            Settings.set_default_read_mode(bool(self.cmb_mode.currentData()))
+        except Exception:
+            pass
         if self.cmb_layer is None:
             return
         layer = self.cmb_layer.currentLayer()

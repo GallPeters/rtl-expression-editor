@@ -112,6 +112,11 @@ try:
 except Exception:  # pragma: no cover
     CustomAutocompleteController = None
 
+try:
+    from .rtl_readmode import ReadModeController
+except Exception:  # pragma: no cover
+    ReadModeController = None
+
 
 # --------------------------------------------------------------------------- #
 # Configuration
@@ -708,6 +713,19 @@ class RtlOverlayEditor(QPlainTextEdit):
             self._bracket_matcher = None
             _log(f"Bracket matching unavailable: {exc}", Qgis.MessageLevel.Info)
 
+        # --- optional feature: description read mode ----------------------
+        # Adds an in-editor switch when a lookup table with descriptions is
+        # configured. It writes to the document with signals blocked, so the
+        # preview text never reaches Scintilla and the stored expression is
+        # untouched.
+        self._read_mode = None
+        if ReadModeController is not None:
+            try:
+                self._read_mode = ReadModeController(self)
+            except Exception as exc:
+                self._read_mode = None
+                _log(f"Read mode unavailable: {exc}", Qgis.MessageLevel.Info)
+
         # --- optional feature: custom autocomplete source -----------------
         # Added last, after the editor is fully wired, so a failure here can
         # never affect synchronisation, geometry or rendering.  The controller
@@ -1117,6 +1135,13 @@ class RtlOverlayEditor(QPlainTextEdit):
             except Exception:
                 pass
             self._custom_autocomplete = None
+        read_mode = getattr(self, "_read_mode", None)
+        if read_mode is not None:
+            try:
+                read_mode.teardown()
+            except Exception:
+                pass
+            self._read_mode = None
         matcher = getattr(self, "_bracket_matcher", None)
         if matcher is not None:
             try:
