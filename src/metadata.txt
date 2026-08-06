@@ -1,33 +1,43 @@
 [general]
-name=RTL / BiDi Code Editor
-qgisMinimumVersion=3.99
+name=RTL Expression Editor
+qgisMinimumVersion=4.0
 qgisMaximumVersion=4.99
-description=Fixes right-to-left (Hebrew / Arabic) text rendering in the Expression Builder and the Layer Filter (Query) Builder by transparently overlaying the QScintilla editor with a bidi-capable Qt editor.
-about=QGIS uses QScintilla for its code editors. Scintilla has no proper Unicode bidirectional (BiDi) text support, so mixed Hebrew/English or Arabic/English expressions are rendered incorrectly - glyphs overlap and the text becomes unreadable. This plugin leaves QGIS untouched and simply covers the visible editing area of QgsCodeEditorExpression and QgsCodeEditorSQL widgets with a QPlainTextEdit, which uses Qt's full HarfBuzz/BiDi text engine. The two editors are kept in perfect two-way synchronisation, so every QGIS feature (field / function / operator insertion, validation, preview, OK/Cancel) keeps working exactly as before. Includes syntax highlighting and word completion.
-version=1.4.0
-author=Your Name
-email=you@example.com
+description=Fixes RTL (right-to-left) text rendering in QGIS expression and layer filter builders.
+about=QGIS's built-in editor (QScintilla) does not display RTL (right-to-left) text correctly, especially when it is mixed with LTR (left-to-right) text, making expressions and layer filters difficult to read and edit.
 
-tracker=https://example.com/rtl-bidi-editor/issues
-repository=https://example.com/rtl-bidi-editor
+This plugin places an enhanced editor directly above the original one. The enhanced editor renders mixed RTL and LTR text correctly while remaining fully synchronized with the original editor beneath it. This preserves all existing QGIS functionality, including field and function tools, validation, value previews, syntax highlighting, and more.
+
+The plugin also provides an optional advanced auto-complete system. You can configure a project layer and its fields as the source of allowed values, along with optional value descriptions, groups, and group descriptions. The suggestions automatically adapt to the field being queried and the current layer.
+
+When a custom auto-complete source is configured, an optional Read Mode slider button becomes available. Read Mode displays value descriptions instead of stored codes, making expressions much easier to understand. If the same code has different descriptions in different groups, the selected description is saved in the project and restored automatically, ensuring Read Mode always displays the correct description.
+
+version=1.2
+author=Jossef Kanter
+email=jossefkan@gmail.com
+
+tracker=https://github.com/GallPeters/rtl-expression-editor
+repository=https://github.com/GallPeters/rtl-expression-editor
 
 # Optional metadata
-tags=rtl,bidi,hebrew,arabic,expression,filter,query builder,editor,accessibility,i18n
-homepage=https://example.com/rtl-bidi-editor
-category=Plugins
-icon=icon.svg
+tags=rtl,hebrew,arabic,expression,filter,editor,expression 
+homepage=https://github.com/GallPeters/rtl-expression-editor
+icon=icon.png
 experimental=False
 deprecated=False
 hasProcessingProvider=no
 supportsQt6=True
 server=False
 
-changelog=1.4.0
-    - Added Settings dialog (Plugins > RTL Text Editor > Settings) with a master enable switch.
-    - Added optional custom autocomplete source: Ctrl+Space looks up allowed values
-      for the quoted field before the caret from a configurable project layer,
-      with optional descriptions and grouping. Off by default.
-    1.3.0
-    - Fixed editor detection by resolving C++ class names via QMetaObject.
-    1.0.0
-    - Initial release. Overlay editor for QgsCodeEditorExpression and QgsCodeEditorSQL.
+** v1.2 (06.08.2026):
+  - Added a Settings dialog with an enable/disable switch.
+  - Added optional autocomplete from project layer values.
+  - Added Read mode to display value descriptions instead of codes.
+  - Added project-specific storage for custom value descriptions.
+
+** v1.1 (03.08.2026):
+  - RTL window now follows the original window's position and size.
+  - Added syntax highlighting.
+  - Removed the Apply and Cancel buttons.
+
+** v1.0 (26.07.2026):
+  - Initial release.
