@@ -345,27 +345,51 @@ class SettingsDialog(QDialog):
             self.cmb_layer = QgsMapLayerComboBox(self.config)
             self._apply_vector_filter(self.cmb_layer)
             self.cmb_layer.setAllowEmptyLayer(True)
-            form.addRow("Layer", self.cmb_layer)
+            heading = QLabel("<b>Required</b>", self.config)
+            form.addRow(heading)
+            form.addRow("Lookup layer", self.cmb_layer)
 
             # (logical name, label, optional?)
+            # Required first, then optional. Labels say "column" rather than
+            # "field" because every one of these selects a COLUMN of the lookup
+            # layer - "Fields Names Field Name" was ambiguous about which of the
+            # two it meant. The logical keys are unchanged, so settings saved by
+            # earlier versions still load.
             spec = [
-                ("table", "Table Field Name", True),
-                ("field_names", "Fields Names Field Name", False),
-                ("value", "Values Code Field", False),
-                ("description", "Description Code Field", True),
-                ("group_code", "Group Code Field", True),
-                ("group_description", "Group Description Field", True),
+                ("field_names", "Field names column", False),
+                ("value", "Values column", False),
+                (None, None, None),  # separator: Optional
+                ("description", "Descriptions column", True),
+                ("table", "Table names column", True),
+                ("group_code", "Group codes column", True),
+                ("group_description", "Group descriptions column", True),
             ]
             self.field_combos = {}
             for key, label, optional in spec:
+                if key is None:
+                    form.addRow(QLabel("<b>Optional</b>", self.config))
+                    continue
                 combo = QgsFieldComboBox(self.config)
                 combo.setAllowEmptyFieldName(True)
                 self.field_combos[key] = combo
-                form.addRow(f"{label}{'  (optional)' if optional else ''}", combo)
+                form.addRow(label, combo)
 
+            self.field_combos["field_names"].setToolTip(
+                "Column listing the field names you want suggestions for, "
+                "e.g. NAME, COUNTRY, STATUS."
+            )
+            self.field_combos["value"].setToolTip(
+                "Column holding the values inserted into the expression."
+            )
             self.field_combos["table"].setToolTip(
-                "Field holding the table/category name. Leave empty to match "
-                "values regardless of which table is being edited."
+                "Column holding the source table name. Leave empty to offer "
+                "values regardless of which layer is being edited."
+            )
+            self.field_combos["group_code"].setToolTip(
+                "Column used to group the suggestions."
+            )
+            self.field_combos["group_description"].setToolTip(
+                "Column shown beside each group heading."
             )
             self.field_combos["description"].setToolTip(
                 "Shown beside each value, e.g. 'IL (Israel)'. Only the value is "
@@ -494,8 +518,8 @@ class SettingsDialog(QDialog):
                 self._complain("Select the layer that holds the autocomplete definitions.")
                 return
             for key, label in (
-                ("field_names", "Fields Names Field Name"),
-                ("value", "Values Code Field"),
+                ("field_names", "Field names column"),
+                ("value", "Values column"),
             ):
                 if not self.field_combos[key].currentField():
                     self._complain(f"'{label}' is required.")
@@ -509,8 +533,8 @@ class SettingsDialog(QDialog):
                 QMessageBox.information(
                     self,
                     "Grouping incomplete",
-                    "Grouping uses both the Group Code Field and the Group "
-                    "Description Field. With only one set, results will be shown "
+                    "Grouping uses both the group codes column and the group "
+                    "descriptions column. With only one set, results are shown "
                     "ungrouped.",
                 )
 
