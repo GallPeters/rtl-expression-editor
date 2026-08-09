@@ -197,6 +197,16 @@ ENABLE_GENERIC_FALLBACK = True
 #: reload can never attach two overlays to the same editor.
 OVERLAY_OBJECT_NAME = "rtlBidiOverlayEditor"
 
+#: Optional colour override for the overlay. Leave both empty to inherit the
+#: application theme, which is correct for custom QSS themes. Set both only if a
+#: theme needs forcing, e.g. "#1e1e1e" and "#e0e0e0".
+#: Set True only after a GUI theme styles QPlainTextEdit#rtlBidiOverlayEditor
+#: with BOTH background-color and color. See the note in _apply_appearance.
+LET_THEME_STYLE_OVERLAY = False
+
+OVERLAY_BACKGROUND = ""
+OVERLAY_FOREGROUND = ""
+
 #: Verbose logging.  Leave on until the plugin is confirmed working on your
 #: build; it makes every detection decision visible in the Log Messages panel.
 DEBUG = True
@@ -661,6 +671,22 @@ class RtlOverlayEditor(QPlainTextEdit):
         self._dialect = "sql" if "QgsCodeEditorSQL" in cls_names else "expression"
 
         self.setObjectName(OVERLAY_OBJECT_NAME)
+
+        # Paint an opaque background.
+        #
+        # A QPlainTextEdit used as an overlay has no reason to fill its own
+        # background, so without this it renders text onto whatever is behind it
+        # - here, Scintilla's own background and its (badly laid out) text. The
+        # result is two sets of glyphs superimposed, which looks like the overlay
+        # "disappearing" while in fact it is simply transparent. Both the widget
+        # and its viewport need the flag: the viewport is what actually paints
+        # the document area.
+        self.setAutoFillBackground(True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, False)
+        try:
+            self.viewport().setAutoFillBackground(True)
+        except Exception:
+            pass
         self.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
         self.setUndoRedoEnabled(True)
         # Qt applies the Unicode BiDi algorithm per paragraph and picks the
@@ -793,11 +819,42 @@ class RtlOverlayEditor(QPlainTextEdit):
             # Match the frame so the swap is visually invisible.
             self.setFrameStyle(self._sci.frameStyle())
 
+            # Use QGIS's standard code-editor colours.
+            #
+            # Background and foreground are taken from the SAME source, which is
+            # what prevents the white-on-white failure: mixing a light scheme
+            # background with a dark theme's light text made the caret and text
+            # invisible. Whatever the scheme says, the pair is internally
+            # consistent.
+            #
+            # The palette is set explicitly rather than inherited because
+            # autoFillBackground alone is not dependably opaque for a
+            # QPlainTextEdit viewport, and the caret is drawn in QPalette::Text -
+            # leaving it unset makes the text cursor invisible.
             palette = self.palette()
-            palette.setColor(
-                QPalette.ColorRole.Base, _scheme_color("Background", "#ffffff")
-            )
-            palette.setColor(QPalette.ColorRole.Text, _scheme_color("Default", "#000000"))
+            base = _scheme_color("Background", "#ffffff")
+            text = _scheme_color("Default", "#000000")
+
+            if OVERLAY_BACKGROUND and OVERLAY_FOREGROUND:
+                base = QColor(OVERLAY_BACKGROUND)
+                text = QColor(OVERLAY_FOREGROUND)
+
+            # Any alpha below 255 would let Scintilla show through again.
+            base = QColor(base)
+            text = QColor(text)
+            base.setAlpha(255)
+            text.setAlpha(255)
+
+            # Contrast guard: if the two colours are too close to tell apart,
+            # force the foreground to black or white. A scheme role that fails to
+            # resolve falls back to a hard-coded default, and two defaults can
+            # collide - this makes the text readable regardless.
+            if abs(base.lightness() - text.lightness()) < 40:
+                text = QColor("#000000") if base.lightness() > 127 else QColor("#ffffff")
+
+            palette.setColor(QPalette.ColorRole.Base, base)
+            palette.setColor(QPalette.ColorRole.Window, base)
+            palette.setColor(QPalette.ColorRole.Text, text)
             palette.setColor(
                 QPalette.ColorRole.Highlight,
                 _scheme_color("SelectionBackground", "#308cc6"),
@@ -806,7 +863,32 @@ class RtlOverlayEditor(QPlainTextEdit):
                 QPalette.ColorRole.HighlightedText,
                 _scheme_color("SelectionForeground", "#ffffff"),
             )
+
             self.setPalette(palette)
+            self.setAutoFillBackground(True)
+            try:
+                self.viewport().setPalette(palette)
+            except Exception:
+                pass
+
+            # Scoped by object name so it cannot leak onto other widgets.
+            #
+            # NOTE: a widget-level stylesheet overrides an application-level QSS.
+            # Once a GUI theme styles QPlainTextEdit#rtlBidiOverlayEditor itself,
+            # set LET_THEME_STYLE_OVERLAY = True near the top of this file so
+            # this block is skipped and the theme takes effect. Only do that once
+            # the theme sets BOTH background-color and color for that selector,
+            # or the caret and text become invisible again.
+            if not LET_THEME_STYLE_OVERLAY:
+                self.setStyleSheet(
+                    "QPlainTextEdit#%s { background-color: %s; color: %s; }"
+                    % (OVERLAY_OBJECT_NAME, base.name(), text.name())
+                )
+            else:
+                self.setStyleSheet("")
+
+            # Keep the caret clearly visible against either background.
+            self.setCursorWidth(2)
 
             self.setReadOnly(bool(self._sci.isReadOnly()))
             self.setEnabled(self._sci.isEnabled())
