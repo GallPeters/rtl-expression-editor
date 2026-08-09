@@ -207,9 +207,14 @@ class DescriptionResolver:
                 description = cls._text(feature, f_desc)
                 if not (field and code and description):
                     continue
-                bucket = mapping.setdefault(field, {}).setdefault(code, [])
-                if description not in bucket:
-                    bucket.append(description)
+                # Key by both spellings so a table storing codes with or
+                # without quotes both resolve.
+                for variant in {code, normalize_code(code)}:
+                    if not variant:
+                        continue
+                    bucket = mapping.setdefault(field, {}).setdefault(variant, [])
+                    if description not in bucket:
+                        bucket.append(description)
         except Exception as exc:
             _log(f"Read-mode mapping failed: {exc}", Qgis.MessageLevel.Warning)
         return mapping
@@ -282,7 +287,7 @@ class ChoiceMemory:
         """
         return (
             f"{context or ''}\x1e{(table or '').lower()}\x1f{(field or '').lower()}"
-            f"\x1f{code}\x1f{int(occurrence)}"
+            f"\x1f{normalize_code(code)}\x1f{int(occurrence)}"
         )
 
     @classmethod
@@ -359,6 +364,24 @@ _SCAN_RE = re.compile(
 )
 
 
+def normalize_code(text: str) -> str:
+    """Strip one layer of matching outer quotes from a code value.
+
+    Needed because a lookup table may store codes with the quotes included, e.g.
+    the literal seven characters ``'farm'`` rather than ``farm``. That form is
+    convenient - double-clicking inserts a ready-made SQL string - but it breaks
+    matching: _SCAN_RE captures a quoted literal's *contents*, so the expression
+    yields ``farm`` while the mapping is keyed by ``'farm'``.
+
+    Only the lookup keys are normalised. The value inserted into the expression
+    is never touched, so a code stored with quotes still produces valid SQL.
+    """
+    value = (text or "").strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1].strip()
+    return value
+
+
 def expression_context_key(widget) -> str:
     """Identify WHICH expression slot this editor belongs to.
 
@@ -433,7 +456,7 @@ def occurrence_index(text_before: str, field: str, code: str) -> int:
     the same occurrence in both directions.
     """
     field = (field or "").strip().lower()
-    code = (code or "").strip()
+    code = normalize_code(code)
     if not field or not code:
         return 0
 
@@ -449,7 +472,7 @@ def occurrence_index(text_before: str, field: str, code: str) -> int:
             literal = match.group("bare")
         if literal is None:
             continue
-        if current_field == field and literal.strip() == code:
+        if current_field == field and normalize_code(literal) == code:
             count += 1
     return count
 
@@ -490,8 +513,10 @@ def substitute_descriptions(
         if literal is None:
             continue
 
-        code = literal.strip()
+        code = normalize_code(literal)
         candidates = mapping.get(current_field, {}).get(code)
+        if not candidates:
+            candidates = mapping.get(current_field, {}).get(literal.strip())
         if not candidates:
             continue
 
@@ -539,14 +564,19 @@ def _pick_label(
     the time invites trust it has not earned, and two interacting mechanisms are
     harder to reason about than one. Remembering is the only mechanism.
     """
+    # Descriptions are normalised for DISPLAY only. A table that stores values
+    # with their quotes included, e.g. the literal ``'farm'``, would otherwise
+    # render as ``''farm''`` once the substitution re-wraps a quoted literal.
+    # Matching against remembered choices uses the raw stored form, so the two
+    # stay consistent.
     if len(candidates) == 1:
-        return candidates[0]
+        return normalize_code(candidates[0])
 
     remembered = ChoiceMemory.recall(table, field, code, occurrence, context)
     if remembered and remembered in candidates:
-        return remembered
+        return normalize_code(remembered)
 
-    return " / ".join(candidates)
+    return " / ".join(normalize_code(candidate) for candidate in candidates)
 
 
 # --------------------------------------------------------------------------- #

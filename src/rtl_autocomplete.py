@@ -105,6 +105,26 @@ def _dbg(message: str) -> None:
 # --------------------------------------------------------------------------- #
 
 
+def _unquote_for_display(text: str) -> str:
+    """Strip one layer of matching outer quotes, for DISPLAY only.
+
+    A lookup table may store codes with their quotes included, e.g. the literal
+    seven characters ``'farm'``, so that double-clicking inserts a ready-made SQL
+    string. Showing that raw in the popup gives ``'farm' (300)``, which is noisy.
+
+    This affects only what the popup renders and what typing filters against.
+    The value inserted into the expression comes from the entry's raw ``value``,
+    so a code stored with quotes still produces valid SQL.
+
+    Uses the same single-matching-pair rule as rtl_readmode.normalize_code, so
+    the popup and read mode agree on what "unquoted" means.
+    """
+    value = (text or "").strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1].strip()
+    return value
+
+
 class AutocompleteEntry:
     """One candidate value, plus the optional labels used to present it."""
 
@@ -124,17 +144,29 @@ class AutocompleteEntry:
 
     @property
     def display(self) -> str:
-        """Label shown in the popup: ``IL (Israel)`` or just ``IL``."""
-        if self.description:
-            return f"{self.value} ({self.description})"
-        return self.value
+        """Label shown in the popup: ``IL (Israel)`` or just ``IL``.
+
+        Quotes are stripped for presentation only - see _unquote_for_display.
+        """
+        value = _unquote_for_display(self.value)
+        description = _unquote_for_display(self.description)
+        if description:
+            return f"{value} ({description})"
+        return value
+
+    @property
+    def filter_text(self) -> str:
+        """Text typing is matched against: unquoted value plus description."""
+        return f"{_unquote_for_display(self.value)} {_unquote_for_display(self.description)}"
 
     @property
     def group_label(self) -> str:
         """Header label: ``Country Codes (International)``."""
-        if self.group_code and self.group_description:
-            return f"{self.group_code} ({self.group_description})"
-        return self.group_code or self.group_description or ""
+        code = _unquote_for_display(self.group_code)
+        description = _unquote_for_display(self.group_description)
+        if code and description:
+            return f"{code} ({description})"
+        return code or description or ""
 
 
 # --------------------------------------------------------------------------- #
@@ -1098,8 +1130,8 @@ class CustomAutocompleteController(QObject):
         if layer is not None:
             try:
                 lines.append(f"lookup rows: {layer.featureCount()}")
-            except Exception as exc:
-                lines.append(f"lookup rows: FAILED {exc!r}")
+            except Exception:
+                pass
 
         if editor is None:
             lines.append("editor: GONE")
@@ -1111,15 +1143,12 @@ class CustomAutocompleteController(QObject):
         lines.append(f"detected field: {field_name!r}")
 
         sci = getattr(editor, "_sci", None)
-        probe = sci if sci is not None else editor
-
-        context = _find_context_layer(probe)
+        context = _find_context_layer(sci if sci is not None else editor)
         lines.append(f"context layer: {context.name() if context is not None else None}")
         if context is not None:
             lines.append(f"context provider: {context.providerType()}")
             lines.append(f"source table: {source_table_name(context)!r}")
-            lines.append(f"context layer id: {context.id()!r}")
-        candidates = resolve_table_candidates(probe)
+        candidates = resolve_table_candidates(sci if sci is not None else editor)
         lines.append(f"table candidates: {candidates}")
 
         # This must DIFFER between two expression slots (e.g. fill colour vs
@@ -1127,28 +1156,9 @@ class CustomAutocompleteController(QObject):
         try:
             from .rtl_readmode import expression_context_key
 
-            lines.append(f"context key: {expression_context_key(probe)!r}")
+            lines.append(f"context key: {expression_context_key(sci if sci is not None else editor)!r}")
         except Exception as exc:
             lines.append(f"context key: FAILED {exc!r}")
-
-        # Walk OUTWARDS from the dialog. Everything inside the dialog is identical
-        # for every property, so if anything identifies which slot is being edited
-        # it lives in the object that created the dialog, not within it.
-        # node.parent() rather than parentWidget(): the chain can run through
-        # non-widget QObjects, which parentWidget() would skip.
-        try:
-            window = probe.window()
-            lines.append(f"dialog: {type(window).__name__}:{window.objectName()!r}")
-            chain = []
-            node = window.parent() if window is not None else None
-            depth = 0
-            while node is not None and depth < 12:
-                chain.append(f"{type(node).__name__}:{node.objectName()}")
-                node = node.parent()
-                depth += 1
-            lines.append("dialog parent chain: " + (" > ".join(chain) or "<empty>"))
-        except Exception as exc:
-            lines.append(f"dialog parent chain: FAILED {exc!r}")
 
         if usable and field_name:
             try:
@@ -1382,12 +1392,16 @@ class CustomAutocompleteController(QObject):
             return
         token = self._current_token().lower()
         if token:
-            subset = [e for e in self._entries if e.value.lower().startswith(token)]
+            subset = [
+                e
+                for e in self._entries
+                if _unquote_for_display(e.value).lower().startswith(token)
+            ]
             if not subset:
                 subset = [
                     e
                     for e in self._entries
-                    if token in e.value.lower() or token in e.description.lower()
+                    if token in e.filter_text.lower()
                 ]
         else:
             subset = list(self._entries)
