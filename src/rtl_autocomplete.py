@@ -1098,8 +1098,8 @@ class CustomAutocompleteController(QObject):
         if layer is not None:
             try:
                 lines.append(f"lookup rows: {layer.featureCount()}")
-            except Exception:
-                pass
+            except Exception as exc:
+                lines.append(f"lookup rows: FAILED {exc!r}")
 
         if editor is None:
             lines.append("editor: GONE")
@@ -1111,13 +1111,44 @@ class CustomAutocompleteController(QObject):
         lines.append(f"detected field: {field_name!r}")
 
         sci = getattr(editor, "_sci", None)
-        context = _find_context_layer(sci if sci is not None else editor)
+        probe = sci if sci is not None else editor
+
+        context = _find_context_layer(probe)
         lines.append(f"context layer: {context.name() if context is not None else None}")
         if context is not None:
             lines.append(f"context provider: {context.providerType()}")
             lines.append(f"source table: {source_table_name(context)!r}")
-        candidates = resolve_table_candidates(sci if sci is not None else editor)
+            lines.append(f"context layer id: {context.id()!r}")
+        candidates = resolve_table_candidates(probe)
         lines.append(f"table candidates: {candidates}")
+
+        # This must DIFFER between two expression slots (e.g. fill colour vs
+        # stroke colour). If it is identical, their remembered choices collide.
+        try:
+            from .rtl_readmode import expression_context_key
+
+            lines.append(f"context key: {expression_context_key(probe)!r}")
+        except Exception as exc:
+            lines.append(f"context key: FAILED {exc!r}")
+
+        # Walk OUTWARDS from the dialog. Everything inside the dialog is identical
+        # for every property, so if anything identifies which slot is being edited
+        # it lives in the object that created the dialog, not within it.
+        # node.parent() rather than parentWidget(): the chain can run through
+        # non-widget QObjects, which parentWidget() would skip.
+        try:
+            window = probe.window()
+            lines.append(f"dialog: {type(window).__name__}:{window.objectName()!r}")
+            chain = []
+            node = window.parent() if window is not None else None
+            depth = 0
+            while node is not None and depth < 12:
+                chain.append(f"{type(node).__name__}:{node.objectName()}")
+                node = node.parent()
+                depth += 1
+            lines.append("dialog parent chain: " + (" > ".join(chain) or "<empty>"))
+        except Exception as exc:
+            lines.append(f"dialog parent chain: FAILED {exc!r}")
 
         if usable and field_name:
             try:
@@ -1421,15 +1452,38 @@ class CustomAutocompleteController(QObject):
         # ChoiceMemory for why that distinction matters.
         if not self._field_mode and chosen_description:
             try:
-                from .rtl_readmode import ChoiceMemory
+                from .rtl_readmode import (
+                    ChoiceMemory,
+                    expression_context_key,
+                    occurrence_index,
+                )
 
                 sci = getattr(self._editor, "_sci", None)
                 tables = resolve_table_candidates(sci if sci is not None else self._editor)
+
+                # Identify WHICH occurrence of this code we just inserted, so a
+                # value the user typed by hand keeps showing every meaning while
+                # this one resolves to the description they picked. Count over
+                # the text up to the insertion point, excluding the partial
+                # token we replaced - otherwise that fragment would be counted
+                # as an earlier literal and shift the index.
+                cursor_position = self._editor.textCursor().position()
+                insertion_start = max(0, cursor_position - len(value))
+                text_before = self._editor.toPlainText()[:insertion_start]
+                index = occurrence_index(text_before, self._field_name, value)
+
+                # Scope the choice to THIS expression slot, so a fill-colour
+                # override and a stroke-colour override on the same layer keep
+                # separate descriptions instead of overwriting each other.
+                context = expression_context_key(sci if sci is not None else self._editor)
+
                 ChoiceMemory.remember(
                     tables[0] if tables else "",
                     self._field_name,
                     value,
                     chosen_description,
+                    index,
+                    context,
                 )
             except Exception as exc:
                 _dbg(f"Could not remember choice: {exc}")

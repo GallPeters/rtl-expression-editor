@@ -37,6 +37,9 @@ from .rtl_settings import BUS, Settings
 
 LOG_TAG = "RTL BiDi Editor"
 
+#: Object name of the overlay, excluded from the context chain.
+OVERLAY_HINT = "rtlBidiOverlayEditor"
+
 #: Height reserved at the bottom of the editor so the switch never sits on text.
 SWITCH_STRIP_HEIGHT = 26
 
@@ -105,6 +108,34 @@ class SlideSwitch(QAbstractButton):
 # --------------------------------------------------------------------------- #
 
 
+def _connect_project_invalidation(callback) -> bool:
+    """Call ``callback`` whenever the current project is replaced.
+
+    Both caches in this module hold project-scoped data, so neither may survive
+    a project change. Without this, opening project B after using project A
+    would serve A's cached data - and worse, ``ChoiceMemory.remember()`` writes
+    the whole merged dictionary back, so A's entries would be saved into B.
+
+    ``QgsProject.instance()`` is a singleton that persists across project
+    changes, so connecting once is enough. Returns True if at least one signal
+    was connected, so callers only mark themselves hooked on success.
+    """
+    connected = False
+    try:
+        from qgis.core import QgsProject
+
+        project = QgsProject.instance()
+        for signal_name in ("cleared", "readProject"):
+            try:
+                getattr(project, signal_name).connect(callback)
+                connected = True
+            except Exception:
+                pass
+    except Exception as exc:
+        _log(f"Could not hook project change: {exc}", Qgis.MessageLevel.Warning)
+    return connected
+
+
 class DescriptionResolver:
     """Builds ``field -> {code: [descriptions]}`` for one table context.
 
@@ -117,12 +148,19 @@ class DescriptionResolver:
 
     @classmethod
     def _ensure_hook(cls) -> None:
-        if not cls._hooked:
-            try:
-                BUS.changed.connect(lambda: cls._cache.clear())
-                cls._hooked = True
-            except Exception:
-                pass
+        if cls._hooked:
+            return
+        try:
+            BUS.changed.connect(cls.invalidate)
+        except Exception:
+            pass
+        _connect_project_invalidation(cls.invalidate)
+        cls._hooked = True
+
+    @classmethod
+    def invalidate(cls) -> None:
+        """Drop the mapping cache. Safe to call from a signal."""
+        cls._cache.clear()
 
     @classmethod
     def mapping(cls, table_candidates: List[str]) -> Dict[str, Dict[str, List[str]]]:
@@ -211,13 +249,45 @@ class ChoiceMemory:
     KEY = "value_choices"
 
     _cache: Optional[Dict[str, str]] = None
+    _hooked = False
 
     @classmethod
-    def _key(cls, table: str, field: str, code: str) -> str:
-        return f"{(table or '').lower()}\x1f{(field or '').lower()}\x1f{code}"
+    def _ensure_hook(cls) -> None:
+        """Drop the cache when the project changes.
+
+        Choices are stored per project, so a cache that outlived a project
+        switch would both read the wrong values and write one project's choices
+        into another.
+        """
+        if cls._hooked:
+            return
+        try:
+            BUS.changed.connect(cls.invalidate)
+        except Exception:
+            pass
+        _connect_project_invalidation(cls.invalidate)
+        cls._hooked = True
+
+    @classmethod
+    def _key(
+        cls, table: str, field: str, code: str, occurrence: int, context: str = ""
+    ) -> str:
+        """Key a choice to a specific *occurrence* of the code.
+
+        Keying on (table, field, code) alone made every instance of a code
+        resolve to the last description picked - including instances the user
+        typed by hand, which should show all possible meanings instead. The
+        occurrence index is what separates "the 610 I chose from the list" from
+        "some other 610 in this expression".
+        """
+        return (
+            f"{context or ''}\x1e{(table or '').lower()}\x1f{(field or '').lower()}"
+            f"\x1f{code}\x1f{int(occurrence)}"
+        )
 
     @classmethod
     def _load(cls) -> Dict[str, str]:
+        cls._ensure_hook()
         if cls._cache is not None:
             return cls._cache
         data: Dict[str, str] = {}
@@ -237,12 +307,21 @@ class ChoiceMemory:
         return data
 
     @classmethod
-    def remember(cls, table: str, field: str, code: str, description: str) -> None:
-        """Record a choice and persist it into the project."""
+    def remember(
+        cls,
+        table: str,
+        field: str,
+        code: str,
+        description: str,
+        occurrence: int = 0,
+        context: str = "",
+    ) -> None:
+        """Record a choice for one occurrence and persist it into the project."""
         if not (field and code and description):
             return
+        cls._ensure_hook()
         data = cls._load()
-        key = cls._key(table, field, code)
+        key = cls._key(table, field, code, occurrence, context)
         if data.get(key) == description:
             return
         data[key] = description
@@ -256,8 +335,15 @@ class ChoiceMemory:
             _log(f"Could not persist remembered choice: {exc}")
 
     @classmethod
-    def recall(cls, table: str, field: str, code: str) -> str:
-        return cls._load().get(cls._key(table, field, code), "")
+    def recall(
+        cls, table: str, field: str, code: str, occurrence: int = 0, context: str = ""
+    ) -> str:
+        """Description chosen for this occurrence, or "" if it was not chosen.
+
+        Deliberately does NOT fall back to a different occurrence: a miss must
+        mean "the user did not pick this one", so read mode shows every meaning.
+        """
+        return cls._load().get(cls._key(table, field, code, occurrence, context), "")
 
     @classmethod
     def invalidate(cls) -> None:
@@ -273,10 +359,106 @@ _SCAN_RE = re.compile(
 )
 
 
+def expression_context_key(widget) -> str:
+    """Identify WHICH expression slot this editor belongs to.
+
+    Remembered choices were previously keyed only by (table, field, code,
+    occurrence), so two expressions on the same layer - a fill-colour override
+    and a stroke-colour override - shared one key and overwrote each other.
+
+    The identifying information is **outside** the dialog, not inside it. Every
+    data-defined expression opens the same QgsExpressionBuilderDialogBase with
+    the same title and the same internal widget tree, so nothing within it says
+    which property is being edited. What differs is the object that created the
+    dialog: the property-override button, e.g. ``mFillColorDDBtn`` versus
+    ``mStrokeColorDDBtn``. So the chain is walked outwards from the dialog.
+
+    ``parent()`` is used rather than ``parentWidget()`` because the chain can run
+    through non-widget QObjects, which ``parentWidget()`` would skip.
+
+    Known limit: two symbol layers of the same type in one renderer expose the
+    same button object name, so their choices still share a key.
+    """
+    parts: List[str] = []
+    window = None
+    try:
+        window = widget.window()
+    except Exception as exc:
+        _log(f"Context key: no window ({exc})")
+
+    if window is not None:
+        try:
+            parts.append(window.objectName() or "")
+            parts.append(window.windowTitle() or "")
+        except Exception as exc:
+            _log(f"Context key: window identity unavailable ({exc})")
+
+        # The outward chain - this is what separates one slot from another.
+        try:
+            chain: List[str] = []
+            node = window.parent()
+            depth = 0
+            while node is not None and depth < 12:
+                name = node.objectName()
+                if name:
+                    chain.append(name)
+                node = node.parent()
+                depth += 1
+            if chain:
+                parts.append(">".join(chain))
+        except Exception as exc:
+            _log(f"Context key: parent chain unavailable ({exc})")
+
+    # Keep the same slot on two different layers separate. Failures are logged
+    # rather than swallowed - a silent miss here is what dropped the layer id
+    # from the key previously.
+    try:
+        layer = _find_context_layer(widget)
+        if layer is not None:
+            parts.append(layer.id())
+        else:
+            _log("Context key: no context layer resolved")
+    except Exception as exc:
+        _log(f"Context key: layer id unavailable ({exc})")
+
+    return "|".join(part for part in parts if part)
+
+
+def occurrence_index(text_before: str, field: str, code: str) -> int:
+    """How many earlier literals in ``text_before`` are this field's ``code``.
+
+    Used at two moments that must agree exactly: when a choice is recorded (the
+    caller passes the text up to the insertion point) and when read mode scans
+    the finished expression. Both count the same way, so the index identifies
+    the same occurrence in both directions.
+    """
+    field = (field or "").strip().lower()
+    code = (code or "").strip()
+    if not field or not code:
+        return 0
+
+    count = 0
+    current_field = ""
+    for match in _SCAN_RE.finditer(text_before):
+        found_field = match.group("field")
+        if found_field is not None:
+            current_field = found_field.strip().lower()
+            continue
+        literal = match.group("quoted")
+        if literal is None:
+            literal = match.group("bare")
+        if literal is None:
+            continue
+        if current_field == field and literal.strip() == code:
+            count += 1
+    return count
+
+
 def substitute_descriptions(
     text: str,
     mapping: Dict[str, Dict[str, List[str]]],
     table: str = "",
+    context: str = "",
 ) -> str:
     """Replace value codes with descriptions, for display only.
 
@@ -293,6 +475,7 @@ def substitute_descriptions(
     out: List[str] = []
     last_end = 0
     current_field = ""
+    counters: Dict[tuple, int] = {}
 
     for match in _SCAN_RE.finditer(text):
         field = match.group("field")
@@ -312,7 +495,13 @@ def substitute_descriptions(
         if not candidates:
             continue
 
-        label = _pick_label(candidates, table, current_field, code)
+        # Which occurrence of this field/code pair is this? Counted the same way
+        # as occurrence_index() counts it when the choice was recorded.
+        seen_key = (current_field, code)
+        index = counters.get(seen_key, 0)
+        counters[seen_key] = index + 1
+
+        label = _pick_label(candidates, table, current_field, code, index, context)
         if not label:
             continue
 
@@ -326,7 +515,14 @@ def substitute_descriptions(
     return "".join(out)
 
 
-def _pick_label(candidates: List[str], table: str, field: str, code: str) -> str:
+def _pick_label(
+    candidates: List[str],
+    table: str,
+    field: str,
+    code: str,
+    occurrence: int = 0,
+    context: str = "",
+) -> str:
     """Choose among competing descriptions for one code.
 
     Exactly two rules, in order:
@@ -346,7 +542,7 @@ def _pick_label(candidates: List[str], table: str, field: str, code: str) -> str
     if len(candidates) == 1:
         return candidates[0]
 
-    remembered = ChoiceMemory.recall(table, field, code)
+    remembered = ChoiceMemory.recall(table, field, code, occurrence, context)
     if remembered and remembered in candidates:
         return remembered
 
@@ -488,7 +684,10 @@ class ReadModeController(QObject):
         tables = resolve_table_candidates(sci if sci is not None else editor)
         mapping = DescriptionResolver.mapping(tables)
         preview = substitute_descriptions(
-            self._original, mapping, tables[0] if tables else ""
+            self._original,
+            mapping,
+            tables[0] if tables else "",
+            expression_context_key(sci if sci is not None else editor),
         )
 
         self._was_read_only = editor.isReadOnly()
