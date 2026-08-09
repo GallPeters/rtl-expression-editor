@@ -2,9 +2,16 @@
 name=RTL Expression Editor
 qgisMinimumVersion=4.0
 qgisMaximumVersion=4.99
-description=Fixes RTL (right-to-left) text rendering in QGIS expression and layer filter builders.
-about=QGIS's built-in editor (QScintilla) does not display RTL (right-to-left) text correctly, especially when it is mixed with LTR (left-to-right) text, making expressions and layer filters difficult to read and edit. This plugin places an enhanced editor directly above the original one. The enhanced editor renders mixed RTL and LTR text correctly while remaining fully synchronized with the original editor beneath it. This preserves all existing QGIS functionality, including field and function tools, validation, value previews, syntax highlighting, and more. The plugin also provides an optional advanced auto-complete system. You can configure a project layer and its fields as the source of allowed values, along with optional value descriptions, groups, and group descriptions. The suggestions automatically adapt to the field being queried and the current layer. When a custom auto-complete source is configured, an optional Read Mode slider button becomes available. Read Mode displays value descriptions instead of stored codes, making expressions much easier to understand. If the same code has different descriptions in different groups, the selected description is saved in the project and restored automatically, ensuring Read Mode always displays the correct description.
-version=1.2
+description=Fixes right-to-left (Hebrew, Arabic) text rendering in the QGIS expression and layer filter builders.
+about=QGIS's built-in editor (QScintilla) does not display right-to-left text correctly, especially when RTL and left-to-right text are mixed. Glyphs overlap and the text cursor jumps to the wrong place, which makes Hebrew or Arabic expressions and layer filters hard to read and almost impossible to edit.
+
+    This plugin places an enhanced editor directly above the original one. The enhanced editor renders mixed RTL and LTR text correctly while staying fully sync-hronized with the original editor beneath it, so all existing QGIS functionality keeps working: the field, function and operator tools, validation, value previews and syntax highlighting. Matching brackets are highlighted as well. Nothing in QGIS is modified or replaced.
+
+    The plugin also offers an optional advanced auto-complete system. Choose any project layer and its fields as the source of allowed values, with optional descriptions, groups and group descriptions. Press Ctrl+Space to complete either a field name or a value, and the suggestions adapt automatically to the field being queried and to the layer you are working on.
+
+
+    When a custom auto-complete source is configured, an optional Read Mode switch appears inside the editor. Read Mode shows the value descriptions instead of the stored codes, making a long expression far easier tounderstand, and never alters the expression itself. Where the same code has different meanings in different groups, the description you picked is saved in the project file and restored automatically, so Read Mode always shows the right one, for everyone who opens the project.
+version=1.3
 author=Jossef Kanter
 email=jossefkan@gmail.com
 
@@ -20,6 +27,9 @@ deprecated=False
 hasProcessingProvider=no
 supportsQt6=True
 server=False
+
+** v1.3 (09.08.2026):
+  - Fixed transparent background issue in the editor.
 
 ** v1.2 (06.08.2026):
   - Added a Settings dialog with an enable/disable switch.
