@@ -35,7 +35,12 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from qgis.PyQt.QtCore import QEvent, QObject, Qt
 from qgis.PyQt.QtGui import QColor, QFont, QTextCursor
-from qgis.PyQt.QtWidgets import QApplication, QListWidget, QListWidgetItem
+from qgis.PyQt.QtWidgets import (
+    QApplication,
+    QListWidget,
+    QListWidgetItem,
+    QToolTip,
+)
 
 from qgis.core import Qgis, QgsExpression, QgsFeatureRequest, QgsMessageLog
 
@@ -66,6 +71,10 @@ _SQ_STRING_RE = re.compile(r"'(?:[^'\\\n]|\\.)*'")
 VALUE_ROLE = int(Qt.ItemDataRole.UserRole) + 1
 #: Description carried alongside the value, for remembering the user's choice.
 DESC_ROLE = int(Qt.ItemDataRole.UserRole) + 2
+#: Text to insert, which differs from the displayed label for functions.
+INSERT_ROLE = int(Qt.ItemDataRole.UserRole) + 3
+#: Characters to move the caret left after inserting.
+CARET_ROLE = int(Qt.ItemDataRole.UserRole) + 4
 
 
 #: Diagnostic logging for the Ctrl+Space path.
@@ -128,7 +137,16 @@ def _unquote_for_display(text: str) -> str:
 class AutocompleteEntry:
     """One candidate value, plus the optional labels used to present it."""
 
-    __slots__ = ("value", "description", "group_code", "group_description")
+    __slots__ = (
+        "value",
+        "description",
+        "group_code",
+        "group_description",
+        "insert_text",
+        "display_text",
+        "help_text",
+        "caret_offset",
+    )
 
     def __init__(
         self,
@@ -136,11 +154,26 @@ class AutocompleteEntry:
         description: str = "",
         group_code: str = "",
         group_description: str = "",
+        insert_text: str = "",
+        display_text: str = "",
+        help_text: str = "",
+        caret_offset: int = 0,
     ):
         self.value = value
         self.description = description
         self.group_code = group_code
         self.group_description = group_description
+        #: What actually goes into the document. Defaults to ``value``. A
+        #: function displays ``buffer(geometry, distance)`` but inserts
+        #: ``buffer()``, so the two must be separable.
+        self.insert_text = insert_text or value
+        #: Overrides the computed label when set.
+        self.display_text = display_text
+        #: Tooltip - QGIS help text is HTML, which Qt tooltips render natively.
+        self.help_text = help_text
+        #: Characters to move the caret LEFT after inserting, so ``buffer()``
+        #: leaves the caret between the parentheses.
+        self.caret_offset = caret_offset
 
     @property
     def display(self) -> str:
@@ -148,6 +181,8 @@ class AutocompleteEntry:
 
         Quotes are stripped for presentation only - see _unquote_for_display.
         """
+        if self.display_text:
+            return self.display_text
         value = _unquote_for_display(self.value)
         description = _unquote_for_display(self.description)
         if description:
@@ -172,6 +207,160 @@ class AutocompleteEntry:
 # --------------------------------------------------------------------------- #
 # Field-name detection
 # --------------------------------------------------------------------------- #
+
+
+#: Group headings used by the mixed suggestion list.
+GROUP_FIELDS = "Fields"
+GROUP_FUNCTIONS = "Functions"
+GROUP_VARIABLES = "Variables"
+GROUP_OPERATORS = "Operators"
+GROUP_VALUES = "Values"
+
+#: Static operator/keyword list. Not obtainable from any API.
+_OPERATORS = (
+    "AND", "OR", "NOT", "IN", "LIKE", "ILIKE", "IS NULL", "IS NOT NULL",
+    "BETWEEN", "CASE WHEN", "THEN", "ELSE", "END",
+)
+
+#: Cache for the function index - QgsExpression.Functions() is stable for a
+#: session, and building signatures for several hundred functions on every
+#: keypress would be wasteful.
+_FUNCTION_CACHE: Optional[List[tuple]] = None
+
+
+def builtin_functions() -> List[tuple]:
+    """Return ``(name, signature, help_html)`` for every registered function.
+
+    Scintilla's own completion cannot be reused from an overlay (it needs to own
+    the input loop to filter and accept entries), so the list is rebuilt from
+    the public API instead. That also lets us show signatures and help text,
+    which Scintilla's plain list does not.
+    """
+    global _FUNCTION_CACHE
+    if _FUNCTION_CACHE is not None:
+        return _FUNCTION_CACHE
+
+    functions: List[tuple] = []
+    try:
+        for function in QgsExpression.Functions():
+            try:
+                name = function.name()
+                if not name or name.startswith("_"):
+                    continue
+
+                params: List[str] = []
+                try:
+                    for parameter in function.parameters():
+                        param_name = parameter.name()
+                        if param_name:
+                            params.append(param_name)
+                except Exception:
+                    # Not every function exposes parameters; variadic ones in
+                    # particular may report none. Fall back to an empty
+                    # signature rather than dropping the function.
+                    params = []
+
+                signature = f"{name}({', '.join(params)})" if params else f"{name}()"
+                try:
+                    help_html = function.helpText() or ""
+                except Exception:
+                    help_html = ""
+                functions.append((name, signature, help_html, len(params)))
+            except Exception:
+                continue
+    except Exception as exc:
+        _dbg(f"Could not enumerate functions: {exc}")
+
+    functions.sort(key=lambda item: item[0].lower())
+    _FUNCTION_CACHE = functions
+    return functions
+
+
+def builtin_variables(layer=None) -> List[str]:
+    """Variable names from the global, project and layer scopes.
+
+    Covers @map_scale, @atlas_feature, project variables and any custom ones,
+    correctly scoped, without hard-coding a list that would go stale.
+    """
+    names: List[str] = []
+    seen = set()
+
+    def add_scope(scope) -> None:
+        if scope is None:
+            return
+        try:
+            for name in scope.variableNames():
+                if name and name not in seen:
+                    seen.add(name)
+                    names.append(name)
+        except Exception:
+            pass
+
+    try:
+        from qgis.core import QgsExpressionContextUtils, QgsProject
+
+        add_scope(QgsExpressionContextUtils.globalScope())
+        add_scope(QgsExpressionContextUtils.projectScope(QgsProject.instance()))
+        if layer is not None:
+            add_scope(QgsExpressionContextUtils.layerScope(layer))
+    except Exception as exc:
+        _dbg(f"Could not enumerate variables: {exc}")
+
+    names.sort(key=str.lower)
+    return names
+
+
+def context_field_names(layer) -> List[str]:
+    """Field names of the layer being edited."""
+    if layer is None:
+        return []
+    try:
+        return [field.name() for field in layer.fields()]
+    except Exception:
+        return []
+
+
+#: Caret sitting immediately after @ or partway through a variable name.
+_VARIABLE_RE = re.compile(r"@(\w*)$")
+
+
+def suggestion_context(text_before_cursor: str) -> str:
+    """Decide WHAT to suggest from the text before the caret.
+
+    The syntax is usually unambiguous. Where it is not, the answer is "mixed"
+    rather than a guess: a wrong guess hides the thing the user wanted, whereas
+    a grouped list costs them only a keystroke of filtering.
+
+    Returns one of: "fields", "variables", "values", "mixed".
+    """
+    if not text_before_cursor:
+        return "mixed"
+
+    scrubbed = _SQ_STRING_RE.sub(
+        lambda m: " " * (m.end() - m.start()), text_before_cursor
+    )
+
+    # Inside an unterminated double quote -> naming a field.
+    if scrubbed.count('"') % 2 == 1:
+        return "fields"
+
+    # Immediately after @ -> a variable.
+    if _VARIABLE_RE.search(text_before_cursor):
+        return "variables"
+
+    # Inside an unterminated single quote -> typing a value.
+    without_fields = re.sub(r'"[^"\n]*"', lambda m: " " * len(m.group(0)), text_before_cursor)
+    if without_fields.count("'") % 2 == 1:
+        return "values"
+
+    # After a comparison against a known field -> that field's values.
+    if detect_field_name(text_before_cursor):
+        tail = text_before_cursor[text_before_cursor.rfind('"') + 1:]
+        if re.search(r"(=|!=|<>|<|>|\bIN\b|\bLIKE\b|\bILIKE\b)\s*\(?\s*[\w'%]*$",
+                     tail, re.IGNORECASE):
+            return "values"
+
+    return "mixed"
 
 
 def detect_field_name(text_before_cursor: str) -> str:
@@ -828,8 +1017,11 @@ class AutocompletePopup(QListWidget):
             item = QListWidgetItem(("    " if grouped else "") + entry.display)
             item.setData(VALUE_ROLE, entry.value)
             item.setData(DESC_ROLE, entry.description)
-            if entry.description:
-                item.setToolTip(entry.description)
+            item.setData(INSERT_ROLE, entry.insert_text)
+            item.setData(CARET_ROLE, int(entry.caret_offset))
+            tooltip = entry.help_text or entry.description
+            if tooltip:
+                item.setToolTip(tooltip)
             self.addItem(item)
             selectable += 1
 
@@ -1035,6 +1227,10 @@ class CustomAutocompleteController(QObject):
                     if self._is_trigger(event):
                         self.trigger()
                         return True
+                    # Typing '(' raises the signature hint. Deferred so the
+                    # character is in the document before we look for it.
+                    if event.text() == "(":
+                        self._call_tip_soon()
                 elif event_type == QEvent.Type.FocusOut:
                     # Showing a Qt.Popup window takes the keyboard grab, which
                     # makes Qt deliver FocusOut to the editor with reason
@@ -1277,46 +1473,132 @@ class CustomAutocompleteController(QObject):
             return
 
         text_before = editor.toPlainText()[: editor.textCursor().position()]
-
-        # Field-name mode: the caret sits inside an unterminated double quote,
-        # i.e. the user typed `"` (optionally followed by a partial name) and
-        # wants to know which fields have definitions. Detected by quote parity
-        # on the string-scrubbed text - the same test detect_field_name() uses.
-        scrubbed = _SQ_STRING_RE.sub(
-            lambda m: " " * (m.end() - m.start()), text_before
-        )
-        if scrubbed.count('"') % 2 == 1:
-            self._offer_field_names()
-            return
-
-        field_name = detect_field_name(text_before)
-        if not field_name:
-            self._notice('Place the caret after a quoted field, e.g. "NAME" = ')
-            return
-
         sci = getattr(editor, "_sci", None)
-        tables = resolve_table_candidates(sci if sci is not None else editor)
+        probe = sci if sci is not None else editor
 
-        # No override cursor: lookups are provider-filtered and fast, and an
-        # override cursor is a classic source of stuck-cursor artefacts.
-        self._entries = cache().lookup(field_name, tables)
-        self._field_name = field_name
-        self._field_mode = False
+        kind = suggestion_context(text_before)
+        self._field_mode = kind == "fields"
+        self._entries = self._collect_entries(kind, text_before, probe)
 
         if not self._entries:
-            if Settings.field("table") and not tables:
-                self._notice(
-                    "Cannot determine the current layer's source table; "
-                    "select that layer in the Layers panel."
-                )
-            else:
-                self._notice(
-                    f"No values defined for field \"{field_name}\""
-                    + (f" in table '{tables[0]}'" if tables else "")
-                )
+            self._notice("Nothing to suggest here")
             return
 
         self._refilter(show=True)
+
+    def _collect_entries(self, kind: str, text_before: str, probe) -> List[AutocompleteEntry]:
+        """Build the ordered, grouped entry list for this context.
+
+        Ordering is by relevance: the most likely group first, then the rest.
+        Built-in functions and variables are appended to the value context too,
+        so they are always reachable - Scintilla's own list is unavailable to an
+        overlay, and hiding ours behind a guess would leave no way to get at
+        them.
+        """
+        from .rtl_readmode import _find_context_layer
+
+        try:
+            layer = _find_context_layer(probe)
+        except Exception:
+            layer = None
+
+        entries: List[AutocompleteEntry] = []
+
+        def add_fields() -> None:
+            for name in context_field_names(layer):
+                entries.append(
+                    AutocompleteEntry(
+                        value=f'"{name}"',
+                        group_code=GROUP_FIELDS,
+                        display_text=name,
+                        insert_text=f'"{name}"',
+                    )
+                )
+
+        def add_functions() -> None:
+            for name, signature, help_html, param_count in builtin_functions():
+                entries.append(
+                    AutocompleteEntry(
+                        value=name,
+                        group_code=GROUP_FUNCTIONS,
+                        display_text=signature,
+                        insert_text=f"{name}()",
+                        help_text=help_html,
+                        # Land the caret between the parentheses when the
+                        # function takes arguments; after them when it does not.
+                        caret_offset=1 if param_count else 0,
+                    )
+                )
+
+        def add_variables() -> None:
+            for name in builtin_variables(layer):
+                entries.append(
+                    AutocompleteEntry(
+                        value=f"@{name}",
+                        group_code=GROUP_VARIABLES,
+                        display_text=f"@{name}",
+                        insert_text=f"@{name}",
+                    )
+                )
+
+        def add_operators() -> None:
+            for token in _OPERATORS:
+                entries.append(
+                    AutocompleteEntry(
+                        value=token, group_code=GROUP_OPERATORS, display_text=token
+                    )
+                )
+
+        def add_values() -> None:
+            field_name = detect_field_name(text_before)
+            if not field_name:
+                return
+            self._field_name = field_name
+            try:
+                tables = resolve_table_candidates(probe)
+                found = cache().lookup(field_name, tables)
+            except Exception as exc:
+                _dbg(f"Value lookup failed: {exc}")
+                return
+            for entry in found:
+                if not entry.group_code and not entry.group_description:
+                    entry.group_code = GROUP_VALUES
+                entries.append(entry)
+
+        if kind == "fields":
+            add_fields()
+            if not entries:
+                # No layer resolved - fall back to the lookup table's own list.
+                self._offer_field_names_into(entries, probe)
+        elif kind == "variables":
+            add_variables()
+        elif kind == "values":
+            add_values()
+            add_functions()
+            add_variables()
+        else:
+            add_fields()
+            add_functions()
+            add_variables()
+            add_operators()
+
+        return entries
+
+    def _offer_field_names_into(self, entries: List[AutocompleteEntry], probe) -> None:
+        """Field names taken from the lookup table, when the layer is unknown."""
+        try:
+            tables = resolve_table_candidates(probe)
+            for name in cache().lookup_field_names(tables):
+                entries.append(
+                    AutocompleteEntry(
+                        value=f'"{name}"',
+                        group_code=GROUP_FIELDS,
+                        display_text=name,
+                        insert_text=f'"{name}"',
+                    )
+                )
+        except Exception as exc:
+            _dbg(f"Field-name fallback failed: {exc}")
 
     def _offer_field_names(self) -> None:
         """Populate the popup with field names rather than values."""
@@ -1425,6 +1707,15 @@ class CustomAutocompleteController(QObject):
         if self._popup is None:
             return
         value = self._popup.current_value()
+        insert_text = value
+        caret_offset = 0
+        try:
+            item = self._popup.currentItem()
+            if item is not None:
+                insert_text = str(item.data(INSERT_ROLE) or value)
+                caret_offset = int(item.data(CARET_ROLE) or 0)
+        except Exception:
+            pass
         chosen_description = ""
         try:
             item = self._popup.currentItem()
@@ -1454,12 +1745,24 @@ class CustomAutocompleteController(QObject):
         if self._field_mode:
             text = self._editor.toPlainText()
             after = text[cursor.position():cursor.position() + 1]
-            if after != '"':
-                value = value + '"'
+            # Field entries are inserted already quoted, so only trim when a
+            # closing quote is already sitting to the right of the caret.
+            if after == '"' and insert_text.endswith('"'):
+                insert_text = insert_text[:-1]
 
-        cursor.insertText(value)
+        cursor.insertText(insert_text)
         cursor.endEditBlock()
+        if caret_offset:
+            cursor.movePosition(
+                QTextCursor.MoveOperation.Left,
+                QTextCursor.MoveMode.MoveAnchor,
+                caret_offset,
+            )
         self._editor.setTextCursor(cursor)
+
+        # A function was just completed - show its signature immediately.
+        if caret_offset:
+            self._call_tip_soon()
 
         # Record which meaning was chosen, so read mode can resolve a code that
         # has several. Stores the choice, not a copy of the expression - see
@@ -1501,6 +1804,72 @@ class CustomAutocompleteController(QObject):
                 )
             except Exception as exc:
                 _dbg(f"Could not remember choice: {exc}")
+
+    def _call_tip_soon(self) -> None:
+        """Show the call tip after the document has settled."""
+        from qgis.PyQt.QtCore import QTimer
+
+        QTimer.singleShot(0, self.show_call_tip)
+
+    def show_call_tip(self) -> None:
+        """Signature hint for the function enclosing the caret.
+
+        Our own tooltip rather than Scintilla's call tip, which has the same
+        limitation as its completion list: it needs Scintilla to own the input
+        loop. A QToolTip renders the HTML that helpText() returns and works over
+        a modal dialog.
+        """
+        editor = self._editor
+        if editor is None:
+            return
+        try:
+            text = editor.toPlainText()
+            position = editor.textCursor().position()
+            name = self._enclosing_function(text, position)
+            if not name:
+                QToolTip.hideText()
+                return
+
+            for func_name, signature, help_html, _count in builtin_functions():
+                if func_name.lower() != name.lower():
+                    continue
+                summary = re.sub(r"<[^>]+>", " ", help_html or "")
+                summary = re.sub(r"\s+", " ", summary).strip()
+                if len(summary) > 220:
+                    summary = summary[:220].rsplit(" ", 1)[0] + "..."
+                body = f"<b>{signature}</b>"
+                if summary:
+                    body += f"<br>{summary}"
+                point = editor.mapToGlobal(editor.cursorRect().bottomLeft())
+                QToolTip.showText(point, body, editor)
+                return
+            QToolTip.hideText()
+        except Exception as exc:
+            _dbg(f"Call tip failed: {exc}")
+
+    @staticmethod
+    def _enclosing_function(text: str, position: int) -> str:
+        """Name of the function whose parentheses contain ``position``.
+
+        Walks backwards counting bracket depth, so a nested call reports the
+        innermost function - the one the caret is actually inside.
+        """
+        depth = 0
+        index = position - 1
+        while index >= 0:
+            char = text[index]
+            if char == ")":
+                depth += 1
+            elif char == "(":
+                if depth == 0:
+                    end = index
+                    start = end
+                    while start > 0 and (text[start - 1].isalnum() or text[start - 1] in "_$"):
+                        start -= 1
+                    return text[start:end].strip()
+                depth -= 1
+            index -= 1
+        return ""
 
     def hide_popup(self) -> None:
         """Close the list and hand the caret back to the editor."""
