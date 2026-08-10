@@ -25,12 +25,12 @@ icon=icon.png
 experimental=False
 deprecated=False
 hasProcessingProvider=no
-supportsQt6=True
 server=False
 
-** v1.3 (09.08.2026):
+** v1.3 (10.08.2026):
   - Improved: the suggestion list now shows values without their surrounding quotes.
   - Improved: clearer labels in the settings window, with required options listed first.
+  - Improved: read mode and the suggestion list now show values without surrounding quotes
   - Fixed: read mode now handles code and description columns whose values include quotes.
   - Fixed transparent background issue in the editor.
 

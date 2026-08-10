@@ -507,8 +507,7 @@ def substitute_descriptions(
             continue
 
         literal = match.group("quoted")
-        quoted = literal is not None
-        if not quoted:
+        if literal is None:
             literal = match.group("bare")
         if literal is None:
             continue
@@ -530,8 +529,15 @@ def substitute_descriptions(
         if not label:
             continue
 
+        # Replace the WHOLE literal, quotes included, with the bare label.
+        #
+        # Re-wrapping in quotes produced nonsense whenever the description was
+        # not a string: a code of 'house' with description 648 rendered as '648'.
+        # Read mode is a human-readable rendering rather than valid SQL - the
+        # real expression is untouched underneath - so quoting adds nothing and
+        # misleads when the description is numeric.
         out.append(text[last_end:match.start()])
-        out.append(f"'{label}'" if quoted else label)
+        out.append(label)
         last_end = match.end()
 
     if not out:
