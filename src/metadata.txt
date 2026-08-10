@@ -27,6 +27,10 @@ deprecated=False
 hasProcessingProvider=no
 server=False
 
+** v1.4(12.08.2026):
+    - Added: Ctrl+Space now also suggests fields, functions and variables, with signatures and help.
+    - Added: typing "(" shows the function's signature and description.
+
 ** v1.3 (10.08.2026):
   - Improved: the suggestion list now shows values without their surrounding quotes.
   - Improved: clearer labels in the settings window, with required options listed first.
