@@ -423,6 +423,58 @@ class BidiSyntaxHighlighter(QSyntaxHighlighter):
 # --------------------------------------------------------------------------- #
 
 
+class ExtraSelectionCoordinator:
+    """Single owner of one editor's extra-selection list.
+
+    ``QPlainTextEdit.setExtraSelections`` REPLACES the whole list, so two
+    independent features calling it would erase each other - the bracket matcher
+    and the occurrence highlighter would alternate, each wiping the other's
+    highlights depending on which ran last.
+
+    Contributors publish under a key instead, and this class merges and makes the
+    single call. Merge order is painting order: later entries draw on top, so
+    occurrences are painted first and the bracket pair last, keeping the bracket
+    highlight visible even when it sits inside a highlighted word.
+    """
+
+    #: Painting order, back to front. Unlisted keys are appended after these.
+    ORDER = ("occurrences", "brackets")
+
+    def __init__(self, editor: QPlainTextEdit):
+        self._editor = editor
+        self._layers = {}
+
+    def publish(self, key: str, selections) -> None:
+        """Replace one contributor's selections and repaint."""
+        self._layers[key] = list(selections or [])
+        self._apply()
+
+    def clear(self, key: str) -> None:
+        if self._layers.pop(key, None) is not None:
+            self._apply()
+
+    def _apply(self) -> None:
+        merged = []
+        for key in self.ORDER:
+            merged.extend(self._layers.get(key, ()))
+        for key, selections in self._layers.items():
+            if key not in self.ORDER:
+                merged.extend(selections)
+        try:
+            self._editor.setExtraSelections(merged)
+        except RuntimeError:
+            pass  # C++ object already deleted
+
+
+def _coordinator_for(editor):
+    """Return the editor's coordinator, creating it on first use."""
+    coordinator = getattr(editor, "_extra_selections", None)
+    if coordinator is None:
+        coordinator = ExtraSelectionCoordinator(editor)
+        editor._extra_selections = coordinator
+    return coordinator
+
+
 class BracketMatcher(QObject):
     """Highlights the bracket pair under the caret, like any code editor.
 
@@ -576,7 +628,7 @@ class BracketMatcher(QObject):
         try:
             text = editor.toPlainText()
             if len(text) > self.MAX_CHARS:
-                editor.setExtraSelections([])
+                _coordinator_for(editor).publish("brackets", [])
                 return
 
             position = editor.textCursor().position()
@@ -595,10 +647,10 @@ class BracketMatcher(QObject):
                 selections = [self._selection(probe, partner >= 0)]
                 if partner >= 0:
                     selections.append(self._selection(partner, True))
-                editor.setExtraSelections(selections)
+                _coordinator_for(editor).publish("brackets", selections)
                 return
 
-            editor.setExtraSelections([])
+            _coordinator_for(editor).publish("brackets", [])
         except Exception as exc:
             _log(f"Bracket matching failed: {exc}", Qgis.MessageLevel.Info)
 
@@ -625,7 +677,159 @@ class BracketMatcher(QObject):
             except Exception:
                 pass
         try:
-            editor.setExtraSelections([])
+            _coordinator_for(editor).clear("brackets")
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------------------- #
+# The overlay editor
+# --------------------------------------------------------------------------- #
+
+
+class OccurrenceHighlighter(QObject):
+    """Highlights every occurrence of the selected word, as VS Code does.
+
+    Driven entirely by the selection, which is why it needs no shortcut and
+    cannot collide with the Expression Builder's Ctrl+F / Ctrl+H:
+
+    * select a word by hand -> the other occurrences light up;
+    * press Ctrl+F -> the word was already selected, so it is already
+      highlighted, and QGIS's find bar opens on top untouched;
+    * press Enter in the find bar -> Scintilla selects the next match, the
+      existing selection sync mirrors it into the overlay, and the highlighting
+      follows automatically.
+
+    Paints through the coordinator with setExtraSelections, which draws over the
+    document WITHOUT modifying it - no textChanged, so the overlay -> Scintilla
+    synchronisation is never involved and the expression cannot be altered.
+    """
+
+    #: Below this, a selection is too short to be worth highlighting - selecting
+    #: a single bracket should not light up the whole expression.
+    MIN_LENGTH = 2
+
+    #: Guard against a pathological document. Expressions are tiny in practice.
+    MAX_MATCHES = 500
+
+    #: Qt uses this instead of \n inside QTextCursor.selectedText().
+    PARAGRAPH_SEPARATOR = "\u2029"
+
+    def __init__(self, editor: QPlainTextEdit):
+        super().__init__(editor)
+        self._editor = editor
+        self._format = QTextCharFormat()
+        self._build_format()
+        try:
+            editor.selectionChanged.connect(self.refresh)
+            editor.textChanged.connect(self.refresh)
+        except Exception as exc:
+            _log(f"Occurrence highlighting unavailable: {exc}", Qgis.MessageLevel.Info)
+
+    # -- appearance -------------------------------------------------------- #
+
+    def _build_format(self) -> None:
+        """A faded version of whatever colour marks the selection.
+
+        Derived from the palette rather than hard-coded, so it tracks a custom
+        GUI theme automatically and always matches the selected word's colour.
+        The lightness guard is the same one the bracket matcher uses: a tint too
+        close to the background would be invisible, which is indistinguishable
+        from the feature not working.
+        """
+        try:
+            palette = self._editor.palette()
+            tint = QColor(palette.color(QPalette.ColorRole.Highlight))
+            background = palette.color(QPalette.ColorRole.Base)
+            if abs(tint.lightness() - background.lightness()) < 30:
+                tint = QColor("#4a90d9")
+            # Faded: strong enough to see, weak enough that Qt's own selection
+            # paint on the selected word still reads as the primary marker.
+            tint.setAlpha(90)
+        except Exception:
+            tint = QColor(74, 144, 217, 90)
+        self._format = QTextCharFormat()
+        self._format.setBackground(tint)
+
+    # -- matching ---------------------------------------------------------- #
+
+    def _is_field_name(self, text: str, needle: str) -> bool:
+        """True when the selection is used as a quoted field somewhere.
+
+        Whole-word matching is applied only to field names: selecting ``NAME``
+        should not light up the ``NAME`` inside ``F_NAME_2``. For anything else -
+        a value, a fragment - substring matching is more useful.
+        """
+        try:
+            return re.search('"' + re.escape(needle) + '"', text, re.IGNORECASE) is not None
+        except Exception:
+            return False
+
+    def refresh(self) -> None:
+        """Recompute the highlights for the current selection."""
+        editor = self._editor
+        if editor is None:
+            return
+        try:
+            coordinator = _coordinator_for(editor)
+            cursor = editor.textCursor()
+            if not cursor.hasSelection():
+                coordinator.publish("occurrences", [])
+                return
+
+            needle = cursor.selectedText()
+            if (
+                len(needle) < self.MIN_LENGTH
+                or self.PARAGRAPH_SEPARATOR in needle
+                or needle != needle.strip()
+                or any(ch.isspace() for ch in needle)
+            ):
+                # Multi-line or whitespace-bearing selections are phrases, not
+                # words; highlighting them adds noise.
+                coordinator.publish("occurrences", [])
+                return
+
+            text = editor.toPlainText()
+            pattern = re.escape(needle)
+            if self._is_field_name(text, needle):
+                # Plain word boundaries. Treating @ and $ as word characters was
+                # tried and rejected: it made selecting "map_scale" skip
+                # @map_scale, since the @ then counted as part of the word - the
+                # opposite of what a reader expects.
+                pattern = r"(?<!\w)" + pattern + r"(?!\w)"
+
+            selections = []
+            document = editor.document()
+            for match in re.finditer(pattern, text, re.IGNORECASE):
+                selection = QTextEdit.ExtraSelection()
+                hit = QTextCursor(document)
+                hit.setPosition(match.start())
+                hit.setPosition(match.end(), QTextCursor.MoveMode.KeepAnchor)
+                selection.cursor = hit
+                selection.format = self._format
+                selections.append(selection)
+                if len(selections) >= self.MAX_MATCHES:
+                    break
+
+            # A single hit is the selection itself - nothing to point out.
+            coordinator.publish("occurrences", selections if len(selections) > 1 else [])
+        except Exception as exc:
+            _log(f"Occurrence highlighting failed: {exc}", Qgis.MessageLevel.Info)
+
+    # -- teardown ---------------------------------------------------------- #
+
+    def teardown(self) -> None:
+        """Disconnect and clear; safe to call more than once."""
+        editor, self._editor = self._editor, None
+        if editor is None:
+            return
+        for signal_name in ("selectionChanged", "textChanged"):
+            try:
+                getattr(editor, signal_name).disconnect(self.refresh)
+            except Exception:
+                pass
+        try:
+            _coordinator_for(editor).clear("occurrences")
         except Exception:
             pass
 
@@ -738,6 +942,17 @@ class RtlOverlayEditor(QPlainTextEdit):
         except Exception as exc:
             self._bracket_matcher = None
             _log(f"Bracket matching unavailable: {exc}", Qgis.MessageLevel.Info)
+
+        # --- occurrence highlighting --------------------------------------
+        # Selection-driven, so it needs no shortcut and cannot clash with the
+        # Expression Builder's Ctrl+F / Ctrl+H. Shares the extra-selection list
+        # with the bracket matcher through the coordinator.
+        self._occurrence_highlighter = None
+        try:
+            self._occurrence_highlighter = OccurrenceHighlighter(self)
+        except Exception as exc:
+            self._occurrence_highlighter = None
+            _log(f"Occurrence highlighting unavailable: {exc}", Qgis.MessageLevel.Info)
 
         # --- optional feature: description read mode ----------------------
         # Adds an in-editor switch when a lookup table with descriptions is
@@ -1224,6 +1439,13 @@ class RtlOverlayEditor(QPlainTextEdit):
             except Exception:
                 pass
             self._read_mode = None
+        highlighter = getattr(self, "_occurrence_highlighter", None)
+        if highlighter is not None:
+            try:
+                highlighter.teardown()
+            except Exception:
+                pass
+            self._occurrence_highlighter = None
         matcher = getattr(self, "_bracket_matcher", None)
         if matcher is not None:
             try:
