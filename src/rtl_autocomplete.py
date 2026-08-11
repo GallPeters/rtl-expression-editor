@@ -55,6 +55,11 @@ QUERY_LIMIT = 2000
 #: Maximum items shown in the popup at once.
 MAX_DISPLAYED = 500
 
+#: Vertical breathing room between the caret's text line and any popup
+#: placed above or below it, so neither the call tip nor the suggestion
+#: list sits close enough to overlap the very text it is describing.
+POPUP_VERTICAL_GAP = 10
+
 #: Characters that make up a value token being typed before the cursor.
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_\-.]+$")
 
@@ -1154,6 +1159,7 @@ class AutocompletePopup(QListWidget):
         editor = self._editor
         rect = editor.cursorRect()
         point = editor.mapToGlobal(rect.bottomLeft())
+        point.setY(point.y() + POPUP_VERTICAL_GAP)
 
         rows = min(self.count(), 12)
         height = max(60, sum(self.sizeHintForRow(r) for r in range(rows)) + 8)
@@ -1162,7 +1168,7 @@ class AutocompletePopup(QListWidget):
         try:
             screen = editor.screen().availableGeometry()
             if point.y() + height > screen.bottom():
-                point.setY(editor.mapToGlobal(rect.topLeft()).y() - height)
+                point.setY(editor.mapToGlobal(rect.topLeft()).y() - height - POPUP_VERTICAL_GAP)
             if point.x() + width > screen.right():
                 point.setX(max(screen.left(), screen.right() - width))
         except Exception:
@@ -1772,7 +1778,18 @@ class CustomAutocompleteController(QObject):
             cursor = editor.textCursor()
             if cursor.hasSelection():
                 return
-            text_before = editor.toPlainText()[: cursor.position()]
+            text = editor.toPlainText()
+            position = cursor.position()
+            if self._inside_active_call(text, position):
+                # Mid-argument inside an open call, on the same line as its
+                # '(': the call tip already covers this position (see
+                # show_call_tip), and QGIS's own editor holds off on
+                # suggestions here too. Typing ')' or moving to a new line
+                # needs no special case - both simply make this check false
+                # the next time it runs, since the caret is then either
+                # outside the call or past a newline within it.
+                return
+            text_before = text[:position]
             kind = suggestion_context(text_before)
             if kind == "mixed" and not self._current_token():
                 # Fields and values are anchored to a delimiter the user just
@@ -1786,6 +1803,19 @@ class CustomAutocompleteController(QObject):
             self.trigger(auto=True)
         except Exception as exc:
             _dbg(f"Auto-trigger failed: {exc}")
+
+    def _inside_active_call(self, text: str, position: int) -> bool:
+        """True while the caret is mid-argument inside an open function call.
+
+        "Mid-argument" specifically: enclosed by an unclosed '(', and still on
+        the same source line as that '(' - typing ')' or Enter both end this
+        state, closing the call in the first case and starting a fresh line
+        within it in the second, matching how QGIS's own editor behaves.
+        """
+        name, open_index = self._enclosing_function(text, position)
+        if not name:
+            return False
+        return "\n" not in text[open_index:position]
 
     def _collect_entries(self, kind: str, text_before: str, probe) -> List[AutocompleteEntry]:
         """Build the entry list for this context. One rule per context:
@@ -2205,9 +2235,11 @@ class CustomAutocompleteController(QObject):
             _dbg(f"Call tip failed: {exc}")
 
     def _call_tip_point(self):
-        """Global position for the call tip: just under the caret."""
+        """Global position for the call tip: below the caret, with a gap."""
         editor = self._editor
-        return editor.mapToGlobal(editor.cursorRect().bottomLeft())
+        point = editor.mapToGlobal(editor.cursorRect().bottomLeft())
+        point.setY(point.y() + POPUP_VERTICAL_GAP)
+        return point
 
     def _reposition_call_tip(self) -> None:
         """Keep the call tip glued to the caret when the window itself moves.
