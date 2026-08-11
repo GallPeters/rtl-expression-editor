@@ -58,6 +58,10 @@ MAX_DISPLAYED = 500
 #: Characters that make up a value token being typed before the cursor.
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_\-.]+$")
 
+#: A single character that continues a token rather than ending it - used to
+#: decide whether a just-typed key should close the completion popup.
+_CONTINUATION_CHAR_RE = re.compile(r"[A-Za-z0-9_\-.]")
+
 #: A field name in double quotes, e.g. "COUNTRY".
 _QUOTED_FIELD_RE = re.compile(r'"([^"\n]+)"')
 
@@ -1257,16 +1261,17 @@ class CustomAutocompleteController(QObject):
             _log(f"Custom autocomplete not attached: {exc}", Qgis.MessageLevel.Warning)
 
         # Both popups are Qt.ToolTip windows with WA_ShowWithoutActivating, so
-        # they never go through the editor's own focus-in/out cycle when the
-        # user switches to a *different application* - alt-tabbing away left
-        # them floating on top of whatever came next. applicationStateChanged
-        # is the one signal that actually reports "QGIS as a whole is no
-        # longer the active application", independent of which QGIS window or
-        # dialog has focus internally.
+        # they never go through the editor's own focus-in/out cycle - neither
+        # switching to a different application, nor switching to a different
+        # QGIS window while this one stays open in the background, generates
+        # a FocusOut on the editor. focusWindowChanged is the one signal that
+        # reports a change of *OS-level* focus window, covering both cases
+        # plus clicking through to the desktop (window becomes None) - so the
+        # popups only ever show while this dialog is the active window.
         try:
             app = QApplication.instance()
             if app is not None:
-                app.applicationStateChanged.connect(self._on_app_state_changed)
+                app.focusWindowChanged.connect(self._on_focus_window_changed)
         except Exception:
             pass
 
@@ -1279,7 +1284,7 @@ class CustomAutocompleteController(QObject):
         try:
             app = QApplication.instance()
             if app is not None:
-                app.applicationStateChanged.disconnect(self._on_app_state_changed)
+                app.focusWindowChanged.disconnect(self._on_focus_window_changed)
         except Exception:
             pass
         try:
@@ -1359,16 +1364,6 @@ class CustomAutocompleteController(QObject):
                         # Keys normally reach the popup; if one arrives here
                         # anyway, handle it identically.
                         return self._on_popup_key(event)
-                    if event.key() == Qt.Key.Key_Escape and (
-                        self._call_tip is not None and self._call_tip.isVisible()
-                    ):
-                        # No completion list is open to claim Escape itself
-                        # (the branch above owns that case), so the call tip
-                        # needs its own dismissal here. Consumed only when
-                        # there was something to dismiss, so a second Escape
-                        # still reaches the dialog to close it as usual.
-                        self._hide_call_tip()
-                        return True
                     if self._is_diagnostic(event):
                         self._show_report()
                         return True
@@ -1376,11 +1371,24 @@ class CustomAutocompleteController(QObject):
                         self.trigger()
                         return True
                     # '(' raises the signature hint, ',' advances the
-                    # highlighted argument, and ')' re-checks it - closing the
+                    # highlighted argument (or closes the tip if it is past
+                    # the last one), and ')' re-checks it - closing the
                     # innermost call may still leave the caret inside an outer
                     # one. Deferred so the character is in the document first.
+                    #
+                    # Escape is deliberately NOT used to dismiss the call tip:
+                    # unlike the completion popup (a real Qt.Popup with its
+                    # own keyboard grab), the plain editor never gets a
+                    # KeyPress for Escape to filter in the first place - the
+                    # dialog's own Escape-closes-the-dialog shortcut claims it
+                    # first, at the ShortcutOverride stage. Consuming it here
+                    # would be a no-op at best and confusing at worst.
                     if event.text() in ("(", ",", ")"):
                         self._call_tip_soon()
+                    elif event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                        # Matches QGIS's own function helper: Enter closes it,
+                        # same as finishing the call.
+                        self._hide_call_tip()
                 elif event_type == QEvent.Type.FocusOut:
                     # Showing a Qt.Popup window takes the keyboard grab, which
                     # makes Qt deliver FocusOut to the editor with reason
@@ -1410,16 +1418,27 @@ class CustomAutocompleteController(QObject):
             _log(f"Custom autocomplete error: {exc}", Qgis.MessageLevel.Warning)
         return False
 
-    def _on_app_state_changed(self, state) -> None:
-        """Hide both popups the moment QGIS stops being the active app."""
+    def _on_focus_window_changed(self, window) -> None:
+        """Hide both popups the moment a different top-level window is active.
+
+        Covers switching to another application, switching to a different
+        QGIS window or dialog while this one stays open behind it, and
+        clicking through to the desktop (``window`` is then ``None``) - so
+        the popups are visible only while this specific dialog (Expression
+        Builder, Field Calculator, Layer Filter, ...) is the active window.
+        """
+        editor = self._editor
+        if editor is None:
+            return
         try:
-            active = Qt.ApplicationState.ApplicationActive
+            own_window = editor.window().windowHandle()
         except Exception:
-            active = getattr(Qt, "ApplicationActive", None)
-        if active is None or state == active:
-            # Either QGIS is still the active application, or the enum could
-            # not be resolved at all - in which case there is nothing safe to
-            # compare against, so err on the side of not hiding anything.
+            own_window = None
+        if own_window is None:
+            # Could not resolve our own window - nothing safe to compare
+            # against, so err on the side of not hiding anything.
+            return
+        if window is own_window:
             return
         self.hide_popup()
         self._hide_call_tip()
@@ -1594,8 +1613,26 @@ class CustomAutocompleteController(QObject):
             self.hide_popup()
             self._forward_to_editor(event)
             return True
+        if key in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete):
+            # Still editing the token itself: keep narrowing/widening.
+            self._forward_to_editor(event)
+            self._refilter_soon()
+            return True
 
-        # Printable characters, Backspace, Delete: let the editor apply them.
+        text = event.text()
+        if text and not _CONTINUATION_CHAR_RE.match(text):
+            # A boundary character - space, punctuation, an operator, the
+            # closing quote - ends the token, so the list closes immediately
+            # rather than waiting to find nothing matches. Matches QGIS's own
+            # suggestion list, which closes on anything but Up/Down/PgUp/PgDn
+            # unless it still narrows to a result.
+            self.hide_popup()
+            self._forward_to_editor(event)
+            return True
+
+        # A word character narrowing the token (or a key with no text, e.g. a
+        # lone modifier press): let the editor apply it, then refilter -
+        # narrows the list, or hides it once nothing matches any more.
         self._forward_to_editor(event)
         self._refilter_soon()
         return True
@@ -2040,6 +2077,12 @@ class CustomAutocompleteController(QObject):
                 if func_name.lower() != name.lower():
                     continue
                 arg_index = self._argument_index(text, open_index, position)
+                if params and arg_index >= len(params):
+                    # Matches QGIS's own function helper: another comma typed
+                    # past the last declared argument closes it rather than
+                    # leaving nothing sensible highlighted.
+                    self._hide_call_tip()
+                    return
                 signature_html = self._signature_html(name, params, arg_index)
 
                 summary = re.sub(r"<[^>]+>", " ", help_html or "")
