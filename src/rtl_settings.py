@@ -34,6 +34,7 @@ from qgis.PyQt.QtWidgets import (
     QGroupBox,
     QLabel,
     QMessageBox,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -243,6 +244,31 @@ class Settings:
     # -- convenience ------------------------------------------------------- #
 
     @classmethod
+    def max_suggested_values(cls) -> int:
+        """Cap on value suggestions read straight from the current layer.
+
+        Only used when the field being completed has no configured lookup
+        table (or the lookup returns nothing): the popup then shows the first
+        N distinct, non-null values already present in the layer. The custom
+        lookup table has no such cap - QUERY_LIMIT in rtl_autocomplete already
+        bounds it generously.
+        """
+        raw = cls._get_str("ac/max_values", "")
+        try:
+            value = int(raw)
+            return value if value > 0 else 10
+        except (TypeError, ValueError):
+            return 10
+
+    @classmethod
+    def set_max_suggested_values(cls, value: int) -> None:
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            value = 10
+        cls._set("ac/max_values", str(max(1, value)))
+
+    @classmethod
     def default_read_mode(cls) -> bool:
         """Whether the editor opens in description (read-only) mode.
 
@@ -315,6 +341,18 @@ class SettingsDialog(QDialog):
             "editor is created and QGIS behaves exactly as without the plugin."
         )
         general_layout.addWidget(self.chk_enabled)
+
+        values_row = QFormLayout()
+        self.spin_max_values = QSpinBox(general)
+        self.spin_max_values.setRange(1, 1000)
+        self.spin_max_values.setToolTip(
+            "When Ctrl+Space suggests values for a field that has no "
+            "configured lookup table (or the lookup has nothing for it), "
+            "show this many of the field's own distinct, non-null values."
+        )
+        values_row.addRow("Suggested values without a lookup table", self.spin_max_values)
+        general_layout.addLayout(values_row)
+
         root.addWidget(general)
 
         # -- Custom Autocomplete ------------------------------------------- #
@@ -470,6 +508,7 @@ class SettingsDialog(QDialog):
 
     def _load(self) -> None:
         self.chk_enabled.setChecked(Settings.plugin_enabled())
+        self.spin_max_values.setValue(Settings.max_suggested_values())
         self.chk_ac.setChecked(Settings.autocomplete_enabled())
         try:
             index = self.cmb_mode.findData(Settings.default_read_mode())
@@ -547,6 +586,7 @@ class SettingsDialog(QDialog):
 
     def _save(self) -> None:
         Settings.set_plugin_enabled(self.chk_enabled.isChecked())
+        Settings.set_max_suggested_values(self.spin_max_values.value())
         Settings.set_autocomplete_enabled(self.chk_ac.isChecked())
         try:
             Settings.set_default_read_mode(bool(self.cmb_mode.currentData()))

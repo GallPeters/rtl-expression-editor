@@ -229,12 +229,18 @@ _FUNCTION_CACHE: Optional[List[tuple]] = None
 
 
 def builtin_functions() -> List[tuple]:
-    """Return ``(name, signature, help_html)`` for every registered function.
+    """Return ``(name, signature, help_html, param_count, group)`` per function.
 
     Scintilla's own completion cannot be reused from an overlay (it needs to own
     the input loop to filter and accept entries), so the list is rebuilt from
     the public API instead. That also lets us show signatures and help text,
     which Scintilla's plain list does not.
+
+    ``group`` is the function's own category (Aggregates, Arrays, Color,
+    Conditionals, Geometry, Operators, ...) exactly as QgsExpression reports
+    it - the same string the Expression Builder's tree groups functions by -
+    so the autocomplete popup groups them identically instead of lumping every
+    function under one generic heading.
     """
     global _FUNCTION_CACHE
     if _FUNCTION_CACHE is not None:
@@ -265,7 +271,11 @@ def builtin_functions() -> List[tuple]:
                     help_html = function.helpText() or ""
                 except Exception:
                     help_html = ""
-                functions.append((name, signature, help_html, len(params)))
+                try:
+                    group = function.group() or GROUP_FUNCTIONS
+                except Exception:
+                    group = GROUP_FUNCTIONS
+                functions.append((name, signature, help_html, len(params), group))
             except Exception:
                 continue
     except Exception as exc:
@@ -318,6 +328,54 @@ def context_field_names(layer) -> List[str]:
         return [field.name() for field in layer.fields()]
     except Exception:
         return []
+
+
+def layer_first_values(layer, field_name: str, limit: int) -> List[str]:
+    """The first ``limit`` distinct, non-null values of ``field_name``.
+
+    Used when no lookup table is configured for this field (or it has
+    nothing for it): rather than offering no values at all, the field's own
+    data stands in. Each value comes back already wrapped for insertion -
+    quoted for text, bare for numbers - via ``QgsExpression.quotedValue()``,
+    which is exactly what a hand-typed literal would need.
+    """
+    if layer is None or not field_name or limit <= 0:
+        return []
+    try:
+        index = layer.fields().indexOf(field_name)
+        if index < 0:
+            return []
+    except Exception:
+        return []
+
+    values: List[str] = []
+    seen = set()
+    try:
+        # uniqueValues() may include NULL among its results, so ask for a
+        # little more than we need and stop once enough real values are found.
+        for raw in layer.uniqueValues(index, limit + 5):
+            if raw is None:
+                continue
+            try:
+                if hasattr(raw, "isNull") and raw.isNull():
+                    continue
+            except Exception:
+                pass
+            text_key = str(raw).strip().lower()
+            if not text_key or text_key in seen:
+                continue
+            seen.add(text_key)
+            try:
+                literal = QgsExpression.quotedValue(raw)
+            except Exception:
+                literal = QgsExpression.quotedString(str(raw))
+            values.append(literal)
+            if len(values) >= limit:
+                break
+    except Exception as exc:
+        _dbg(f"Layer value fallback failed: {exc}")
+        return []
+    return values
 
 
 #: Caret sitting immediately after @ or partway through a variable name.
@@ -1137,6 +1195,8 @@ class CustomAutocompleteController(QObject):
         self._field_name = ""
         #: True while the popup lists field names rather than values.
         self._field_mode = False
+        #: True while the popup lists values (quoted literals) for a field.
+        self._value_mode = False
         #: True while a key event is being re-sent to the editor, to stop the
         #: editor branch of eventFilter from re-entering the popup handler.
         self._forwarding = False
@@ -1462,14 +1522,15 @@ class CustomAutocompleteController(QObject):
     # -- the feature ------------------------------------------------------- #
 
     def trigger(self) -> None:
-        """Ctrl+Space: detect the field, fetch values, show the popup."""
+        """Ctrl+Space: detect the context, fetch entries, show the popup.
+
+        Works with no configuration at all: fields, functions, variables and
+        operators are always available. A lookup table configured in Settings
+        only narrows and enriches the field-name and value lists; it is never
+        required for the feature to be active.
+        """
         editor = self._editor
         if editor is None:
-            return
-
-        enabled, reason = Settings.autocomplete_is_usable()
-        if not enabled:
-            _dbg(f"Ctrl+Space ignored: {reason}")
             return
 
         text_before = editor.toPlainText()[: editor.textCursor().position()]
@@ -1478,6 +1539,7 @@ class CustomAutocompleteController(QObject):
 
         kind = suggestion_context(text_before)
         self._field_mode = kind == "fields"
+        self._value_mode = kind == "values"
         self._entries = self._collect_entries(kind, text_before, probe)
 
         if not self._entries:
@@ -1487,118 +1549,137 @@ class CustomAutocompleteController(QObject):
         self._refilter(show=True)
 
     def _collect_entries(self, kind: str, text_before: str, probe) -> List[AutocompleteEntry]:
-        """Build the ordered, grouped entry list for this context.
+        """Build the entry list for this context. One rule per context:
 
-        Ordering is by relevance: the most likely group first, then the rest.
-        Built-in functions and variables are appended to the value context too,
-        so they are always reachable - Scintilla's own list is unavailable to an
-        overlay, and hiding ours behind a guess would leave no way to get at
-        them.
+        * ``"fields"``    - field names from the configured lookup table if
+          one is set, otherwise the current layer's own fields.
+        * ``"values"``    - values for the field just named, from the lookup
+          table if configured (grouped by the group field, when set),
+          otherwise the field's own first N non-null values (N from Settings).
+        * ``"variables"`` - variable names.
+        * anything else   - the full list of functions, variables and
+          operators, grouped exactly as the Expression Builder groups them.
+
+        None of this needs a configured lookup table - it is only ever used
+        to narrow and enrich the fields/values lists when one is present, so
+        Ctrl+Space works the same on a project where nothing has been set up.
         """
-        from .rtl_readmode import _find_context_layer
-
         try:
             layer = _find_context_layer(probe)
         except Exception:
             layer = None
 
-        entries: List[AutocompleteEntry] = []
+        usable, _ = Settings.autocomplete_is_usable()
+        tables = resolve_table_candidates(probe) if usable else []
 
-        def add_fields() -> None:
-            for name in context_field_names(layer):
-                entries.append(
-                    AutocompleteEntry(
-                        value=f'"{name}"',
-                        group_code=GROUP_FIELDS,
-                        display_text=name,
-                        insert_text=f'"{name}"',
-                    )
-                )
+        if kind == "fields":
+            return self._field_entries(layer, usable, tables)
+        if kind == "values":
+            return self._value_entries(text_before, layer, usable, tables)
+        if kind == "variables":
+            return self._variable_entries(layer)
+        return self._full_entries(layer)
 
-        def add_functions() -> None:
-            for name, signature, help_html, param_count in builtin_functions():
-                entries.append(
-                    AutocompleteEntry(
-                        value=name,
-                        group_code=GROUP_FUNCTIONS,
-                        display_text=signature,
-                        insert_text=f"{name}()",
-                        help_text=help_html,
-                        # Land the caret between the parentheses when the
-                        # function takes arguments; after them when it does not.
-                        caret_offset=1 if param_count else 0,
-                    )
-                )
-
-        def add_variables() -> None:
-            for name in builtin_variables(layer):
-                entries.append(
-                    AutocompleteEntry(
-                        value=f"@{name}",
-                        group_code=GROUP_VARIABLES,
-                        display_text=f"@{name}",
-                        insert_text=f"@{name}",
-                    )
-                )
-
-        def add_operators() -> None:
-            for token in _OPERATORS:
-                entries.append(
-                    AutocompleteEntry(
-                        value=token, group_code=GROUP_OPERATORS, display_text=token
-                    )
-                )
-
-        def add_values() -> None:
-            field_name = detect_field_name(text_before)
-            if not field_name:
-                return
-            self._field_name = field_name
+    @staticmethod
+    def _field_entries(layer, usable: bool, tables: Sequence[str]) -> List[AutocompleteEntry]:
+        """Field names: the configured lookup table if set, else the layer's."""
+        names: List[str] = []
+        if usable:
             try:
-                tables = resolve_table_candidates(probe)
+                names = cache().lookup_field_names(tables)
+            except Exception as exc:
+                _dbg(f"Field-name lookup failed: {exc}")
+        if not names:
+            names = context_field_names(layer)
+        return [
+            AutocompleteEntry(
+                value=f'"{name}"',
+                group_code=GROUP_FIELDS,
+                display_text=name,
+                insert_text=f'"{name}"',
+            )
+            for name in names
+        ]
+
+    def _value_entries(
+        self, text_before: str, layer, usable: bool, tables: Sequence[str]
+    ) -> List[AutocompleteEntry]:
+        """Values for the field before the caret: lookup table, else the layer."""
+        field_name = detect_field_name(text_before)
+        if not field_name:
+            return []
+        self._field_name = field_name
+
+        if usable:
+            try:
                 found = cache().lookup(field_name, tables)
             except Exception as exc:
                 _dbg(f"Value lookup failed: {exc}")
-                return
-            for entry in found:
-                if not entry.group_code and not entry.group_description:
-                    entry.group_code = GROUP_VALUES
-                entries.append(entry)
+                found = []
+            if found:
+                entries = []
+                for entry in found:
+                    if not entry.group_code and not entry.group_description:
+                        entry.group_code = GROUP_VALUES
+                    entries.append(entry)
+                return entries
 
-        if kind == "fields":
-            add_fields()
-            if not entries:
-                # No layer resolved - fall back to the lookup table's own list.
-                self._offer_field_names_into(entries, probe)
-        elif kind == "variables":
-            add_variables()
-        elif kind == "values":
-            add_values()
-            add_functions()
-            add_variables()
-        else:
-            add_fields()
-            add_functions()
-            add_variables()
-            add_operators()
+        # No configured table, or nothing in it for this field: fall back to
+        # the first few distinct, non-null values already in the layer.
+        limit = Settings.max_suggested_values()
+        return [
+            AutocompleteEntry(value=v, group_code=GROUP_VALUES)
+            for v in layer_first_values(layer, field_name, limit)
+        ]
 
-        return entries
+    @staticmethod
+    def _variable_entries(layer) -> List[AutocompleteEntry]:
+        return [
+            AutocompleteEntry(
+                value=f"@{name}",
+                group_code=GROUP_VARIABLES,
+                display_text=f"@{name}",
+                insert_text=f"@{name}",
+            )
+            for name in builtin_variables(layer)
+        ]
 
-    def _offer_field_names_into(self, entries: List[AutocompleteEntry], probe) -> None:
-        """Field names taken from the lookup table, when the layer is unknown."""
-        try:
-            tables = resolve_table_candidates(probe)
-            for name in cache().lookup_field_names(tables):
-                entries.append(
-                    AutocompleteEntry(
-                        value=f'"{name}"',
-                        group_code=GROUP_FIELDS,
-                        display_text=name,
-                        insert_text=f'"{name}"',
-                    )
+    @staticmethod
+    def _full_entries(layer) -> List[AutocompleteEntry]:
+        """Everything that is not a field or a value.
+
+        Grouped exactly like the Expression Builder's own tree: each function
+        under its real category (Aggregates, Arrays, Color, Conditionals,
+        Geometry, Operators, ...), reported by QgsExpression itself, plus
+        Variables and Operators as their own groups.
+        """
+        entries: List[AutocompleteEntry] = list(
+            CustomAutocompleteController._variable_entries(layer)
+        )
+
+        for name, _signature, help_html, param_count, group in builtin_functions():
+            entries.append(
+                AutocompleteEntry(
+                    value=name,
+                    group_code=group,
+                    # Name only, per spec - the signature still shows up in
+                    # the tooltip and in the call tip after insertion.
+                    display_text=name,
+                    insert_text=f"{name}()",
+                    help_text=help_html,
+                    # Land the caret between the parentheses when the
+                    # function takes arguments; after them when it does not.
+                    caret_offset=1 if param_count else 0,
                 )
-        except Exception as exc:
-            _dbg(f"Field-name fallback failed: {exc}")
+            )
+
+        for token in _OPERATORS:
+            entries.append(
+                AutocompleteEntry(value=token, group_code=GROUP_OPERATORS, display_text=token)
+            )
+
+        entries.sort(key=lambda e: (e.group_label.lower(), e.display.lower()))
+        return entries
 
     def _offer_field_names(self) -> None:
         """Populate the popup with field names rather than values."""
@@ -1730,26 +1811,46 @@ class CustomAutocompleteController(QObject):
         # Replace the partial token, then insert.  This is a normal document
         # edit, so the existing overlay -> Scintilla synchronisation picks it up
         # through textChanged like any keystroke would.
+        editor = self._editor
         token_len = len(self._current_token())
-        cursor = self._editor.textCursor()
+        text = editor.toPlainText()
+        caret_pos = editor.textCursor().position()
+
+        # Field and value entries are inserted already wrapped in their own
+        # matching pair of quotes. _current_token() only matches word
+        # characters, so it never includes the quote the user typed to open
+        # the token - e.g. after typing `"N`, the token is just "N". Left
+        # unhandled, replacing only "N" leaves that opening quote behind and
+        # insert_text adds its own, producing `""NAME"` instead of `"NAME"`.
+        # So when such a quote sits immediately before the token, it is
+        # consumed too: it will be supplied by insert_text instead.
+        quote_char = '"' if self._field_mode else ("'" if self._value_mode else None)
+        remove_len = token_len
+        quote_start = caret_pos - token_len - 1
+        if (
+            quote_char
+            and insert_text.startswith(quote_char)
+            and quote_start >= 0
+            and text[quote_start] == quote_char
+        ):
+            remove_len += 1
+
+        # Close the quote for the user unless one is already sitting to the
+        # right of the caret - the same courtesy every editor extends when
+        # completing a bracketed or quoted token.
+        if quote_char and insert_text.endswith(quote_char):
+            after = text[caret_pos:caret_pos + 1]
+            if after == quote_char:
+                insert_text = insert_text[:-1]
+
+        cursor = editor.textCursor()
         cursor.beginEditBlock()
-        if token_len:
+        if remove_len:
             cursor.movePosition(
                 QTextCursor.MoveOperation.Left,
                 QTextCursor.MoveMode.KeepAnchor,
-                token_len,
+                remove_len,
             )
-        # In field-name mode, close the quote for the user unless one is already
-        # sitting to the right of the caret - the same courtesy every editor
-        # extends when completing a bracketed or quoted token.
-        if self._field_mode:
-            text = self._editor.toPlainText()
-            after = text[cursor.position():cursor.position() + 1]
-            # Field entries are inserted already quoted, so only trim when a
-            # closing quote is already sitting to the right of the caret.
-            if after == '"' and insert_text.endswith('"'):
-                insert_text = insert_text[:-1]
-
         cursor.insertText(insert_text)
         cursor.endEditBlock()
         if caret_offset:
@@ -1830,7 +1931,7 @@ class CustomAutocompleteController(QObject):
                 QToolTip.hideText()
                 return
 
-            for func_name, signature, help_html, _count in builtin_functions():
+            for func_name, signature, help_html, _count, _group in builtin_functions():
                 if func_name.lower() != name.lower():
                     continue
                 summary = re.sub(r"<[^>]+>", " ", help_html or "")

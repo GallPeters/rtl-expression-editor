@@ -436,6 +436,8 @@ def expression_context_key(widget) -> str:
     # rather than swallowed - a silent miss here is what dropped the layer id
     # from the key previously.
     try:
+        from .rtl_autocomplete import _find_context_layer
+
         layer = _find_context_layer(widget)
         if layer is not None:
             parts.append(layer.id())
