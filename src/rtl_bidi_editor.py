@@ -871,17 +871,33 @@ class RtlOverlayEditor(QPlainTextEdit):
         self._highlighter: Optional[BidiSyntaxHighlighter] = None
         self._completer: Optional[QCompleter] = None
 
-        # Scintilla's own call tip (the argument-hint rectangle) reacts to the
-        # very edits and caret moves the overlay -> Scintilla sync pushes into
-        # it, popping up behind our own popup (rtl_autocomplete.CallTipPopup)
-        # with no way for the user to dismiss it. Disabled up front wherever
-        # the API is reachable; _cancel_native_call_tip() below is the backup
-        # for when it is not.
+        # Scintilla's own call tip (the argument-hint rectangle) and its own
+        # autocompletion list both react to the very edits and caret moves the
+        # overlay -> Scintilla sync pushes into it, popping up behind our own
+        # popups (rtl_autocomplete.CallTipPopup / AutocompletePopup) with no
+        # way for the user to dismiss them - the autocompletion list in
+        # particular would open on every keystroke, never only on our
+        # Ctrl+Space trigger. Both are disabled up front wherever the API is
+        # reachable; _cancel_native_popups() below is the backup for when it
+        # is not.
         try:
             from qgis.PyQt.Qsci import QsciScintilla
 
             if isinstance(sci, QsciScintilla):
-                sci.setCallTipsStyle(QsciScintilla.CallTipsStyle.CallTipsNone)
+                # PyQt6 nests these enums under the class; PyQt5 exposes them
+                # flat on QsciScintilla itself. Try both rather than assuming
+                # one binding.
+                calltips_none = getattr(
+                    getattr(QsciScintilla, "CallTipsStyle", QsciScintilla),
+                    "CallTipsNone",
+                )
+                acs_none = getattr(
+                    getattr(QsciScintilla, "AutoCompletionSource", QsciScintilla),
+                    "AcsNone",
+                )
+                sci.setCallTipsStyle(calltips_none)
+                sci.setAutoCompletionSource(acs_none)
+                sci.setAutoCompletionThreshold(-1)
         except Exception:
             pass
 
@@ -1290,7 +1306,7 @@ class RtlOverlayEditor(QPlainTextEdit):
                 # stops the echo from coming back to us.
                 self._sci.setText(text)
             self._push_cursor_to_sci()
-            self._cancel_native_call_tip()
+            self._cancel_native_popups()
         except RuntimeError:
             self._detached = True
         except Exception as exc:
@@ -1304,7 +1320,7 @@ class RtlOverlayEditor(QPlainTextEdit):
         self._syncing = True
         try:
             self._push_cursor_to_sci()
-            self._cancel_native_call_tip()
+            self._cancel_native_popups()
         except RuntimeError:
             self._detached = True
         except Exception as exc:
@@ -1323,16 +1339,23 @@ class RtlOverlayEditor(QPlainTextEdit):
             line, index = _line_index_from_offset(text, cursor.position())
             self._sci.setCursorPosition(line, index)
 
-    def _cancel_native_call_tip(self) -> None:
-        """Belt-and-suspenders backup for the ``setCallTipsStyle`` call above.
+    def _cancel_native_popups(self) -> None:
+        """Belt-and-suspenders backup for the setup done in ``__init__``.
 
-        Cancels any call tip Scintilla just raised in response to the push,
-        synchronously and before Qt gets back to painting - covering the case
-        where ``setCallTipsStyle`` was unreachable (a degraded, Base-only
-        wrapper; see the class docstring on cross-module sip casts).
+        Cancels any call tip or autocompletion list Scintilla just raised in
+        response to the push, synchronously and before Qt gets back to
+        painting - covering the case where ``setCallTipsStyle`` /
+        ``setAutoCompletionSource`` were unreachable (a degraded, Base-only
+        wrapper; see the class docstring on cross-module sip casts). Without
+        this, typing into the overlay could still pop Scintilla's own
+        suggestion list open on every keystroke, never only on Ctrl+Space.
         """
         try:
             self._sci.SendScintilla(self._sci.SCI_CALLTIPCANCEL)
+        except Exception:
+            pass
+        try:
+            self._sci.SendScintilla(self._sci.SCI_AUTOCCANCEL)
         except Exception:
             pass
 
