@@ -1179,25 +1179,21 @@ class AutocompletePopup(QListWidget):
 
 
 class CallTipPopup(QLabel):
-    """A small, clickable replacement for QToolTip, used for signature hints.
+    """A small signature-hint popup, styled like a tooltip.
 
-    QToolTip cannot host a "more" link: clicking anywhere inside one just
-    dismisses it, and it exposes no interaction signal at all - so the full
-    help text had no way to be reached beyond the first ~220 characters. This
-    is an ordinary label instead, styled to look the same, but able to expand
-    its own text in place when the link is clicked.
+    An ordinary label rather than QToolTip so ``show_call_tip`` fully
+    controls when it appears and disappears - QToolTip only ever hides
+    itself on a timer or on the next mouse move, neither of which lines up
+    with "the caret left the function call".
     """
 
     def __init__(self, editor):
         super().__init__(None)
         self._editor = editor
-        self._full_body = ""
         self.setWindowFlags(Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setTextFormat(Qt.TextFormat.RichText)
-        self.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
-        self.setOpenExternalLinks(False)
         self.setWordWrap(True)
         self.setMargin(6)
         self.setMaximumWidth(480)
@@ -1205,21 +1201,17 @@ class CallTipPopup(QLabel):
             "QLabel { background-color: #ffffe1; color: #202020; "
             "border: 1px solid #b0b0b0; }"
         )
-        self.linkActivated.connect(self._on_link_activated)
 
-    def show_body(self, short_body: str, full_body: str, point) -> None:
-        """Display ``short_body``; ``full_body`` is swapped in on "more"."""
-        self._full_body = full_body
-        self.setText(short_body)
+    def show_body(self, body: str, point) -> None:
+        self.setText(body)
         self.adjustSize()
         self.move(point)
         self.show()
         self.raise_()
 
-    def _on_link_activated(self, href: str) -> None:
-        if href == "more" and self._full_body:
-            self.setText(self._full_body)
-            self.adjustSize()
+    def reposition(self, point) -> None:
+        """Follow the parent window without changing what is displayed."""
+        self.move(point)
 
 
 # --------------------------------------------------------------------------- #
@@ -1255,10 +1247,33 @@ class CustomAutocompleteController(QObject):
         #: True while a key event is being re-sent to the editor, to stop the
         #: editor branch of eventFilter from re-entering the popup handler.
         self._forwarding = False
+        #: True for the one cursor move right after Enter, so the call tip
+        #: stays closed even though the caret may still be enclosed by the
+        #: same (now multi-line) call.
+        self._suppress_call_tip_once = False
         try:
             editor.installEventFilter(self)
         except Exception as exc:
             _log(f"Custom autocomplete not attached: {exc}", Qgis.MessageLevel.Warning)
+
+        # The call tip must track the caret continuously, not just on the
+        # keystrokes that used to trigger it: moving the caret out of a
+        # call's parentheses (an arrow key, a mouse click, undo/redo, a field
+        # inserted by a QGIS toolbar button) should close it exactly as
+        # typing ')' does, and moving back in should reopen it. Both are the
+        # same recomputation, so one signal covers every way the caret moves.
+        try:
+            editor.cursorPositionChanged.connect(self._on_cursor_moved)
+        except Exception:
+            pass
+
+        # New text should offer suggestions as it is typed, the same three
+        # contexts Ctrl+Space already recognises (fields, values, the full
+        # grouped list) - see _auto_trigger.
+        try:
+            editor.textChanged.connect(self._auto_trigger_soon)
+        except Exception:
+            pass
 
         # Both popups are Qt.ToolTip windows with WA_ShowWithoutActivating, so
         # they never go through the editor's own focus-in/out cycle - neither
@@ -1275,6 +1290,15 @@ class CustomAutocompleteController(QObject):
         except Exception:
             pass
 
+        # The call tip is glued to the caret's screen position; if the dialog
+        # itself moves or resizes, that position moves with it.
+        try:
+            window = editor.window()
+            if window is not None:
+                window.installEventFilter(self)
+        except Exception:
+            pass
+
     # -- teardown ---------------------------------------------------------- #
 
     def teardown(self) -> None:
@@ -1285,6 +1309,23 @@ class CustomAutocompleteController(QObject):
             app = QApplication.instance()
             if app is not None:
                 app.focusWindowChanged.disconnect(self._on_focus_window_changed)
+        except Exception:
+            pass
+        try:
+            if self._editor is not None:
+                self._editor.cursorPositionChanged.disconnect(self._on_cursor_moved)
+        except Exception:
+            pass
+        try:
+            if self._editor is not None:
+                self._editor.textChanged.disconnect(self._auto_trigger_soon)
+        except Exception:
+            pass
+        try:
+            if self._editor is not None:
+                window = self._editor.window()
+                if window is not None:
+                    window.removeEventFilter(self)
         except Exception:
             pass
         try:
@@ -1370,11 +1411,14 @@ class CustomAutocompleteController(QObject):
                     if self._is_trigger(event):
                         self.trigger()
                         return True
-                    # '(' raises the signature hint, ',' advances the
-                    # highlighted argument (or closes the tip if it is past
-                    # the last one), and ')' re-checks it - closing the
-                    # innermost call may still leave the caret inside an outer
-                    # one. Deferred so the character is in the document first.
+                    # Enter always closes the call tip, matching QGIS's own
+                    # function helper - even though the caret may still be
+                    # enclosed by the same call once Enter inserts a newline
+                    # (multi-line calls are legal). cursorPositionChanged
+                    # (see _on_cursor_moved) is what actually shows/hides the
+                    # tip as the caret moves - including in and out of a call
+                    # via '(', ',' and ')' - so this only needs to mark the
+                    # one recomputation right after Enter as an exception.
                     #
                     # Escape is deliberately NOT used to dismiss the call tip:
                     # unlike the completion popup (a real Qt.Popup with its
@@ -1383,12 +1427,8 @@ class CustomAutocompleteController(QObject):
                     # dialog's own Escape-closes-the-dialog shortcut claims it
                     # first, at the ShortcutOverride stage. Consuming it here
                     # would be a no-op at best and confusing at worst.
-                    if event.text() in ("(", ",", ")"):
-                        self._call_tip_soon()
-                    elif event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-                        # Matches QGIS's own function helper: Enter closes it,
-                        # same as finishing the call.
-                        self._hide_call_tip()
+                    if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                        self._suppress_call_tip_once = True
                 elif event_type == QEvent.Type.FocusOut:
                     # Showing a Qt.Popup window takes the keyboard grab, which
                     # makes Qt deliver FocusOut to the editor with reason
@@ -1414,6 +1454,11 @@ class CustomAutocompleteController(QObject):
                     # Scrolling or the dialog closing leaves a floating list stale.
                     self.hide_popup()
                     self._hide_call_tip()
+                return False
+
+            # --- the dialog itself: keep the call tip glued to the caret --- #
+            if event_type in (QEvent.Type.Move, QEvent.Type.Resize):
+                self._reposition_call_tip()
         except Exception as exc:
             _log(f"Custom autocomplete error: {exc}", Qgis.MessageLevel.Warning)
         return False
@@ -1665,13 +1710,19 @@ class CustomAutocompleteController(QObject):
 
     # -- the feature ------------------------------------------------------- #
 
-    def trigger(self) -> None:
-        """Ctrl+Space: detect the context, fetch entries, show the popup.
+    def trigger(self, auto: bool = False) -> None:
+        """Ctrl+Space (or automatically, while typing): show the popup.
 
         Works with no configuration at all: fields, functions, variables and
         operators are always available. A lookup table configured in Settings
         only narrows and enriches the field-name and value lists; it is never
         required for the feature to be active.
+
+        ``auto`` is True when this came from typing rather than Ctrl+Space
+        (see ``_auto_trigger``): the explanatory "Nothing to suggest here"
+        notice is worth showing for a deliberate Ctrl+Space press that turned
+        up nothing, but would be pure noise appearing on its own as the user
+        types past a context with nothing to offer.
         """
         editor = self._editor
         if editor is None:
@@ -1687,10 +1738,54 @@ class CustomAutocompleteController(QObject):
         self._entries = self._collect_entries(kind, text_before, probe)
 
         if not self._entries:
-            self._notice("Nothing to suggest here")
+            if not auto:
+                self._notice("Nothing to suggest here")
             return
 
         self._refilter(show=True)
+
+    def _auto_trigger_soon(self) -> None:
+        """Open the suggestion list automatically as the user types.
+
+        Deferred to the end of the event loop turn, the same way
+        ``_refilter_soon`` is, so the just-typed character is already in the
+        document and the caret already moved by the time the context is
+        evaluated. Skipped while a key is being forwarded to the editor by
+        the popup itself (``_on_popup_key``/``_refilter_soon`` already own
+        that keystroke) to avoid doing the same work twice.
+        """
+        if self._forwarding:
+            return
+        from qgis.PyQt.QtCore import QTimer
+
+        QTimer.singleShot(0, self._auto_trigger)
+
+    def _auto_trigger(self) -> None:
+        editor = self._editor
+        if editor is None:
+            return
+        if self._popup is not None and self._popup.isVisible():
+            # Already open; typing narrows or closes it through the normal
+            # key handling instead.
+            return
+        try:
+            cursor = editor.textCursor()
+            if cursor.hasSelection():
+                return
+            text_before = editor.toPlainText()[: cursor.position()]
+            kind = suggestion_context(text_before)
+            if kind == "mixed" and not self._current_token():
+                # Fields and values are anchored to a delimiter the user just
+                # typed ('"' or "'"), so showing them immediately makes sense
+                # even with nothing typed yet. The full function/variable/
+                # operator list has no such anchor - opening it on every
+                # keystroke that is not building a word (a space, an
+                # operator, a digit with no prefix) would be far too noisy,
+                # so it waits for an actual prefix to narrow it by.
+                return
+            self.trigger(auto=True)
+        except Exception as exc:
+            _dbg(f"Auto-trigger failed: {exc}")
 
     def _collect_entries(self, kind: str, text_before: str, probe) -> List[AutocompleteEntry]:
         """Build the entry list for this context. One rule per context:
@@ -2054,13 +2149,28 @@ class CustomAutocompleteController(QObject):
 
         QTimer.singleShot(0, self.show_call_tip)
 
+    def _on_cursor_moved(self) -> None:
+        """Keep the call tip in sync with wherever the caret now is.
+
+        Fires on every caret move for any reason at all - typing '(', ',' or
+        ')', the arrow keys, a mouse click, undo/redo, a field or function a
+        QGIS toolbar button inserted - so the tip opens the moment the caret
+        sits inside a call's parentheses and closes the moment it does not,
+        without needing to special-case each way the caret can move there.
+        """
+        if self._suppress_call_tip_once:
+            self._suppress_call_tip_once = False
+            self._hide_call_tip()
+            return
+        self.show_call_tip()
+
     def show_call_tip(self) -> None:
         """Signature hint for the function enclosing the caret.
 
         Our own popup rather than Scintilla's call tip, which has the same
         limitation as its completion list: it needs Scintilla to own the input
-        loop. Highlights the argument the caret is currently sitting in, and
-        offers a "more" link to the full help text when it was truncated.
+        loop. Just the name and its arguments - no help text - with the
+        argument the caret is currently sitting in shown in bold.
         """
         editor = self._editor
         if editor is None:
@@ -2073,7 +2183,7 @@ class CustomAutocompleteController(QObject):
                 self._hide_call_tip()
                 return
 
-            for func_name, _signature, help_html, _count, _group, params in builtin_functions():
+            for func_name, _signature, _help_html, _count, _group, params in builtin_functions():
                 if func_name.lower() != name.lower():
                     continue
                 arg_index = self._argument_index(text, open_index, position)
@@ -2083,37 +2193,34 @@ class CustomAutocompleteController(QObject):
                     # leaving nothing sensible highlighted.
                     self._hide_call_tip()
                     return
-                signature_html = self._signature_html(name, params, arg_index)
 
-                summary = re.sub(r"<[^>]+>", " ", help_html or "")
-                summary = re.sub(r"\s+", " ", summary).strip()
-                short_summary = summary
-                truncated = False
-                if len(short_summary) > 220:
-                    short_summary = short_summary[:220].rsplit(" ", 1)[0] + "..."
-                    truncated = True
-
-                short_body = signature_html
-                full_body = signature_html
-                if summary:
-                    short_body += f"<br>{short_summary}"
-                    full_body += f"<br>{summary}"
-                if truncated:
-                    short_body += ' <a href="more">more</a>'
-
-                point = editor.mapToGlobal(editor.cursorRect().bottomLeft())
-                self._show_call_tip_popup(short_body, full_body, point)
+                body = self._signature_html(name, params, arg_index)
+                point = self._call_tip_point()
+                if self._call_tip is None:
+                    self._call_tip = CallTipPopup(editor)
+                self._call_tip.show_body(body, point)
                 return
             self._hide_call_tip()
         except Exception as exc:
             _dbg(f"Call tip failed: {exc}")
 
-    def _show_call_tip_popup(self, short_body: str, full_body: str, point) -> None:
-        if self._editor is None:
-            return
-        if self._call_tip is None:
-            self._call_tip = CallTipPopup(self._editor)
-        self._call_tip.show_body(short_body, full_body, point)
+    def _call_tip_point(self):
+        """Global position for the call tip: just under the caret."""
+        editor = self._editor
+        return editor.mapToGlobal(editor.cursorRect().bottomLeft())
+
+    def _reposition_call_tip(self) -> None:
+        """Keep the call tip glued to the caret when the window itself moves.
+
+        Repositioning rather than recomputing content: a window move or
+        resize does not change what the caret is enclosed by, only where that
+        position now is on screen.
+        """
+        if self._call_tip is not None and self._call_tip.isVisible() and self._editor is not None:
+            try:
+                self._call_tip.reposition(self._call_tip_point())
+            except Exception:
+                pass
 
     def _hide_call_tip(self) -> None:
         if self._call_tip is not None:
@@ -2181,11 +2288,11 @@ class CustomAutocompleteController(QObject):
 
     @staticmethod
     def _signature_html(name: str, params: List[str], arg_index: int) -> str:
-        """The signature as HTML, with the current argument underlined."""
+        """The signature as HTML, with the current argument in bold."""
         if not params:
             return f"<b>{name}</b>()"
         parts = [
-            f'<u>{param}</u>' if i == arg_index else param
+            f'<b>{param}</b>' if i == arg_index else param
             for i, param in enumerate(params)
         ]
         return f"<b>{name}</b>({', '.join(parts)})"
