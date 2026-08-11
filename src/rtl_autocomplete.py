@@ -2318,13 +2318,20 @@ class CustomAutocompleteController(QObject):
             index += 1
         return argument
 
-    @staticmethod
-    def _signature_html(name: str, params: List[str], arg_index: int) -> str:
-        """The signature as HTML, with the current argument in bold."""
+    #: Colour marking the argument the caret is currently in - distinct from
+    #: the plain-bold function name, so the two kinds of emphasis read as
+    #: different things at a glance.
+    _CURRENT_ARG_COLOR = "#c0392b"
+
+    @classmethod
+    def _signature_html(cls, name: str, params: List[str], arg_index: int) -> str:
+        """The signature as HTML, with the current argument in colour."""
         if not params:
             return f"<b>{name}</b>()"
         parts = [
-            f'<b>{param}</b>' if i == arg_index else param
+            f'<span style="color:{cls._CURRENT_ARG_COLOR};">{param}</span>'
+            if i == arg_index
+            else param
             for i, param in enumerate(params)
         ]
         return f"<b>{name}</b>({', '.join(parts)})"
