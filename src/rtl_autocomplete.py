@@ -1256,12 +1256,32 @@ class CustomAutocompleteController(QObject):
         except Exception as exc:
             _log(f"Custom autocomplete not attached: {exc}", Qgis.MessageLevel.Warning)
 
+        # Both popups are Qt.ToolTip windows with WA_ShowWithoutActivating, so
+        # they never go through the editor's own focus-in/out cycle when the
+        # user switches to a *different application* - alt-tabbing away left
+        # them floating on top of whatever came next. applicationStateChanged
+        # is the one signal that actually reports "QGIS as a whole is no
+        # longer the active application", independent of which QGIS window or
+        # dialog has focus internally.
+        try:
+            app = QApplication.instance()
+            if app is not None:
+                app.applicationStateChanged.connect(self._on_app_state_changed)
+        except Exception:
+            pass
+
     # -- teardown ---------------------------------------------------------- #
 
     def teardown(self) -> None:
         """Called from the editor's detach(); safe to call more than once."""
         self.hide_popup()
         self._hide_call_tip()
+        try:
+            app = QApplication.instance()
+            if app is not None:
+                app.applicationStateChanged.disconnect(self._on_app_state_changed)
+        except Exception:
+            pass
         try:
             if self._editor is not None:
                 self._editor.removeEventFilter(self)
@@ -1339,6 +1359,16 @@ class CustomAutocompleteController(QObject):
                         # Keys normally reach the popup; if one arrives here
                         # anyway, handle it identically.
                         return self._on_popup_key(event)
+                    if event.key() == Qt.Key.Key_Escape and (
+                        self._call_tip is not None and self._call_tip.isVisible()
+                    ):
+                        # No completion list is open to claim Escape itself
+                        # (the branch above owns that case), so the call tip
+                        # needs its own dismissal here. Consumed only when
+                        # there was something to dismiss, so a second Escape
+                        # still reaches the dialog to close it as usual.
+                        self._hide_call_tip()
+                        return True
                     if self._is_diagnostic(event):
                         self._show_report()
                         return True
@@ -1379,6 +1409,20 @@ class CustomAutocompleteController(QObject):
         except Exception as exc:
             _log(f"Custom autocomplete error: {exc}", Qgis.MessageLevel.Warning)
         return False
+
+    def _on_app_state_changed(self, state) -> None:
+        """Hide both popups the moment QGIS stops being the active app."""
+        try:
+            active = Qt.ApplicationState.ApplicationActive
+        except Exception:
+            active = getattr(Qt, "ApplicationActive", None)
+        if active is None or state == active:
+            # Either QGIS is still the active application, or the enum could
+            # not be resolved at all - in which case there is nothing safe to
+            # compare against, so err on the side of not hiding anything.
+            return
+        self.hide_popup()
+        self._hide_call_tip()
 
     def _event_inside_popup(self, event) -> bool:
         """True when a mouse event landed within the popup's own rectangle."""
@@ -1528,6 +1572,7 @@ class CustomAutocompleteController(QObject):
 
         if key == Qt.Key.Key_Escape:
             self.hide_popup()
+            self._hide_call_tip()
             return True
         if key == Qt.Key.Key_Down:
             self._popup.move_selection(1)
