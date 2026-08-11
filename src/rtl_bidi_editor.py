@@ -212,7 +212,16 @@ OVERLAY_FOREGROUND = ""
 DEBUG = True
 
 ENABLE_HIGHLIGHTING = True
-ENABLE_COMPLETER = True
+
+#: Off by default: this was the overlay's own always-on word completer,
+#: opening an ungrouped popup on every keystroke once COMPLETER_MIN_PREFIX
+#: characters were typed - with no way to ask for it, and no way to dismiss
+#: it short of typing past it. rtl_autocomplete.CustomAutocompleteController
+#: now covers the same ground (fields, functions, variables, values) and
+#: then some (grouping, a configurable lookup table), triggered only by
+#: Ctrl+Space. Left in place, disabled, rather than deleted, in case a future
+#: build needs a minimal fallback with no autocomplete module at all.
+ENABLE_COMPLETER = False
 
 #: Minimum prefix length before the completion popup appears.
 COMPLETER_MIN_PREFIX = 2
