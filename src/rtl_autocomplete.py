@@ -1374,6 +1374,16 @@ class CustomAutocompleteController(QObject):
 
             # --- popup is open: it owns the keyboard and mouse grabs ------- #
             if popup is not None and obj is popup:
+                if event_type == QEvent.Type.ShortcutOverride and event.key() == Qt.Key.Key_Escape:
+                    # The popup declines focus (see AutocompletePopup.__init__,
+                    # setFocusPolicy(NoFocus) + setFocusProxy(editor)), so it is
+                    # not certain whether Qt routes Escape's ShortcutOverride to
+                    # the popup itself or to the editor it proxies to - claim it
+                    # on whichever object actually gets it, so a dialog-level
+                    # Escape shortcut never wins the race against the KeyPress
+                    # that follows.
+                    event.accept()
+                    return True
                 if event_type == QEvent.Type.KeyPress:
                     return self._on_popup_key(event)
                 if event_type in (
@@ -2339,7 +2349,7 @@ class CustomAutocompleteController(QObject):
     #: Colour marking the argument the caret is currently in - distinct from
     #: the plain-bold function name, so the two kinds of emphasis read as
     #: different things at a glance.
-    _CURRENT_ARG_COLOR = "#c0392b"
+    _CURRENT_ARG_COLOR = "#1a5fb4"
 
     @classmethod
     def _signature_html(cls, name: str, params: List[str], arg_index: int) -> str:

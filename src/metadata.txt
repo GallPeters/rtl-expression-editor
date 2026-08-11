@@ -41,14 +41,16 @@ server=False
     - Improved: simplified suggestion rules - field names after ", values after ', everything else otherwise.
     - Improved: the function helper now follows the caret and the window, and opens or closes automatically when moving in or out of a function call.
     - Improved: the function helper now shows the current argument in color and no longer shows a description.
-    - Improved: word highlighting now always matches whole words only, with the selected word shown clearly and other matches shown faintly.
+    - Improved: word highlighting now always matches whole words only, with the selected word shown clearly and other matches shown in a lighter, but still clearly visible, color.
     - Improved: the suggestion list and function helper are now positioned further from the text so they no longer overlap it.
+    - Improved: the function helper's current argument is now shown in blue instead of red.
     - Fixed: a crash that could break autocomplete ("cannot import name _find_context_layer").
     - Fixed: the suggestion list and function helper sometimes opened without pressing Ctrl+Space.
     - Fixed: the function helper could get stuck on screen after switching to another window.
     - Fixed: selecting a suggestion sometimes duplicated quote characters.
     - Fixed: the plugin name showed as "RTL BiDi Editor" in the Log Messages panel.
     - Fixed: pressing Escape while the suggestion list was open could close the whole window instead of just the list.
+    - Fixed: pressing Enter in the Ctrl+H replace field could replace all occurrences instead of just the current one.
 
 ** v1.3 (10.08.2026):
   - Improved: the suggestion list now shows values without their surrounding quotes.

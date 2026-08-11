@@ -742,7 +742,7 @@ class OccurrenceHighlighter(QObject):
 
     def _build_format(self) -> None:
         """Two strengths of the same colour: strong for the selected word,
-        barely-there for its other occurrences.
+        clearly visible (but weaker) for its other occurrences.
 
         Derived from the palette rather than hard-coded, so it tracks a custom
         GUI theme automatically. The lightness guard is the same one the
@@ -763,10 +763,10 @@ class OccurrenceHighlighter(QObject):
         self._format_current = QTextCharFormat()
         self._format_current.setBackground(strong)
 
-        faint = QColor(tint)
-        faint.setAlpha(28)
+        other = QColor(tint)
+        other.setAlpha(110)
         self._format_other = QTextCharFormat()
-        self._format_other.setBackground(faint)
+        self._format_other.setBackground(other)
 
     # -- matching ---------------------------------------------------------- #
 
@@ -936,7 +936,15 @@ class ReplaceBarShortcuts(QObject):
             replace_btn = None
             replace_all_btn = None
             for button in node.findChildren(QAbstractButton):
-                label = ((button.text() or "") + " " + (button.toolTip() or "")).lower()
+                label = " ".join(
+                    part or ""
+                    for part in (
+                        button.text(),
+                        button.toolTip(),
+                        button.accessibleName(),
+                        button.objectName(),
+                    )
+                ).lower()
                 label = label.replace("&", "")
                 if "replace" not in label:
                     continue
@@ -958,15 +966,22 @@ class ReplaceBarShortcuts(QObject):
             and event.type() == QEvent.Type.KeyPress
             and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
         ):
+            # Consumed unconditionally, matched button or not: a QLineEdit's
+            # own Enter/Return handling falls through to whichever button in
+            # the dialog is the "default" one (setDefault/autoDefault) once
+            # nothing else claims the key - that button is not necessarily
+            # "Replace" here. Letting that happen even once (because
+            # self._replace_btn came up empty) meant plain Enter could
+            # silently trigger Replace All instead of doing nothing.
             shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
             target = self._replace_all_btn if shift else self._replace_btn
             if target is not None:
                 try:
                     if target.isEnabled():
                         target.click()
-                    return True
                 except Exception:
                     pass
+            return True
         return False
 
     # -- teardown ------------------------------------------------------------ #
