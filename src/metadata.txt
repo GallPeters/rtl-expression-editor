@@ -11,7 +11,7 @@ about=QGIS's built-in editor (QScintilla) does not display right-to-left text co
 
 
     When a custom auto-complete source is configured, an optional Read Mode switch appears inside the editor. Read Mode shows the value descriptions instead of the stored codes, making a long expression far easier tounderstand, and never alters the expression itself. Where the same code has different meanings in different groups, the description you picked is saved in the project file and restored automatically, so Read Mode always shows the right one, for everyone who opens the project.
-version=1.3
+version=1.4
 author=Jossef Kanter
 email=jossefkan@gmail.com
 
@@ -29,7 +29,7 @@ server=False
 
 ** v1.4(12.08.2026):
     - Added: Ctrl+Space now also suggests fields, functions and variables, with signatures and help.
-    - Added: typing "(" shows the function's signature and description.
+    - Added: typing parentheses shows the function's signature and description.
     - Added: selecting a word now highlights its other occurrences, including while using Find.
     - Added: autocomplete now works even without a configured lookup table.
     - Added: suggestions now also appear automatically while typing, not only with Ctrl+Space.
@@ -48,6 +48,7 @@ server=False
     - Fixed: the function helper could get stuck on screen after switching to another window.
     - Fixed: selecting a suggestion sometimes duplicated quote characters.
     - Fixed: the plugin name showed as "RTL BiDi Editor" in the Log Messages panel.
+    - Fixed: pressing Escape while the suggestion list was open could close the whole window instead of just the list.
 
 ** v1.3 (10.08.2026):
   - Improved: the suggestion list now shows values without their surrounding quotes.

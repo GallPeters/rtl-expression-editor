@@ -1406,6 +1406,24 @@ class CustomAutocompleteController(QObject):
                 ):
                     event.accept()
                     return True
+                if (
+                    event_type == QEvent.Type.ShortcutOverride
+                    and event.key() == Qt.Key.Key_Escape
+                    and popup is not None
+                    and popup.isVisible()
+                ):
+                    # The popup declines focus and proxies it back to the
+                    # editor (see AutocompletePopup.__init__), so Qt still
+                    # sends ShortcutOverride to the editor even though the
+                    # popup's own keyboard grab is what actually delivers the
+                    # following KeyPress. If the dialog has an Escape
+                    # QShortcut of its own (many QDialogs do, for "close on
+                    # Escape"), it fires right here - before the grab ever
+                    # gets a say - and closes the dialog instead of the list.
+                    # Claiming the override keeps that from happening; the
+                    # KeyPress that follows is handled below as usual.
+                    event.accept()
+                    return True
                 if event_type == QEvent.Type.KeyPress and not self._forwarding:
                     if popup is not None and popup.isVisible():
                         # Keys normally reach the popup; if one arrives here
