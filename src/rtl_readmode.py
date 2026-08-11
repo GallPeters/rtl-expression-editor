@@ -35,7 +35,7 @@ from qgis.core import Qgis, QgsExpression, QgsFeatureRequest, QgsMessageLog
 
 from .rtl_settings import BUS, Settings
 
-LOG_TAG = "RTL BiDi Editor"
+LOG_TAG = "RTL Expression Editor"
 
 #: Object name of the overlay, excluded from the context chain.
 OVERLAY_HINT = "rtlBidiOverlayEditor"

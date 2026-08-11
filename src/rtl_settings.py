@@ -64,7 +64,7 @@ def _log(message: str) -> None:
     try:
         from qgis.core import Qgis, QgsMessageLog
 
-        QgsMessageLog.logMessage(message, "RTL BiDi Editor", Qgis.MessageLevel.Warning)
+        QgsMessageLog.logMessage(message, "RTL Expression Editor", Qgis.MessageLevel.Warning)
     except Exception:
         pass
 
@@ -167,7 +167,7 @@ class Settings:
             from rtl_bidi_editor.rtl_settings import Settings; Settings.dump()
         """
         print("=" * 68)
-        print("RTL BiDi editor - raw stored settings")
+        print("RTL Expression Editor - raw stored settings")
         print("=" * 68)
         try:
             settings = QgsSettings()

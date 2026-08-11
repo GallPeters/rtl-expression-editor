@@ -37,16 +37,16 @@ from qgis.PyQt.QtCore import QEvent, QObject, Qt
 from qgis.PyQt.QtGui import QColor, QFont, QTextCursor
 from qgis.PyQt.QtWidgets import (
     QApplication,
+    QLabel,
     QListWidget,
     QListWidgetItem,
-    QToolTip,
 )
 
 from qgis.core import Qgis, QgsExpression, QgsFeatureRequest, QgsMessageLog
 
 from .rtl_settings import BUS, Settings
 
-LOG_TAG = "RTL BiDi Editor"
+LOG_TAG = "RTL Expression Editor"
 
 #: Hard ceiling on rows pulled per lookup.  Protects against a misconfigured
 #: field selector turning into an unbounded read.
@@ -229,7 +229,7 @@ _FUNCTION_CACHE: Optional[List[tuple]] = None
 
 
 def builtin_functions() -> List[tuple]:
-    """Return ``(name, signature, help_html, param_count, group)`` per function.
+    """Return ``(name, signature, help_html, param_count, group, params)``.
 
     Scintilla's own completion cannot be reused from an overlay (it needs to own
     the input loop to filter and accept entries), so the list is rebuilt from
@@ -275,7 +275,7 @@ def builtin_functions() -> List[tuple]:
                     group = function.group() or GROUP_FUNCTIONS
                 except Exception:
                     group = GROUP_FUNCTIONS
-                functions.append((name, signature, help_html, len(params), group))
+                functions.append((name, signature, help_html, len(params), group, params))
             except Exception:
                 continue
     except Exception as exc:
@@ -1170,6 +1170,55 @@ class AutocompletePopup(QListWidget):
 
 
 # --------------------------------------------------------------------------- #
+# Call tip
+# --------------------------------------------------------------------------- #
+
+
+class CallTipPopup(QLabel):
+    """A small, clickable replacement for QToolTip, used for signature hints.
+
+    QToolTip cannot host a "more" link: clicking anywhere inside one just
+    dismisses it, and it exposes no interaction signal at all - so the full
+    help text had no way to be reached beyond the first ~220 characters. This
+    is an ordinary label instead, styled to look the same, but able to expand
+    its own text in place when the link is clicked.
+    """
+
+    def __init__(self, editor):
+        super().__init__(None)
+        self._editor = editor
+        self._full_body = ""
+        self.setWindowFlags(Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setTextFormat(Qt.TextFormat.RichText)
+        self.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        self.setOpenExternalLinks(False)
+        self.setWordWrap(True)
+        self.setMargin(6)
+        self.setMaximumWidth(480)
+        self.setStyleSheet(
+            "QLabel { background-color: #ffffe1; color: #202020; "
+            "border: 1px solid #b0b0b0; }"
+        )
+        self.linkActivated.connect(self._on_link_activated)
+
+    def show_body(self, short_body: str, full_body: str, point) -> None:
+        """Display ``short_body``; ``full_body`` is swapped in on "more"."""
+        self._full_body = full_body
+        self.setText(short_body)
+        self.adjustSize()
+        self.move(point)
+        self.show()
+        self.raise_()
+
+    def _on_link_activated(self, href: str) -> None:
+        if href == "more" and self._full_body:
+            self.setText(self._full_body)
+            self.adjustSize()
+
+
+# --------------------------------------------------------------------------- #
 # Controller
 # --------------------------------------------------------------------------- #
 
@@ -1192,6 +1241,7 @@ class CustomAutocompleteController(QObject):
         super().__init__(editor)
         self._editor = editor
         self._popup: Optional[AutocompletePopup] = None
+        self._call_tip: Optional[CallTipPopup] = None
         self._entries: List[AutocompleteEntry] = []
         self._field_name = ""
         #: True while the popup lists field names rather than values.
@@ -1211,6 +1261,7 @@ class CustomAutocompleteController(QObject):
     def teardown(self) -> None:
         """Called from the editor's detach(); safe to call more than once."""
         self.hide_popup()
+        self._hide_call_tip()
         try:
             if self._editor is not None:
                 self._editor.removeEventFilter(self)
@@ -1226,6 +1277,12 @@ class CustomAutocompleteController(QObject):
             except Exception:
                 pass
             self._popup = None
+        if self._call_tip is not None:
+            try:
+                self._call_tip.deleteLater()
+            except Exception:
+                pass
+            self._call_tip = None
         self._editor = None
 
     # -- event handling ---------------------------------------------------- #
@@ -1288,9 +1345,11 @@ class CustomAutocompleteController(QObject):
                     if self._is_trigger(event):
                         self.trigger()
                         return True
-                    # Typing '(' raises the signature hint. Deferred so the
-                    # character is in the document before we look for it.
-                    if event.text() == "(":
+                    # '(' raises the signature hint, ',' advances the
+                    # highlighted argument, and ')' re-checks it - closing the
+                    # innermost call may still leave the caret inside an outer
+                    # one. Deferred so the character is in the document first.
+                    if event.text() in ("(", ",", ")"):
                         self._call_tip_soon()
                 elif event_type == QEvent.Type.FocusOut:
                     # Showing a Qt.Popup window takes the keyboard grab, which
@@ -1309,12 +1368,14 @@ class CustomAutocompleteController(QObject):
                         transient = False
                     if not transient:
                         self.hide_popup()
+                        self._hide_call_tip()
                 elif event_type in (
                     QEvent.Type.Wheel,
                     QEvent.Type.Hide,
                 ):
                     # Scrolling or the dialog closing leaves a floating list stale.
                     self.hide_popup()
+                    self._hide_call_tip()
         except Exception as exc:
             _log(f"Custom autocomplete error: {exc}", Qgis.MessageLevel.Warning)
         return False
@@ -1658,7 +1719,7 @@ class CustomAutocompleteController(QObject):
             CustomAutocompleteController._variable_entries(layer)
         )
 
-        for name, _signature, help_html, param_count, group in builtin_functions():
+        for name, _signature, help_html, param_count, group, _params in builtin_functions():
             entries.append(
                 AutocompleteEntry(
                     value=name,
@@ -1914,10 +1975,10 @@ class CustomAutocompleteController(QObject):
     def show_call_tip(self) -> None:
         """Signature hint for the function enclosing the caret.
 
-        Our own tooltip rather than Scintilla's call tip, which has the same
+        Our own popup rather than Scintilla's call tip, which has the same
         limitation as its completion list: it needs Scintilla to own the input
-        loop. A QToolTip renders the HTML that helpText() returns and works over
-        a modal dialog.
+        loop. Highlights the argument the caret is currently sitting in, and
+        offers a "more" link to the full help text when it was truncated.
         """
         editor = self._editor
         if editor is None:
@@ -1925,34 +1986,61 @@ class CustomAutocompleteController(QObject):
         try:
             text = editor.toPlainText()
             position = editor.textCursor().position()
-            name = self._enclosing_function(text, position)
+            name, open_index = self._enclosing_function(text, position)
             if not name:
-                QToolTip.hideText()
+                self._hide_call_tip()
                 return
 
-            for func_name, signature, help_html, _count, _group in builtin_functions():
+            for func_name, _signature, help_html, _count, _group, params in builtin_functions():
                 if func_name.lower() != name.lower():
                     continue
+                arg_index = self._argument_index(text, open_index, position)
+                signature_html = self._signature_html(name, params, arg_index)
+
                 summary = re.sub(r"<[^>]+>", " ", help_html or "")
                 summary = re.sub(r"\s+", " ", summary).strip()
-                if len(summary) > 220:
-                    summary = summary[:220].rsplit(" ", 1)[0] + "..."
-                body = f"<b>{signature}</b>"
+                short_summary = summary
+                truncated = False
+                if len(short_summary) > 220:
+                    short_summary = short_summary[:220].rsplit(" ", 1)[0] + "..."
+                    truncated = True
+
+                short_body = signature_html
+                full_body = signature_html
                 if summary:
-                    body += f"<br>{summary}"
+                    short_body += f"<br>{short_summary}"
+                    full_body += f"<br>{summary}"
+                if truncated:
+                    short_body += ' <a href="more">more</a>'
+
                 point = editor.mapToGlobal(editor.cursorRect().bottomLeft())
-                QToolTip.showText(point, body, editor)
+                self._show_call_tip_popup(short_body, full_body, point)
                 return
-            QToolTip.hideText()
+            self._hide_call_tip()
         except Exception as exc:
             _dbg(f"Call tip failed: {exc}")
 
+    def _show_call_tip_popup(self, short_body: str, full_body: str, point) -> None:
+        if self._editor is None:
+            return
+        if self._call_tip is None:
+            self._call_tip = CallTipPopup(self._editor)
+        self._call_tip.show_body(short_body, full_body, point)
+
+    def _hide_call_tip(self) -> None:
+        if self._call_tip is not None:
+            try:
+                self._call_tip.hide()
+            except Exception:
+                pass
+
     @staticmethod
-    def _enclosing_function(text: str, position: int) -> str:
-        """Name of the function whose parentheses contain ``position``.
+    def _enclosing_function(text: str, position: int) -> Tuple[str, int]:
+        """``(name, open_paren_index)`` of the call enclosing ``position``.
 
         Walks backwards counting bracket depth, so a nested call reports the
-        innermost function - the one the caret is actually inside.
+        innermost function - the one the caret is actually inside. Returns
+        ``("", -1)`` when the caret is not inside any call.
         """
         depth = 0
         index = position - 1
@@ -1966,10 +2054,53 @@ class CustomAutocompleteController(QObject):
                     start = end
                     while start > 0 and (text[start - 1].isalnum() or text[start - 1] in "_$"):
                         start -= 1
-                    return text[start:end].strip()
+                    return text[start:end].strip(), end
                 depth -= 1
             index -= 1
-        return ""
+        return "", -1
+
+    @staticmethod
+    def _argument_index(text: str, open_index: int, position: int) -> int:
+        """How many top-level commas sit between the "(" and the caret.
+
+        Nested parentheses and quoted literals are skipped, so a comma inside
+        a nested call or a string value is never mistaken for an argument
+        separator. The result is which argument the caret is currently in,
+        0-based.
+        """
+        if open_index < 0:
+            return 0
+        depth = 0
+        quote = ""
+        argument = 0
+        index = open_index + 1
+        limit = min(position, len(text))
+        while index < limit:
+            char = text[index]
+            if quote:
+                if char == quote and text[index - 1] != "\\":
+                    quote = ""
+            elif char in ("'", '"'):
+                quote = char
+            elif char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+            elif char == "," and depth == 0:
+                argument += 1
+            index += 1
+        return argument
+
+    @staticmethod
+    def _signature_html(name: str, params: List[str], arg_index: int) -> str:
+        """The signature as HTML, with the current argument underlined."""
+        if not params:
+            return f"<b>{name}</b>()"
+        parts = [
+            f'<u>{param}</u>' if i == arg_index else param
+            for i, param in enumerate(params)
+        ]
+        return f"<b>{name}</b>({', '.join(parts)})"
 
     def hide_popup(self) -> None:
         """Close the list and hand the caret back to the editor."""

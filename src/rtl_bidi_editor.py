@@ -122,7 +122,7 @@ except Exception:  # pragma: no cover
 # Configuration
 # --------------------------------------------------------------------------- #
 
-LOG_TAG = "RTL BiDi Editor"
+LOG_TAG = "RTL Expression Editor"
 
 #: Editor classes we take over, matched against the C++ QMetaObject
 #: inheritance chain (see CodeEditorWatcher._meta_class_names for why the
@@ -871,6 +871,20 @@ class RtlOverlayEditor(QPlainTextEdit):
         self._highlighter: Optional[BidiSyntaxHighlighter] = None
         self._completer: Optional[QCompleter] = None
 
+        # Scintilla's own call tip (the argument-hint rectangle) reacts to the
+        # very edits and caret moves the overlay -> Scintilla sync pushes into
+        # it, popping up behind our own popup (rtl_autocomplete.CallTipPopup)
+        # with no way for the user to dismiss it. Disabled up front wherever
+        # the API is reachable; _cancel_native_call_tip() below is the backup
+        # for when it is not.
+        try:
+            from qgis.PyQt.Qsci import QsciScintilla
+
+            if isinstance(sci, QsciScintilla):
+                sci.setCallTipsStyle(QsciScintilla.CallTipsStyle.CallTipsNone)
+        except Exception:
+            pass
+
         cls_names = {klass.__name__ for klass in type(sci).__mro__}
         self._dialect = "sql" if "QgsCodeEditorSQL" in cls_names else "expression"
 
@@ -1276,6 +1290,7 @@ class RtlOverlayEditor(QPlainTextEdit):
                 # stops the echo from coming back to us.
                 self._sci.setText(text)
             self._push_cursor_to_sci()
+            self._cancel_native_call_tip()
         except RuntimeError:
             self._detached = True
         except Exception as exc:
@@ -1289,6 +1304,7 @@ class RtlOverlayEditor(QPlainTextEdit):
         self._syncing = True
         try:
             self._push_cursor_to_sci()
+            self._cancel_native_call_tip()
         except RuntimeError:
             self._detached = True
         except Exception as exc:
@@ -1306,6 +1322,19 @@ class RtlOverlayEditor(QPlainTextEdit):
         else:
             line, index = _line_index_from_offset(text, cursor.position())
             self._sci.setCursorPosition(line, index)
+
+    def _cancel_native_call_tip(self) -> None:
+        """Belt-and-suspenders backup for the ``setCallTipsStyle`` call above.
+
+        Cancels any call tip Scintilla just raised in response to the push,
+        synchronously and before Qt gets back to painting - covering the case
+        where ``setCallTipsStyle`` was unreachable (a degraded, Base-only
+        wrapper; see the class docstring on cross-module sip casts).
+        """
+        try:
+            self._sci.SendScintilla(self._sci.SCI_CALLTIPCANCEL)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ #
     # Completion
@@ -1521,7 +1550,7 @@ class CodeEditorWatcher(QObject):
         # Master switch (Settings -> General).  Default is enabled, so an
         # existing install behaves identically to before this feature existed.
         if Settings is not None and not Settings.plugin_enabled():
-            _log("RTL / BiDi editor is disabled in settings.", Qgis.MessageLevel.Info)
+            _log("RTL Expression Editor is disabled in settings.", Qgis.MessageLevel.Info)
             return
         app.installEventFilter(self)
         try:
@@ -1888,7 +1917,7 @@ class RtlBidiEditorPlugin:
                 self._watcher.install()  # idempotent
             else:
                 self._watcher.uninstall()
-                _log("RTL / BiDi editor disabled.", Qgis.MessageLevel.Info)
+                _log("RTL Expression Editor disabled.", Qgis.MessageLevel.Info)
         except Exception as exc:
             _log(f"Could not apply settings: {exc}", Qgis.MessageLevel.Warning)
 
@@ -1903,7 +1932,7 @@ class RtlBidiEditorPlugin:
             self._watcher.install()
             if SETTINGS_BUS is not None:
                 SETTINGS_BUS.changed.connect(self.apply_settings)
-            _log("RTL / BiDi editor active.", Qgis.MessageLevel.Success)
+            _log("RTL Expression Editor active.", Qgis.MessageLevel.Success)
             _dbg(
                 f"watching editor classes {sorted(TARGET_EDITOR_CLASSES)}; "
                 f"detection = Show-event filter + focusChanged signal"
