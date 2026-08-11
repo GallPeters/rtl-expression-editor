@@ -385,9 +385,17 @@ _VARIABLE_RE = re.compile(r"@(\w*)$")
 def suggestion_context(text_before_cursor: str) -> str:
     """Decide WHAT to suggest from the text before the caret.
 
-    The syntax is usually unambiguous. Where it is not, the answer is "mixed"
-    rather than a guess: a wrong guess hides the thing the user wanted, whereas
-    a grouped list costs them only a keystroke of filtering.
+    Three simple, purely syntactic rules, checked in order - no guessing from
+    surrounding operators or keywords:
+
+    * inside an unterminated ``"`` -> naming a field.
+    * immediately after ``@``      -> a variable.
+    * inside an unterminated ``'`` -> typing a value.
+    * anything else                -> "mixed": the full list of functions,
+      variables and operators. This also covers sitting right after ``=``,
+      ``AND``, ``IN`` and the like with no quote typed yet - the suggestion
+      is not narrowed to values there, since nothing was actually typed to
+      say that is what is wanted.
 
     Returns one of: "fields", "variables", "values", "mixed".
     """
@@ -410,13 +418,6 @@ def suggestion_context(text_before_cursor: str) -> str:
     without_fields = re.sub(r'"[^"\n]*"', lambda m: " " * len(m.group(0)), text_before_cursor)
     if without_fields.count("'") % 2 == 1:
         return "values"
-
-    # After a comparison against a known field -> that field's values.
-    if detect_field_name(text_before_cursor):
-        tail = text_before_cursor[text_before_cursor.rfind('"') + 1:]
-        if re.search(r"(=|!=|<>|<|>|\bIN\b|\bLIKE\b|\bILIKE\b)\s*\(?\s*[\w'%]*$",
-                     tail, re.IGNORECASE):
-            return "values"
 
     return "mixed"
 
@@ -1816,23 +1817,21 @@ class CustomAutocompleteController(QObject):
         text = editor.toPlainText()
         caret_pos = editor.textCursor().position()
 
-        # Field and value entries are inserted already wrapped in their own
-        # matching pair of quotes. _current_token() only matches word
-        # characters, so it never includes the quote the user typed to open
-        # the token - e.g. after typing `"N`, the token is just "N". Left
-        # unhandled, replacing only "N" leaves that opening quote behind and
-        # insert_text adds its own, producing `""NAME"` instead of `"NAME"`.
-        # So when such a quote sits immediately before the token, it is
-        # consumed too: it will be supplied by insert_text instead.
+        # _current_token() only matches word characters, so it never includes
+        # the quote the user typed to open the token - e.g. after typing
+        # `"N`, the token is just "N". That opening quote is always consumed
+        # along with it when one is found, for either of two reasons:
+        #
+        # * a field entry supplies its own matching pair of quotes, so
+        #   leaving the old one behind would duplicate it: `""NAME"` instead
+        #   of `"NAME"`.
+        # * a numeric value's insert_text has no quotes at all (bare digits
+        #   need none), so the user's own opening quote would otherwise be
+        #   left dangling: `'605` instead of `605`.
         quote_char = '"' if self._field_mode else ("'" if self._value_mode else None)
         remove_len = token_len
         quote_start = caret_pos - token_len - 1
-        if (
-            quote_char
-            and insert_text.startswith(quote_char)
-            and quote_start >= 0
-            and text[quote_start] == quote_char
-        ):
+        if quote_char and quote_start >= 0 and text[quote_start] == quote_char:
             remove_len += 1
 
         # Close the quote for the user unless one is already sitting to the
