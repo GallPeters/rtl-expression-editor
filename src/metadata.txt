@@ -9,7 +9,6 @@ about=QGIS's built-in editor (QScintilla) does not display right-to-left text co
 
     The plugin also offers an optional advanced auto-complete system. Choose any project layer and its fields as the source of allowed values, with optional descriptions, groups and group descriptions. Press Ctrl+Space to complete either a field name or a value, and the suggestions adapt automatically to the field being queried and to the layer you are working on.
 
-
     When a custom auto-complete source is configured, an optional Read Mode switch appears inside the editor. Read Mode shows the value descriptions instead of the stored codes, making a long expression far easier tounderstand, and never alters the expression itself. Where the same code has different meanings in different groups, the description you picked is saved in the project file and restored automatically, so Read Mode always shows the right one, for everyone who opens the project.
 version=1.4
 author=Jossef Kanter
@@ -52,6 +51,8 @@ server=False
     - Fixed: pressing Escape while the suggestion list was open could close the whole window instead of just the list.
     - Fixed: pressing Enter in the Ctrl+H replace field could replace all occurrences instead of just the current one.
     - Fixed: shrinking the window could show duplicate scrollbars; only the RTL editor's own remain, positioned clear of the read-mode switch.
+    - Fixed: on Linux, the suggestion list could flash open and immediately disappear.
+    - Added: a test suite covering the editor, its sync with the core editor, autocomplete, the function helper and every other feature.
 
 ** v1.3 (10.08.2026):
   - Improved: the suggestion list now shows values without their surrounding quotes.

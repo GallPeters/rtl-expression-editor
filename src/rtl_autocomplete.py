@@ -1395,9 +1395,17 @@ class CustomAutocompleteController(QObject):
                         self.hide_popup()
                         return True
                     return False
-                if event_type in (QEvent.Type.WindowDeactivate, QEvent.Type.FocusOut):
-                    self.hide_popup()
-                    return False
+                # Deliberately NOT hiding on the popup's own WindowDeactivate/
+                # FocusOut: several Linux window managers deliver one to a
+                # freshly-mapped Qt.Popup window before they have actually
+                # finished activating it, which hid the popup within a
+                # millisecond of it appearing - it would flash and vanish
+                # before it could ever be read, let alone used. Every genuine
+                # reason to close it is already covered elsewhere:
+                # _on_focus_window_changed for switching to a different
+                # window or application, the editor's own FocusOut handling
+                # below for focus genuinely leaving the editor, and Escape /
+                # click-outside / accepting a value for everything else.
                 return False
 
             # --- editor ---------------------------------------------------- #

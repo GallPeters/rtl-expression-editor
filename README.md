@@ -38,3 +38,26 @@ QGIS's built-in editor doesn't render RTL and mixed text correctly. This plugin 
 2. A floating RTL editor window appears automatically.
 3. Edit text in either window — they stay synchronized.
 4. Use the original QGIS dialog buttons to apply your result.
+
+## Running the tests
+
+The `test/` folder ships with the plugin and covers the editor and its sync
+with the core editor, autocomplete (with and without a configured lookup
+table), the function helper, read mode, occurrence highlighting, the
+replace-bar shortcuts and the plugin's own load/unload cycle. It is not run
+automatically - these are developer/QA tests, run on demand.
+
+From the QGIS Python Console, after installing the plugin:
+
+```python
+from rtl_bidi_editor.test import run_all
+run_all.main()
+```
+
+From a shell, using QGIS's own Python interpreter (the exact launcher name
+depends on the platform/QGIS build, e.g. `python-qgis-qt6.bat` on Windows,
+`python3` inside `qgis --code` on Linux):
+
+```
+python3 -m rtl_bidi_editor.test.run_all
+```

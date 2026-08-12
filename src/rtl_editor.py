@@ -2064,7 +2064,7 @@ class CodeEditorWatcher(QObject):
 # Exposed so the plugin can be inspected and re-triggered from the QGIS Python
 # Console without restarting QGIS:
 #
-#     from rtl_bidi_editor import rtl_bidi_editor as m
+#     from rtl_bidi_editor import rtl_editor as m
 #     m.rescan()
 # --------------------------------------------------------------------------- #
 
