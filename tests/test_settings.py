@@ -68,5 +68,53 @@ class SettingsRoundTripTests(unittest.TestCase):
         self.assertIsNone(Settings.autocomplete_layer())
 
 
+class RunTestsButtonTests(unittest.TestCase):
+    """The Settings dialog's "Run Tests" button - meaningful in a
+    development checkout where tests/ sits as a sibling of src/, exactly
+    this repository's own layout, which is what makes it possible to test."""
+
+    def test_tests_directory_finds_the_real_tests_folder(self):
+        from src.rtl_settings import SettingsDialog
+
+        tests_dir = SettingsDialog._tests_directory()
+        self.assertIsNotNone(tests_dir)
+        self.assertTrue((tests_dir / "run_all.py").is_file())
+
+    def test_button_is_created_when_tests_directory_is_found(self):
+        from src.rtl_settings import SettingsDialog
+
+        dialog = SettingsDialog()
+        try:
+            self.assertTrue(hasattr(dialog, "btn_run_tests"))
+            self.assertEqual(dialog.btn_run_tests.text(), "Run Tests")
+        finally:
+            dialog.deleteLater()
+
+    def test_run_tests_passes_the_result_through_and_re_enables_the_button(self):
+        """Exercises _run_tests()'s own control flow - disable/run/re-enable,
+        handing the result to _show_test_results() - without paying for a
+        real, recursive run of the whole suite via a mocked run_all.main().
+        """
+        from unittest import mock
+
+        from src.rtl_settings import SettingsDialog
+
+        dialog = SettingsDialog()
+        fake_result = mock.Mock(wasSuccessful=lambda: True, testsRun=3, failures=[], errors=[])
+        try:
+            with mock.patch("tests.run_all.main", return_value=fake_result) as mocked_main, mock.patch.object(
+                SettingsDialog, "_show_test_results"
+            ) as mocked_show:
+                dialog._run_tests()
+
+            mocked_main.assert_called_once()
+            mocked_show.assert_called_once()
+            self.assertIs(mocked_show.call_args[0][0], fake_result)
+            self.assertTrue(dialog.btn_run_tests.isEnabled())
+            self.assertEqual(dialog.btn_run_tests.text(), "Run Tests")
+        finally:
+            dialog.deleteLater()
+
+
 if __name__ == "__main__":
     unittest.main()
