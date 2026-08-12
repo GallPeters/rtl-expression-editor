@@ -1072,6 +1072,25 @@ class RtlOverlayEditor(QPlainTextEdit):
         except Exception:
             pass
 
+        # The underlying editor keeps its own scrollbars even though the
+        # overlay sits on top of it and covers its full rect (_sync_geometry
+        # below): shrinking the dialog narrower or shorter than the text
+        # needs made TWO sets appear - Scintilla's own, and the overlay's.
+        # Suppressed via the raw Scintilla messages rather than a QsciScintilla-
+        # only setter, so this works even on a degraded, Base-only wrapper (see
+        # the class docstring on cross-module sip casts) - the same reasoning
+        # as _cancel_native_popups() below. Only the overlay's own scrollbars
+        # (a plain QPlainTextEdit's) are left to ever appear.
+        try:
+            # Hard-coded Scintilla message numbers as a fallback: these two
+            # are old, stable parts of the message set, but falling back
+            # rather than assuming the attribute name is exposed identically
+            # on every binding costs nothing.
+            sci.SendScintilla(getattr(sci, "SCI_SETHSCROLLBAR", 2130), 0)
+            sci.SendScintilla(getattr(sci, "SCI_SETVSCROLLBAR", 2280), 0)
+        except Exception:
+            pass
+
         cls_names = {klass.__name__ for klass in type(sci).__mro__}
         self._dialect = "sql" if "QgsCodeEditorSQL" in cls_names else "expression"
 

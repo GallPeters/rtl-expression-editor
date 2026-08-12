@@ -618,6 +618,18 @@ class ReadModeController(QObject):
             self._switch.raise_()
             editor.installEventFilter(self)
             self._reserve_strip(True)
+            # The switch sits in the bottom-left corner of the *whole* editor
+            # widget, not just its viewport - exactly where a horizontal
+            # scrollbar is drawn once one appears (narrowing the dialog, or a
+            # long unwrapped line). rangeChanged is what actually flips a
+            # scrollbar between hidden and shown, so it - not just resizes -
+            # is what needs to trigger a reposition.
+            try:
+                hbar = editor.horizontalScrollBar()
+                if hbar is not None:
+                    hbar.rangeChanged.connect(self._reposition)
+            except Exception:
+                pass
             self._reposition()
             # Apply the configured default mode once the dialog has settled.
             if Settings.default_read_mode():
@@ -653,9 +665,19 @@ class ReadModeController(QObject):
             return
         try:
             margin = 4
+            # A horizontal scrollbar - the overlay's own; the underlying
+            # editor's native one is suppressed in RtlOverlayEditor - is drawn
+            # below the viewport, inside the same bottom-left corner the
+            # switch occupies. Shift the switch up by its height so the two
+            # never overlap, instead of leaving the switch sitting on top of
+            # (or under) the scrollbar.
+            clearance = 0
+            hbar = self._editor.horizontalScrollBar()
+            if hbar is not None and hbar.isVisible():
+                clearance = hbar.height()
             self._switch.move(
                 margin,
-                self._editor.height() - self._switch.height() - margin,
+                self._editor.height() - self._switch.height() - margin - clearance,
             )
             self._switch.raise_()
         except RuntimeError:
@@ -768,6 +790,9 @@ class ReadModeController(QObject):
             if self._editor is not None:
                 self._editor.removeEventFilter(self)
                 self._reserve_strip(False)
+                hbar = self._editor.horizontalScrollBar()
+                if hbar is not None:
+                    hbar.rangeChanged.disconnect(self._reposition)
         except Exception:
             pass
         if self._switch is not None:

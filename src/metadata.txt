@@ -51,6 +51,7 @@ server=False
     - Fixed: the plugin name showed as "RTL BiDi Editor" in the Log Messages panel.
     - Fixed: pressing Escape while the suggestion list was open could close the whole window instead of just the list.
     - Fixed: pressing Enter in the Ctrl+H replace field could replace all occurrences instead of just the current one.
+    - Fixed: shrinking the window could show duplicate scrollbars; only the RTL editor's own remain, positioned clear of the read-mode switch.
 
 ** v1.3 (10.08.2026):
   - Improved: the suggestion list now shows values without their surrounding quotes.
