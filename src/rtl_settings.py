@@ -496,16 +496,26 @@ class SettingsDialog(QDialog):
 
     @staticmethod
     def _tests_directory() -> Optional[Path]:
-        """The repository's tests/ folder, if this is a development checkout.
+        """The tests/ folder, if one is findable next to this install.
 
-        This file lives at ``<repo>/src/rtl_settings.py`` when running from a
-        git checkout - a common way to develop against a live QGIS is a
-        symlink from the QGIS profile's plugins folder straight to
-        ``<repo>/src``. A normal end-user install only ships ``src/``'s
-        contents, with no such sibling, so this returns ``None`` there.
+        Checked in order:
+
+        * nested inside this same plugin folder, e.g. ``tests/`` copied in
+          alongside ``rtl_editor.py`` - the natural result of installing the
+          plugin *with* its tests, not just a development checkout;
+        * a sibling of ``src/`` one level up - the git-checkout layout. This
+          file lives at ``<repo>/src/rtl_settings.py`` there, or the same
+          resolved path when a development QGIS profile symlinks its
+          plugins folder straight to ``<repo>/src``.
+
+        A normal end-user install that only ships ``src/``'s contents, with
+        no ``tests/`` anywhere nearby, matches neither and returns ``None``.
         """
-        candidate = Path(__file__).resolve().parent.parent / "tests"
-        return candidate if (candidate / "run_all.py").is_file() else None
+        here = Path(__file__).resolve().parent
+        for candidate in (here / "tests", here.parent / "tests"):
+            if (candidate / "run_all.py").is_file():
+                return candidate
+        return None
 
     def _run_tests(self) -> None:
         """Run the test suite and show a pass/fail summary plus the full log."""

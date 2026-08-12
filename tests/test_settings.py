@@ -3,7 +3,7 @@
 
 import unittest
 
-from src.rtl_settings import Settings
+from _rtl_plugin.rtl_settings import Settings
 
 
 class SettingsRoundTripTests(unittest.TestCase):
@@ -69,19 +69,46 @@ class SettingsRoundTripTests(unittest.TestCase):
 
 
 class RunTestsButtonTests(unittest.TestCase):
-    """The Settings dialog's "Run Tests" button - meaningful in a
-    development checkout where tests/ sits as a sibling of src/, exactly
-    this repository's own layout, which is what makes it possible to test."""
+    """The Settings dialog's "Run Tests" button - meaningful whenever a
+    tests/ folder is findable next to the running plugin, which is true for
+    this repository's own dev-checkout layout (a sibling of src/) and is
+    exactly what makes it possible to test here."""
 
     def test_tests_directory_finds_the_real_tests_folder(self):
-        from src.rtl_settings import SettingsDialog
+        from _rtl_plugin.rtl_settings import SettingsDialog
 
         tests_dir = SettingsDialog._tests_directory()
         self.assertIsNotNone(tests_dir)
         self.assertTrue((tests_dir / "run_all.py").is_file())
 
+    def test_tests_directory_prefers_a_tests_folder_nested_in_the_plugin_itself(self):
+        """Simulates "installed with tests": a tests/ folder copied directly
+        inside the plugin's own folder, alongside rtl_settings.py - the
+        layout that answers "which files do I copy to install with tests".
+        """
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        from _rtl_plugin import rtl_settings as settings_module
+        from _rtl_plugin.rtl_settings import SettingsDialog
+
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin_dir = Path(tmp) / "rtl_expression_editor"
+            plugin_dir.mkdir()
+            (plugin_dir / "rtl_settings.py").write_text("", encoding="utf-8")
+            nested_tests = plugin_dir / "tests"
+            nested_tests.mkdir()
+            (nested_tests / "run_all.py").write_text("", encoding="utf-8")
+
+            fake_file = str(plugin_dir / "rtl_settings.py")
+            with mock.patch.object(settings_module, "__file__", fake_file):
+                found = SettingsDialog._tests_directory()
+
+        self.assertEqual(found, nested_tests)
+
     def test_button_is_created_when_tests_directory_is_found(self):
-        from src.rtl_settings import SettingsDialog
+        from _rtl_plugin.rtl_settings import SettingsDialog
 
         dialog = SettingsDialog()
         try:
@@ -97,7 +124,7 @@ class RunTestsButtonTests(unittest.TestCase):
         """
         from unittest import mock
 
-        from src.rtl_settings import SettingsDialog
+        from _rtl_plugin.rtl_settings import SettingsDialog
 
         dialog = SettingsDialog()
         fake_result = mock.Mock(wasSuccessful=lambda: True, testsRun=3, failures=[], errors=[])

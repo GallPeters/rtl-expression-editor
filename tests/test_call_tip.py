@@ -4,7 +4,7 @@ and the current-argument highlight."""
 
 import unittest
 
-from src import rtl_autocomplete as ac
+from _rtl_plugin import rtl_autocomplete as ac
 
 Controller = ac.CustomAutocompleteController
 

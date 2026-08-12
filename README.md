@@ -54,11 +54,30 @@ profile's plugin directory, e.g.:
 Copying the repository root (or `src/` as a nested subfolder) instead
 produces `ModuleNotFoundError: No module named
 '<plugin folder>.rtl_editor'` - `__init__.py`'s `from .rtl_editor import ...`
-only resolves when the two are direct siblings. The `tests/` folder is a
-sibling of `src/` on purpose, not part of it: it ships with the repository
-for development, never with a packaged release. `releases/` holds the actual
+only resolves when the two are direct siblings. `releases/` holds the actual
 `src/`-contents-only zips built for past versions, as a reference for the
 expected layout.
+
+#### Installing with the tests too
+
+The `tests/` folder at the repository root is a sibling of `src/`, not part
+of it, precisely so a normal install (above) never pulls it in. To install
+*with* it instead - so the Settings dialog's **Run Tests** button shows up -
+copy `tests/` in as well, nested **inside** the same plugin folder, alongside
+the modules it just tested:
+
+```
+<QGIS profile>/python/plugins/rtl_expression_editor/__init__.py
+<QGIS profile>/python/plugins/rtl_expression_editor/rtl_editor.py
+...
+<QGIS profile>/python/plugins/rtl_expression_editor/tests/__init__.py
+<QGIS profile>/python/plugins/rtl_expression_editor/tests/run_all.py
+...
+```
+
+The tests locate the plugin's modules by looking for `rtl_editor.py` next to
+them rather than assuming any particular folder name, so this works
+regardless of what the plugin folder itself is called.
 
 ## Usage
 
@@ -69,35 +88,43 @@ expected layout.
 
 ## Running the tests
 
-The `tests/` folder at the repository root - a sibling of `src/`, not part of
-it - covers the editor and its sync with the core editor, autocomplete (with
-and without a configured lookup table), the function helper, read mode,
-occurrence highlighting, the replace-bar shortcuts and the plugin's own
-load/unload cycle. It ships with the repository, not with a packaged release
-(only `src/`'s contents are packaged), and is never run automatically -
-these are developer/QA tests, run on demand.
+The `tests/` folder covers the editor and its sync with the core editor,
+autocomplete (with and without a configured lookup table), the function
+helper, read mode, occurrence highlighting, the replace-bar shortcuts and the
+plugin's own load/unload cycle. It's never run automatically - these are
+developer/QA tests, run on demand - and only ships when you choose to include
+it (see "Installing with the tests too" above); a normal packaged release is
+just `src/`'s contents.
 
-From the QGIS Python Console, with the repository checked out somewhere on
-disk:
+`tests/` locates the plugin's own modules by looking for `rtl_editor.py`
+next to it rather than assuming a folder name, so running it works the same
+way in either place it can legitimately be:
+
+* at the repository root, a sibling of `src/` (this repository's own
+  development layout);
+* nested inside an installed plugin folder, alongside `rtl_editor.py` (an
+  "installed with tests" copy).
+
+From the QGIS Python Console, with either of those somewhere on disk:
 
 ```python
 import sys
-sys.path.insert(0, r"<path to the repository root>")
+sys.path.insert(0, r"<path to the folder CONTAINING tests/>")
 from tests import run_all
 run_all.main()
 ```
 
 From a shell, using QGIS's own Python interpreter (the exact launcher name
 depends on the platform/QGIS build, e.g. `python-qgis-qt6.bat` on Windows,
-`python3` inside `qgis --code` on Linux), run from the repository root:
+`python3` inside `qgis --code` on Linux), run from that same folder:
 
 ```
 python3 -m tests.run_all
 ```
 
-If the QGIS profile's plugin points straight at this repository's `src/`
-folder (a common way to develop against a live QGIS, e.g. via a symlink),
-the plugin's own Settings dialog also gets a **Run Tests** button under a
-"Developer" section that does the same thing and shows a pass/fail summary
-plus the full log. It only appears when `tests/` is found as a sibling of
-the running plugin's own directory - never for a normal end-user install.
+The plugin's own Settings dialog also gets a **Run Tests** button under a
+"Developer" section whenever `tests/` is found either nested inside the
+running plugin's own directory or as a sibling of it one level up - covering
+both layouts above automatically - and shows a pass/fail summary plus the
+full log. It's simply absent for a normal end-user install, which has no
+`tests/` anywhere nearby.

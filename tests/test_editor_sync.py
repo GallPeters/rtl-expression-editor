@@ -11,7 +11,8 @@ import unittest
 from qgis.gui import QgsCodeEditorExpression, QgsCodeEditorSQL
 from qgis.PyQt.QtWidgets import QApplication
 
-from src import rtl_editor as ed
+from _rtl_plugin import rtl_editor as ed
+
 from .utils import host_in_dialog
 
 

@@ -102,7 +102,7 @@ def reset_plugin_settings() -> None:
     """Clear every autocomplete-related setting, so tests never see leftovers
     from a previous run or from the user's own real configuration.
     """
-    from src.rtl_settings import Settings
+    from _rtl_plugin.rtl_settings import Settings
 
     Settings.set_autocomplete_enabled(False)
     Settings.set_layer_id("")

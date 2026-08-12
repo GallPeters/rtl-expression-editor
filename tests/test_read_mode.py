@@ -6,8 +6,9 @@ import unittest
 
 from qgis.core import QgsProject
 
-from src import rtl_readmode as rm
-from src.rtl_settings import Settings
+from _rtl_plugin import rtl_readmode as rm
+from _rtl_plugin.rtl_settings import Settings
+
 from .utils import make_lookup_layer, reset_plugin_settings
 
 

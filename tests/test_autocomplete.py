@@ -16,8 +16,9 @@ import unittest
 from qgis.core import QgsExpression, QgsFeature, QgsProject
 from qgis.PyQt.QtWidgets import QPlainTextEdit
 
-from src import rtl_autocomplete as ac
-from src.rtl_settings import Settings
+from _rtl_plugin import rtl_autocomplete as ac
+from _rtl_plugin.rtl_settings import Settings
+
 from .utils import make_context_layer, make_lookup_layer, reset_plugin_settings
 
 
