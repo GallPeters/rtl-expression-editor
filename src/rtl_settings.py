@@ -22,10 +22,13 @@ Two pieces live here:
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import List, Optional
 
 from qgis.PyQt.QtCore import QObject, Qt, pyqtSignal
+from qgis.PyQt.QtGui import QFont
 from qgis.PyQt.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -34,6 +37,9 @@ from qgis.PyQt.QtWidgets import (
     QGroupBox,
     QLabel,
     QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -63,7 +69,7 @@ def _log(message: str) -> None:
     try:
         from qgis.core import Qgis, QgsMessageLog
 
-        QgsMessageLog.logMessage(message, "RTL BiDi Editor", Qgis.MessageLevel.Warning)
+        QgsMessageLog.logMessage(message, "RTL Expression Editor", Qgis.MessageLevel.Warning)
     except Exception:
         pass
 
@@ -166,7 +172,7 @@ class Settings:
             from rtl_bidi_editor.rtl_settings import Settings; Settings.dump()
         """
         print("=" * 68)
-        print("RTL BiDi editor - raw stored settings")
+        print("RTL Expression Editor - raw stored settings")
         print("=" * 68)
         try:
             settings = QgsSettings()
@@ -243,6 +249,31 @@ class Settings:
     # -- convenience ------------------------------------------------------- #
 
     @classmethod
+    def max_suggested_values(cls) -> int:
+        """Cap on value suggestions read straight from the current layer.
+
+        Only used when the field being completed has no configured lookup
+        table (or the lookup returns nothing): the popup then shows the first
+        N distinct, non-null values already present in the layer. The custom
+        lookup table has no such cap - QUERY_LIMIT in rtl_autocomplete already
+        bounds it generously.
+        """
+        raw = cls._get_str("ac/max_values", "")
+        try:
+            value = int(raw)
+            return value if value > 0 else 10
+        except (TypeError, ValueError):
+            return 10
+
+    @classmethod
+    def set_max_suggested_values(cls, value: int) -> None:
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            value = 10
+        cls._set("ac/max_values", str(max(1, value)))
+
+    @classmethod
     def default_read_mode(cls) -> bool:
         """Whether the editor opens in description (read-only) mode.
 
@@ -315,6 +346,18 @@ class SettingsDialog(QDialog):
             "editor is created and QGIS behaves exactly as without the plugin."
         )
         general_layout.addWidget(self.chk_enabled)
+
+        values_row = QFormLayout()
+        self.spin_max_values = QSpinBox(general)
+        self.spin_max_values.setRange(1, 1000)
+        self.spin_max_values.setToolTip(
+            "When Ctrl+Space suggests values for a field that has no "
+            "configured lookup table (or the lookup has nothing for it), "
+            "show this many of the field's own distinct, non-null values."
+        )
+        values_row.addRow("Suggested values without a lookup table", self.spin_max_values)
+        general_layout.addLayout(values_row)
+
         root.addWidget(general)
 
         # -- Custom Autocomplete ------------------------------------------- #
@@ -416,6 +459,22 @@ class SettingsDialog(QDialog):
         ac_layout.addWidget(self.lbl_warning)
 
         root.addWidget(ac_group)
+
+        # -- Developer -------------------------------------------------------
+        # Only shown at all when a development checkout's tests/ folder is
+        # found next to the running plugin - a normal end-user install only
+        # ships src/'s contents, with no such sibling, so this stays entirely
+        # invisible there rather than offering a button that could only fail.
+        tests_dir = self._tests_directory()
+        if tests_dir is not None:
+            dev_group = QGroupBox("Developer", self)
+            dev_layout = QVBoxLayout(dev_group)
+            self.btn_run_tests = QPushButton("Run Tests", dev_group)
+            self.btn_run_tests.setToolTip(f"Run the test suite in:\n{tests_dir}")
+            self.btn_run_tests.clicked.connect(self._run_tests)
+            dev_layout.addWidget(self.btn_run_tests)
+            root.addWidget(dev_group)
+
         root.addStretch(1)
 
         buttons = QDialogButtonBox(
@@ -430,6 +489,101 @@ class SettingsDialog(QDialog):
         self.chk_enabled.toggled.connect(ac_group.setEnabled)
 
         self._load()
+
+    # ------------------------------------------------------------------ #
+    # Developer: run the test suite
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _tests_directory() -> Optional[Path]:
+        """The repository's tests/ folder, if this is a development checkout.
+
+        This file lives at ``<repo>/src/rtl_settings.py`` when running from a
+        git checkout - a common way to develop against a live QGIS is a
+        symlink from the QGIS profile's plugins folder straight to
+        ``<repo>/src``. A normal end-user install only ships ``src/``'s
+        contents, with no such sibling, so this returns ``None`` there.
+        """
+        candidate = Path(__file__).resolve().parent.parent / "tests"
+        return candidate if (candidate / "run_all.py").is_file() else None
+
+    def _run_tests(self) -> None:
+        """Run the test suite and show a pass/fail summary plus the full log."""
+        tests_dir = self._tests_directory()
+        if tests_dir is None:
+            QMessageBox.information(
+                self,
+                "Run Tests",
+                "No tests/ folder found next to the plugin - this is only "
+                "available when running from a development checkout.",
+            )
+            return
+
+        self.btn_run_tests.setEnabled(False)
+        self.btn_run_tests.setText("Running...")
+        QApplication.processEvents()  # show the label change before the run blocks
+
+        result = None
+        log_text = ""
+        try:
+            import io
+            import sys
+
+            repo_root = str(tests_dir.parent)
+            if repo_root not in sys.path:
+                sys.path.insert(0, repo_root)
+
+            from tests import run_all  # only importable in a dev checkout
+
+            buffer = io.StringIO()
+            result = run_all.main(verbosity=2, stream=buffer)
+            log_text = buffer.getvalue()
+        except Exception as exc:
+            log_text = f"Could not run the test suite:\n{exc}"
+            _log(f"Run Tests failed: {exc}")
+        finally:
+            self.btn_run_tests.setEnabled(True)
+            self.btn_run_tests.setText("Run Tests")
+
+        self._show_test_results(result, log_text)
+
+    def _show_test_results(self, result, log_text: str) -> None:
+        """A small dialog: a coloured pass/fail summary, then the full log."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Test Results")
+        dialog.resize(760, 500)
+        layout = QVBoxLayout(dialog)
+
+        if result is None:
+            summary, color = "Could not run the test suite - see the log below.", "#b7791f"
+        elif result.wasSuccessful():
+            summary, color = f"All {result.testsRun} tests passed.", "#2e7d32"
+        else:
+            failed = len(result.failures) + len(result.errors)
+            summary = f"{failed} of {result.testsRun} tests failed - see the log below."
+            color = "#c0392b"
+
+        lbl_summary = QLabel(summary, dialog)
+        lbl_summary.setStyleSheet(f"font-weight: bold; color: {color};")
+        layout.addWidget(lbl_summary)
+
+        log_view = QPlainTextEdit(dialog)
+        log_view.setReadOnly(True)
+        log_view.setPlainText(log_text)
+        log_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        font = QFont("Consolas")
+        font.setStyleHint(QFont.StyleHint.Monospace)
+        log_view.setFont(font)
+        layout.addWidget(log_view)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, dialog)
+        buttons.rejected.connect(dialog.reject)
+        close_button = buttons.button(QDialogButtonBox.StandardButton.Close)
+        if close_button is not None:
+            close_button.clicked.connect(dialog.accept)
+        layout.addWidget(buttons)
+
+        dialog.exec()
 
     # ------------------------------------------------------------------ #
     # Helpers
@@ -470,6 +624,7 @@ class SettingsDialog(QDialog):
 
     def _load(self) -> None:
         self.chk_enabled.setChecked(Settings.plugin_enabled())
+        self.spin_max_values.setValue(Settings.max_suggested_values())
         self.chk_ac.setChecked(Settings.autocomplete_enabled())
         try:
             index = self.cmb_mode.findData(Settings.default_read_mode())
@@ -547,6 +702,7 @@ class SettingsDialog(QDialog):
 
     def _save(self) -> None:
         Settings.set_plugin_enabled(self.chk_enabled.isChecked())
+        Settings.set_max_suggested_values(self.spin_max_values.value())
         Settings.set_autocomplete_enabled(self.chk_ac.isChecked())
         try:
             Settings.set_default_read_mode(bool(self.cmb_mode.currentData()))

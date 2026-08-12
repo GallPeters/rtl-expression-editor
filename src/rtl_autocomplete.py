@@ -37,16 +37,16 @@ from qgis.PyQt.QtCore import QEvent, QObject, Qt
 from qgis.PyQt.QtGui import QColor, QFont, QTextCursor
 from qgis.PyQt.QtWidgets import (
     QApplication,
+    QLabel,
     QListWidget,
     QListWidgetItem,
-    QToolTip,
 )
 
 from qgis.core import Qgis, QgsExpression, QgsFeatureRequest, QgsMessageLog
 
 from .rtl_settings import BUS, Settings
 
-LOG_TAG = "RTL BiDi Editor"
+LOG_TAG = "RTL Expression Editor"
 
 #: Hard ceiling on rows pulled per lookup.  Protects against a misconfigured
 #: field selector turning into an unbounded read.
@@ -55,8 +55,17 @@ QUERY_LIMIT = 2000
 #: Maximum items shown in the popup at once.
 MAX_DISPLAYED = 500
 
+#: Vertical breathing room between the caret's text line and any popup
+#: placed above or below it, so neither the call tip nor the suggestion
+#: list sits close enough to overlap the very text it is describing.
+POPUP_VERTICAL_GAP = 10
+
 #: Characters that make up a value token being typed before the cursor.
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_\-.]+$")
+
+#: A single character that continues a token rather than ending it - used to
+#: decide whether a just-typed key should close the completion popup.
+_CONTINUATION_CHAR_RE = re.compile(r"[A-Za-z0-9_\-.]")
 
 #: A field name in double quotes, e.g. "COUNTRY".
 _QUOTED_FIELD_RE = re.compile(r'"([^"\n]+)"')
@@ -229,12 +238,18 @@ _FUNCTION_CACHE: Optional[List[tuple]] = None
 
 
 def builtin_functions() -> List[tuple]:
-    """Return ``(name, signature, help_html)`` for every registered function.
+    """Return ``(name, signature, help_html, param_count, group, params)``.
 
     Scintilla's own completion cannot be reused from an overlay (it needs to own
     the input loop to filter and accept entries), so the list is rebuilt from
     the public API instead. That also lets us show signatures and help text,
     which Scintilla's plain list does not.
+
+    ``group`` is the function's own category (Aggregates, Arrays, Color,
+    Conditionals, Geometry, Operators, ...) exactly as QgsExpression reports
+    it - the same string the Expression Builder's tree groups functions by -
+    so the autocomplete popup groups them identically instead of lumping every
+    function under one generic heading.
     """
     global _FUNCTION_CACHE
     if _FUNCTION_CACHE is not None:
@@ -265,7 +280,11 @@ def builtin_functions() -> List[tuple]:
                     help_html = function.helpText() or ""
                 except Exception:
                     help_html = ""
-                functions.append((name, signature, help_html, len(params)))
+                try:
+                    group = function.group() or GROUP_FUNCTIONS
+                except Exception:
+                    group = GROUP_FUNCTIONS
+                functions.append((name, signature, help_html, len(params), group, params))
             except Exception:
                 continue
     except Exception as exc:
@@ -320,6 +339,54 @@ def context_field_names(layer) -> List[str]:
         return []
 
 
+def layer_first_values(layer, field_name: str, limit: int) -> List[str]:
+    """The first ``limit`` distinct, non-null values of ``field_name``.
+
+    Used when no lookup table is configured for this field (or it has
+    nothing for it): rather than offering no values at all, the field's own
+    data stands in. Each value comes back already wrapped for insertion -
+    quoted for text, bare for numbers - via ``QgsExpression.quotedValue()``,
+    which is exactly what a hand-typed literal would need.
+    """
+    if layer is None or not field_name or limit <= 0:
+        return []
+    try:
+        index = layer.fields().indexOf(field_name)
+        if index < 0:
+            return []
+    except Exception:
+        return []
+
+    values: List[str] = []
+    seen = set()
+    try:
+        # uniqueValues() may include NULL among its results, so ask for a
+        # little more than we need and stop once enough real values are found.
+        for raw in layer.uniqueValues(index, limit + 5):
+            if raw is None:
+                continue
+            try:
+                if hasattr(raw, "isNull") and raw.isNull():
+                    continue
+            except Exception:
+                pass
+            text_key = str(raw).strip().lower()
+            if not text_key or text_key in seen:
+                continue
+            seen.add(text_key)
+            try:
+                literal = QgsExpression.quotedValue(raw)
+            except Exception:
+                literal = QgsExpression.quotedString(str(raw))
+            values.append(literal)
+            if len(values) >= limit:
+                break
+    except Exception as exc:
+        _dbg(f"Layer value fallback failed: {exc}")
+        return []
+    return values
+
+
 #: Caret sitting immediately after @ or partway through a variable name.
 _VARIABLE_RE = re.compile(r"@(\w*)$")
 
@@ -327,9 +394,17 @@ _VARIABLE_RE = re.compile(r"@(\w*)$")
 def suggestion_context(text_before_cursor: str) -> str:
     """Decide WHAT to suggest from the text before the caret.
 
-    The syntax is usually unambiguous. Where it is not, the answer is "mixed"
-    rather than a guess: a wrong guess hides the thing the user wanted, whereas
-    a grouped list costs them only a keystroke of filtering.
+    Three simple, purely syntactic rules, checked in order - no guessing from
+    surrounding operators or keywords:
+
+    * inside an unterminated ``"`` -> naming a field.
+    * immediately after ``@``      -> a variable.
+    * inside an unterminated ``'`` -> typing a value.
+    * anything else                -> "mixed": the full list of functions,
+      variables and operators. This also covers sitting right after ``=``,
+      ``AND``, ``IN`` and the like with no quote typed yet - the suggestion
+      is not narrowed to values there, since nothing was actually typed to
+      say that is what is wanted.
 
     Returns one of: "fields", "variables", "values", "mixed".
     """
@@ -352,13 +427,6 @@ def suggestion_context(text_before_cursor: str) -> str:
     without_fields = re.sub(r'"[^"\n]*"', lambda m: " " * len(m.group(0)), text_before_cursor)
     if without_fields.count("'") % 2 == 1:
         return "values"
-
-    # After a comparison against a known field -> that field's values.
-    if detect_field_name(text_before_cursor):
-        tail = text_before_cursor[text_before_cursor.rfind('"') + 1:]
-        if re.search(r"(=|!=|<>|<|>|\bIN\b|\bLIKE\b|\bILIKE\b)\s*\(?\s*[\w'%]*$",
-                     tail, re.IGNORECASE):
-            return "values"
 
     return "mixed"
 
@@ -1091,6 +1159,7 @@ class AutocompletePopup(QListWidget):
         editor = self._editor
         rect = editor.cursorRect()
         point = editor.mapToGlobal(rect.bottomLeft())
+        point.setY(point.y() + POPUP_VERTICAL_GAP)
 
         rows = min(self.count(), 12)
         height = max(60, sum(self.sizeHintForRow(r) for r in range(rows)) + 8)
@@ -1099,7 +1168,7 @@ class AutocompletePopup(QListWidget):
         try:
             screen = editor.screen().availableGeometry()
             if point.y() + height > screen.bottom():
-                point.setY(editor.mapToGlobal(rect.topLeft()).y() - height)
+                point.setY(editor.mapToGlobal(rect.topLeft()).y() - height - POPUP_VERTICAL_GAP)
             if point.x() + width > screen.right():
                 point.setX(max(screen.left(), screen.right() - width))
         except Exception:
@@ -1108,6 +1177,47 @@ class AutocompletePopup(QListWidget):
         self.setGeometry(point.x(), point.y(), width, height)
         self.show()
         self.raise_()
+
+
+# --------------------------------------------------------------------------- #
+# Call tip
+# --------------------------------------------------------------------------- #
+
+
+class CallTipPopup(QLabel):
+    """A small signature-hint popup, styled like a tooltip.
+
+    An ordinary label rather than QToolTip so ``show_call_tip`` fully
+    controls when it appears and disappears - QToolTip only ever hides
+    itself on a timer or on the next mouse move, neither of which lines up
+    with "the caret left the function call".
+    """
+
+    def __init__(self, editor):
+        super().__init__(None)
+        self._editor = editor
+        self.setWindowFlags(Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setTextFormat(Qt.TextFormat.RichText)
+        self.setWordWrap(True)
+        self.setMargin(6)
+        self.setMaximumWidth(480)
+        self.setStyleSheet(
+            "QLabel { background-color: #ffffe1; color: #202020; "
+            "border: 1px solid #b0b0b0; }"
+        )
+
+    def show_body(self, body: str, point) -> None:
+        self.setText(body)
+        self.adjustSize()
+        self.move(point)
+        self.show()
+        self.raise_()
+
+    def reposition(self, point) -> None:
+        """Follow the parent window without changing what is displayed."""
+        self.move(point)
 
 
 # --------------------------------------------------------------------------- #
@@ -1133,23 +1243,97 @@ class CustomAutocompleteController(QObject):
         super().__init__(editor)
         self._editor = editor
         self._popup: Optional[AutocompletePopup] = None
+        self._call_tip: Optional[CallTipPopup] = None
         self._entries: List[AutocompleteEntry] = []
         self._field_name = ""
         #: True while the popup lists field names rather than values.
         self._field_mode = False
+        #: True while the popup lists values (quoted literals) for a field.
+        self._value_mode = False
         #: True while a key event is being re-sent to the editor, to stop the
         #: editor branch of eventFilter from re-entering the popup handler.
         self._forwarding = False
+        #: True for the one cursor move right after Enter, so the call tip
+        #: stays closed even though the caret may still be enclosed by the
+        #: same (now multi-line) call.
+        self._suppress_call_tip_once = False
         try:
             editor.installEventFilter(self)
         except Exception as exc:
             _log(f"Custom autocomplete not attached: {exc}", Qgis.MessageLevel.Warning)
+
+        # The call tip must track the caret continuously, not just on the
+        # keystrokes that used to trigger it: moving the caret out of a
+        # call's parentheses (an arrow key, a mouse click, undo/redo, a field
+        # inserted by a QGIS toolbar button) should close it exactly as
+        # typing ')' does, and moving back in should reopen it. Both are the
+        # same recomputation, so one signal covers every way the caret moves.
+        try:
+            editor.cursorPositionChanged.connect(self._on_cursor_moved)
+        except Exception:
+            pass
+
+        # New text should offer suggestions as it is typed, the same three
+        # contexts Ctrl+Space already recognises (fields, values, the full
+        # grouped list) - see _auto_trigger.
+        try:
+            editor.textChanged.connect(self._auto_trigger_soon)
+        except Exception:
+            pass
+
+        # Both popups are Qt.ToolTip windows with WA_ShowWithoutActivating, so
+        # they never go through the editor's own focus-in/out cycle - neither
+        # switching to a different application, nor switching to a different
+        # QGIS window while this one stays open in the background, generates
+        # a FocusOut on the editor. focusWindowChanged is the one signal that
+        # reports a change of *OS-level* focus window, covering both cases
+        # plus clicking through to the desktop (window becomes None) - so the
+        # popups only ever show while this dialog is the active window.
+        try:
+            app = QApplication.instance()
+            if app is not None:
+                app.focusWindowChanged.connect(self._on_focus_window_changed)
+        except Exception:
+            pass
+
+        # The call tip is glued to the caret's screen position; if the dialog
+        # itself moves or resizes, that position moves with it.
+        try:
+            window = editor.window()
+            if window is not None:
+                window.installEventFilter(self)
+        except Exception:
+            pass
 
     # -- teardown ---------------------------------------------------------- #
 
     def teardown(self) -> None:
         """Called from the editor's detach(); safe to call more than once."""
         self.hide_popup()
+        self._hide_call_tip()
+        try:
+            app = QApplication.instance()
+            if app is not None:
+                app.focusWindowChanged.disconnect(self._on_focus_window_changed)
+        except Exception:
+            pass
+        try:
+            if self._editor is not None:
+                self._editor.cursorPositionChanged.disconnect(self._on_cursor_moved)
+        except Exception:
+            pass
+        try:
+            if self._editor is not None:
+                self._editor.textChanged.disconnect(self._auto_trigger_soon)
+        except Exception:
+            pass
+        try:
+            if self._editor is not None:
+                window = self._editor.window()
+                if window is not None:
+                    window.removeEventFilter(self)
+        except Exception:
+            pass
         try:
             if self._editor is not None:
                 self._editor.removeEventFilter(self)
@@ -1165,6 +1349,12 @@ class CustomAutocompleteController(QObject):
             except Exception:
                 pass
             self._popup = None
+        if self._call_tip is not None:
+            try:
+                self._call_tip.deleteLater()
+            except Exception:
+                pass
+            self._call_tip = None
         self._editor = None
 
     # -- event handling ---------------------------------------------------- #
@@ -1184,6 +1374,16 @@ class CustomAutocompleteController(QObject):
 
             # --- popup is open: it owns the keyboard and mouse grabs ------- #
             if popup is not None and obj is popup:
+                if event_type == QEvent.Type.ShortcutOverride and event.key() == Qt.Key.Key_Escape:
+                    # The popup declines focus (see AutocompletePopup.__init__,
+                    # setFocusPolicy(NoFocus) + setFocusProxy(editor)), so it is
+                    # not certain whether Qt routes Escape's ShortcutOverride to
+                    # the popup itself or to the editor it proxies to - claim it
+                    # on whichever object actually gets it, so a dialog-level
+                    # Escape shortcut never wins the race against the KeyPress
+                    # that follows.
+                    event.accept()
+                    return True
                 if event_type == QEvent.Type.KeyPress:
                     return self._on_popup_key(event)
                 if event_type in (
@@ -1195,9 +1395,17 @@ class CustomAutocompleteController(QObject):
                         self.hide_popup()
                         return True
                     return False
-                if event_type in (QEvent.Type.WindowDeactivate, QEvent.Type.FocusOut):
-                    self.hide_popup()
-                    return False
+                # Deliberately NOT hiding on the popup's own WindowDeactivate/
+                # FocusOut: several Linux window managers deliver one to a
+                # freshly-mapped Qt.Popup window before they have actually
+                # finished activating it, which hid the popup within a
+                # millisecond of it appearing - it would flash and vanish
+                # before it could ever be read, let alone used. Every genuine
+                # reason to close it is already covered elsewhere:
+                # _on_focus_window_changed for switching to a different
+                # window or application, the editor's own FocusOut handling
+                # below for focus genuinely leaving the editor, and Escape /
+                # click-outside / accepting a value for everything else.
                 return False
 
             # --- editor ---------------------------------------------------- #
@@ -1216,6 +1424,24 @@ class CustomAutocompleteController(QObject):
                 ):
                     event.accept()
                     return True
+                if (
+                    event_type == QEvent.Type.ShortcutOverride
+                    and event.key() == Qt.Key.Key_Escape
+                    and popup is not None
+                    and popup.isVisible()
+                ):
+                    # The popup declines focus and proxies it back to the
+                    # editor (see AutocompletePopup.__init__), so Qt still
+                    # sends ShortcutOverride to the editor even though the
+                    # popup's own keyboard grab is what actually delivers the
+                    # following KeyPress. If the dialog has an Escape
+                    # QShortcut of its own (many QDialogs do, for "close on
+                    # Escape"), it fires right here - before the grab ever
+                    # gets a say - and closes the dialog instead of the list.
+                    # Claiming the override keeps that from happening; the
+                    # KeyPress that follows is handled below as usual.
+                    event.accept()
+                    return True
                 if event_type == QEvent.Type.KeyPress and not self._forwarding:
                     if popup is not None and popup.isVisible():
                         # Keys normally reach the popup; if one arrives here
@@ -1227,10 +1453,24 @@ class CustomAutocompleteController(QObject):
                     if self._is_trigger(event):
                         self.trigger()
                         return True
-                    # Typing '(' raises the signature hint. Deferred so the
-                    # character is in the document before we look for it.
-                    if event.text() == "(":
-                        self._call_tip_soon()
+                    # Enter always closes the call tip, matching QGIS's own
+                    # function helper - even though the caret may still be
+                    # enclosed by the same call once Enter inserts a newline
+                    # (multi-line calls are legal). cursorPositionChanged
+                    # (see _on_cursor_moved) is what actually shows/hides the
+                    # tip as the caret moves - including in and out of a call
+                    # via '(', ',' and ')' - so this only needs to mark the
+                    # one recomputation right after Enter as an exception.
+                    #
+                    # Escape is deliberately NOT used to dismiss the call tip:
+                    # unlike the completion popup (a real Qt.Popup with its
+                    # own keyboard grab), the plain editor never gets a
+                    # KeyPress for Escape to filter in the first place - the
+                    # dialog's own Escape-closes-the-dialog shortcut claims it
+                    # first, at the ShortcutOverride stage. Consuming it here
+                    # would be a no-op at best and confusing at worst.
+                    if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                        self._suppress_call_tip_once = True
                 elif event_type == QEvent.Type.FocusOut:
                     # Showing a Qt.Popup window takes the keyboard grab, which
                     # makes Qt deliver FocusOut to the editor with reason
@@ -1248,15 +1488,47 @@ class CustomAutocompleteController(QObject):
                         transient = False
                     if not transient:
                         self.hide_popup()
+                        self._hide_call_tip()
                 elif event_type in (
                     QEvent.Type.Wheel,
                     QEvent.Type.Hide,
                 ):
                     # Scrolling or the dialog closing leaves a floating list stale.
                     self.hide_popup()
+                    self._hide_call_tip()
+                return False
+
+            # --- the dialog itself: keep the call tip glued to the caret --- #
+            if event_type in (QEvent.Type.Move, QEvent.Type.Resize):
+                self._reposition_call_tip()
         except Exception as exc:
             _log(f"Custom autocomplete error: {exc}", Qgis.MessageLevel.Warning)
         return False
+
+    def _on_focus_window_changed(self, window) -> None:
+        """Hide both popups the moment a different top-level window is active.
+
+        Covers switching to another application, switching to a different
+        QGIS window or dialog while this one stays open behind it, and
+        clicking through to the desktop (``window`` is then ``None``) - so
+        the popups are visible only while this specific dialog (Expression
+        Builder, Field Calculator, Layer Filter, ...) is the active window.
+        """
+        editor = self._editor
+        if editor is None:
+            return
+        try:
+            own_window = editor.window().windowHandle()
+        except Exception:
+            own_window = None
+        if own_window is None:
+            # Could not resolve our own window - nothing safe to compare
+            # against, so err on the side of not hiding anything.
+            return
+        if window is own_window:
+            return
+        self.hide_popup()
+        self._hide_call_tip()
 
     def _event_inside_popup(self, event) -> bool:
         """True when a mouse event landed within the popup's own rectangle."""
@@ -1406,6 +1678,7 @@ class CustomAutocompleteController(QObject):
 
         if key == Qt.Key.Key_Escape:
             self.hide_popup()
+            self._hide_call_tip()
             return True
         if key == Qt.Key.Key_Down:
             self._popup.move_selection(1)
@@ -1427,8 +1700,26 @@ class CustomAutocompleteController(QObject):
             self.hide_popup()
             self._forward_to_editor(event)
             return True
+        if key in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete):
+            # Still editing the token itself: keep narrowing/widening.
+            self._forward_to_editor(event)
+            self._refilter_soon()
+            return True
 
-        # Printable characters, Backspace, Delete: let the editor apply them.
+        text = event.text()
+        if text and not _CONTINUATION_CHAR_RE.match(text):
+            # A boundary character - space, punctuation, an operator, the
+            # closing quote - ends the token, so the list closes immediately
+            # rather than waiting to find nothing matches. Matches QGIS's own
+            # suggestion list, which closes on anything but Up/Down/PgUp/PgDn
+            # unless it still narrows to a result.
+            self.hide_popup()
+            self._forward_to_editor(event)
+            return True
+
+        # A word character narrowing the token (or a key with no text, e.g. a
+        # lone modifier press): let the editor apply it, then refilter -
+        # narrows the list, or hides it once nothing matches any more.
         self._forward_to_editor(event)
         self._refilter_soon()
         return True
@@ -1461,15 +1752,22 @@ class CustomAutocompleteController(QObject):
 
     # -- the feature ------------------------------------------------------- #
 
-    def trigger(self) -> None:
-        """Ctrl+Space: detect the field, fetch values, show the popup."""
+    def trigger(self, auto: bool = False) -> None:
+        """Ctrl+Space (or automatically, while typing): show the popup.
+
+        Works with no configuration at all: fields, functions, variables and
+        operators are always available. A lookup table configured in Settings
+        only narrows and enriches the field-name and value lists; it is never
+        required for the feature to be active.
+
+        ``auto`` is True when this came from typing rather than Ctrl+Space
+        (see ``_auto_trigger``): the explanatory "Nothing to suggest here"
+        notice is worth showing for a deliberate Ctrl+Space press that turned
+        up nothing, but would be pure noise appearing on its own as the user
+        types past a context with nothing to offer.
+        """
         editor = self._editor
         if editor is None:
-            return
-
-        enabled, reason = Settings.autocomplete_is_usable()
-        if not enabled:
-            _dbg(f"Ctrl+Space ignored: {reason}")
             return
 
         text_before = editor.toPlainText()[: editor.textCursor().position()]
@@ -1478,127 +1776,215 @@ class CustomAutocompleteController(QObject):
 
         kind = suggestion_context(text_before)
         self._field_mode = kind == "fields"
+        self._value_mode = kind == "values"
         self._entries = self._collect_entries(kind, text_before, probe)
 
         if not self._entries:
-            self._notice("Nothing to suggest here")
+            if not auto:
+                self._notice("Nothing to suggest here")
             return
 
         self._refilter(show=True)
 
-    def _collect_entries(self, kind: str, text_before: str, probe) -> List[AutocompleteEntry]:
-        """Build the ordered, grouped entry list for this context.
+    def _auto_trigger_soon(self) -> None:
+        """Open the suggestion list automatically as the user types.
 
-        Ordering is by relevance: the most likely group first, then the rest.
-        Built-in functions and variables are appended to the value context too,
-        so they are always reachable - Scintilla's own list is unavailable to an
-        overlay, and hiding ours behind a guess would leave no way to get at
-        them.
+        Deferred to the end of the event loop turn, the same way
+        ``_refilter_soon`` is, so the just-typed character is already in the
+        document and the caret already moved by the time the context is
+        evaluated. Skipped while a key is being forwarded to the editor by
+        the popup itself (``_on_popup_key``/``_refilter_soon`` already own
+        that keystroke) to avoid doing the same work twice.
         """
-        from .rtl_readmode import _find_context_layer
+        if self._forwarding:
+            return
+        from qgis.PyQt.QtCore import QTimer
 
+        QTimer.singleShot(0, self._auto_trigger)
+
+    def _auto_trigger(self) -> None:
+        editor = self._editor
+        if editor is None:
+            return
+        if self._popup is not None and self._popup.isVisible():
+            # Already open; typing narrows or closes it through the normal
+            # key handling instead.
+            return
+        try:
+            cursor = editor.textCursor()
+            if cursor.hasSelection():
+                return
+            text = editor.toPlainText()
+            position = cursor.position()
+            if self._inside_active_call(text, position):
+                # Mid-argument inside an open call, on the same line as its
+                # '(': the call tip already covers this position (see
+                # show_call_tip), and QGIS's own editor holds off on
+                # suggestions here too. Typing ')' or moving to a new line
+                # needs no special case - both simply make this check false
+                # the next time it runs, since the caret is then either
+                # outside the call or past a newline within it.
+                return
+            text_before = text[:position]
+            kind = suggestion_context(text_before)
+            if kind == "mixed" and not self._current_token():
+                # Fields and values are anchored to a delimiter the user just
+                # typed ('"' or "'"), so showing them immediately makes sense
+                # even with nothing typed yet. The full function/variable/
+                # operator list has no such anchor - opening it on every
+                # keystroke that is not building a word (a space, an
+                # operator, a digit with no prefix) would be far too noisy,
+                # so it waits for an actual prefix to narrow it by.
+                return
+            self.trigger(auto=True)
+        except Exception as exc:
+            _dbg(f"Auto-trigger failed: {exc}")
+
+    def _inside_active_call(self, text: str, position: int) -> bool:
+        """True while the caret is mid-argument inside an open function call.
+
+        "Mid-argument" specifically: enclosed by an unclosed '(', and still on
+        the same source line as that '(' - typing ')' or Enter both end this
+        state, closing the call in the first case and starting a fresh line
+        within it in the second, matching how QGIS's own editor behaves.
+        """
+        name, open_index = self._enclosing_function(text, position)
+        if not name:
+            return False
+        return "\n" not in text[open_index:position]
+
+    def _collect_entries(self, kind: str, text_before: str, probe) -> List[AutocompleteEntry]:
+        """Build the entry list for this context. One rule per context:
+
+        * ``"fields"``    - field names from the configured lookup table if
+          one is set, otherwise the current layer's own fields.
+        * ``"values"``    - values for the field just named, from the lookup
+          table if configured (grouped by the group field, when set),
+          otherwise the field's own first N non-null values (N from Settings).
+        * ``"variables"`` - variable names.
+        * anything else   - the full list of functions, variables and
+          operators, grouped exactly as the Expression Builder groups them.
+
+        None of this needs a configured lookup table - it is only ever used
+        to narrow and enrich the fields/values lists when one is present, so
+        Ctrl+Space works the same on a project where nothing has been set up.
+        """
         try:
             layer = _find_context_layer(probe)
         except Exception:
             layer = None
 
-        entries: List[AutocompleteEntry] = []
+        usable, _ = Settings.autocomplete_is_usable()
+        tables = resolve_table_candidates(probe) if usable else []
 
-        def add_fields() -> None:
-            for name in context_field_names(layer):
-                entries.append(
-                    AutocompleteEntry(
-                        value=f'"{name}"',
-                        group_code=GROUP_FIELDS,
-                        display_text=name,
-                        insert_text=f'"{name}"',
-                    )
-                )
+        if kind == "fields":
+            return self._field_entries(layer, usable, tables)
+        if kind == "values":
+            return self._value_entries(text_before, layer, usable, tables)
+        if kind == "variables":
+            return self._variable_entries(layer)
+        return self._full_entries(layer)
 
-        def add_functions() -> None:
-            for name, signature, help_html, param_count in builtin_functions():
-                entries.append(
-                    AutocompleteEntry(
-                        value=name,
-                        group_code=GROUP_FUNCTIONS,
-                        display_text=signature,
-                        insert_text=f"{name}()",
-                        help_text=help_html,
-                        # Land the caret between the parentheses when the
-                        # function takes arguments; after them when it does not.
-                        caret_offset=1 if param_count else 0,
-                    )
-                )
-
-        def add_variables() -> None:
-            for name in builtin_variables(layer):
-                entries.append(
-                    AutocompleteEntry(
-                        value=f"@{name}",
-                        group_code=GROUP_VARIABLES,
-                        display_text=f"@{name}",
-                        insert_text=f"@{name}",
-                    )
-                )
-
-        def add_operators() -> None:
-            for token in _OPERATORS:
-                entries.append(
-                    AutocompleteEntry(
-                        value=token, group_code=GROUP_OPERATORS, display_text=token
-                    )
-                )
-
-        def add_values() -> None:
-            field_name = detect_field_name(text_before)
-            if not field_name:
-                return
-            self._field_name = field_name
+    @staticmethod
+    def _field_entries(layer, usable: bool, tables: Sequence[str]) -> List[AutocompleteEntry]:
+        """Field names: the configured lookup table if set, else the layer's."""
+        names: List[str] = []
+        if usable:
             try:
-                tables = resolve_table_candidates(probe)
+                names = cache().lookup_field_names(tables)
+            except Exception as exc:
+                _dbg(f"Field-name lookup failed: {exc}")
+        if not names:
+            names = context_field_names(layer)
+        return [
+            AutocompleteEntry(
+                value=f'"{name}"',
+                group_code=GROUP_FIELDS,
+                display_text=name,
+                insert_text=f'"{name}"',
+            )
+            for name in names
+        ]
+
+    def _value_entries(
+        self, text_before: str, layer, usable: bool, tables: Sequence[str]
+    ) -> List[AutocompleteEntry]:
+        """Values for the field before the caret: lookup table, else the layer."""
+        field_name = detect_field_name(text_before)
+        if not field_name:
+            return []
+        self._field_name = field_name
+
+        if usable:
+            try:
                 found = cache().lookup(field_name, tables)
             except Exception as exc:
                 _dbg(f"Value lookup failed: {exc}")
-                return
-            for entry in found:
-                if not entry.group_code and not entry.group_description:
-                    entry.group_code = GROUP_VALUES
-                entries.append(entry)
+                found = []
+            if found:
+                entries = []
+                for entry in found:
+                    if not entry.group_code and not entry.group_description:
+                        entry.group_code = GROUP_VALUES
+                    entries.append(entry)
+                return entries
 
-        if kind == "fields":
-            add_fields()
-            if not entries:
-                # No layer resolved - fall back to the lookup table's own list.
-                self._offer_field_names_into(entries, probe)
-        elif kind == "variables":
-            add_variables()
-        elif kind == "values":
-            add_values()
-            add_functions()
-            add_variables()
-        else:
-            add_fields()
-            add_functions()
-            add_variables()
-            add_operators()
+        # No configured table, or nothing in it for this field: fall back to
+        # the first few distinct, non-null values already in the layer.
+        limit = Settings.max_suggested_values()
+        return [
+            AutocompleteEntry(value=v, group_code=GROUP_VALUES)
+            for v in layer_first_values(layer, field_name, limit)
+        ]
 
-        return entries
+    @staticmethod
+    def _variable_entries(layer) -> List[AutocompleteEntry]:
+        return [
+            AutocompleteEntry(
+                value=f"@{name}",
+                group_code=GROUP_VARIABLES,
+                display_text=f"@{name}",
+                insert_text=f"@{name}",
+            )
+            for name in builtin_variables(layer)
+        ]
 
-    def _offer_field_names_into(self, entries: List[AutocompleteEntry], probe) -> None:
-        """Field names taken from the lookup table, when the layer is unknown."""
-        try:
-            tables = resolve_table_candidates(probe)
-            for name in cache().lookup_field_names(tables):
-                entries.append(
-                    AutocompleteEntry(
-                        value=f'"{name}"',
-                        group_code=GROUP_FIELDS,
-                        display_text=name,
-                        insert_text=f'"{name}"',
-                    )
+    @staticmethod
+    def _full_entries(layer) -> List[AutocompleteEntry]:
+        """Everything that is not a field or a value.
+
+        Grouped exactly like the Expression Builder's own tree: each function
+        under its real category (Aggregates, Arrays, Color, Conditionals,
+        Geometry, Operators, ...), reported by QgsExpression itself, plus
+        Variables and Operators as their own groups.
+        """
+        entries: List[AutocompleteEntry] = list(
+            CustomAutocompleteController._variable_entries(layer)
+        )
+
+        for name, _signature, help_html, param_count, group, _params in builtin_functions():
+            entries.append(
+                AutocompleteEntry(
+                    value=name,
+                    group_code=group,
+                    # Name only, per spec - the signature still shows up in
+                    # the tooltip and in the call tip after insertion.
+                    display_text=name,
+                    insert_text=f"{name}()",
+                    help_text=help_html,
+                    # Land the caret between the parentheses when the
+                    # function takes arguments; after them when it does not.
+                    caret_offset=1 if param_count else 0,
                 )
-        except Exception as exc:
-            _dbg(f"Field-name fallback failed: {exc}")
+            )
+
+        for token in _OPERATORS:
+            entries.append(
+                AutocompleteEntry(value=token, group_code=GROUP_OPERATORS, display_text=token)
+            )
+
+        entries.sort(key=lambda e: (e.group_label.lower(), e.display.lower()))
+        return entries
 
     def _offer_field_names(self) -> None:
         """Populate the popup with field names rather than values."""
@@ -1730,26 +2116,44 @@ class CustomAutocompleteController(QObject):
         # Replace the partial token, then insert.  This is a normal document
         # edit, so the existing overlay -> Scintilla synchronisation picks it up
         # through textChanged like any keystroke would.
+        editor = self._editor
         token_len = len(self._current_token())
-        cursor = self._editor.textCursor()
+        text = editor.toPlainText()
+        caret_pos = editor.textCursor().position()
+
+        # _current_token() only matches word characters, so it never includes
+        # the quote the user typed to open the token - e.g. after typing
+        # `"N`, the token is just "N". That opening quote is always consumed
+        # along with it when one is found, for either of two reasons:
+        #
+        # * a field entry supplies its own matching pair of quotes, so
+        #   leaving the old one behind would duplicate it: `""NAME"` instead
+        #   of `"NAME"`.
+        # * a numeric value's insert_text has no quotes at all (bare digits
+        #   need none), so the user's own opening quote would otherwise be
+        #   left dangling: `'605` instead of `605`.
+        quote_char = '"' if self._field_mode else ("'" if self._value_mode else None)
+        remove_len = token_len
+        quote_start = caret_pos - token_len - 1
+        if quote_char and quote_start >= 0 and text[quote_start] == quote_char:
+            remove_len += 1
+
+        # Close the quote for the user unless one is already sitting to the
+        # right of the caret - the same courtesy every editor extends when
+        # completing a bracketed or quoted token.
+        if quote_char and insert_text.endswith(quote_char):
+            after = text[caret_pos:caret_pos + 1]
+            if after == quote_char:
+                insert_text = insert_text[:-1]
+
+        cursor = editor.textCursor()
         cursor.beginEditBlock()
-        if token_len:
+        if remove_len:
             cursor.movePosition(
                 QTextCursor.MoveOperation.Left,
                 QTextCursor.MoveMode.KeepAnchor,
-                token_len,
+                remove_len,
             )
-        # In field-name mode, close the quote for the user unless one is already
-        # sitting to the right of the caret - the same courtesy every editor
-        # extends when completing a bracketed or quoted token.
-        if self._field_mode:
-            text = self._editor.toPlainText()
-            after = text[cursor.position():cursor.position() + 1]
-            # Field entries are inserted already quoted, so only trim when a
-            # closing quote is already sitting to the right of the caret.
-            if after == '"' and insert_text.endswith('"'):
-                insert_text = insert_text[:-1]
-
         cursor.insertText(insert_text)
         cursor.endEditBlock()
         if caret_offset:
@@ -1811,13 +2215,28 @@ class CustomAutocompleteController(QObject):
 
         QTimer.singleShot(0, self.show_call_tip)
 
+    def _on_cursor_moved(self) -> None:
+        """Keep the call tip in sync with wherever the caret now is.
+
+        Fires on every caret move for any reason at all - typing '(', ',' or
+        ')', the arrow keys, a mouse click, undo/redo, a field or function a
+        QGIS toolbar button inserted - so the tip opens the moment the caret
+        sits inside a call's parentheses and closes the moment it does not,
+        without needing to special-case each way the caret can move there.
+        """
+        if self._suppress_call_tip_once:
+            self._suppress_call_tip_once = False
+            self._hide_call_tip()
+            return
+        self.show_call_tip()
+
     def show_call_tip(self) -> None:
         """Signature hint for the function enclosing the caret.
 
-        Our own tooltip rather than Scintilla's call tip, which has the same
+        Our own popup rather than Scintilla's call tip, which has the same
         limitation as its completion list: it needs Scintilla to own the input
-        loop. A QToolTip renders the HTML that helpText() returns and works over
-        a modal dialog.
+        loop. Just the name and its arguments - no help text - with the
+        argument the caret is currently sitting in shown in bold.
         """
         editor = self._editor
         if editor is None:
@@ -1825,34 +2244,66 @@ class CustomAutocompleteController(QObject):
         try:
             text = editor.toPlainText()
             position = editor.textCursor().position()
-            name = self._enclosing_function(text, position)
+            name, open_index = self._enclosing_function(text, position)
             if not name:
-                QToolTip.hideText()
+                self._hide_call_tip()
                 return
 
-            for func_name, signature, help_html, _count in builtin_functions():
+            for func_name, _signature, _help_html, _count, _group, params in builtin_functions():
                 if func_name.lower() != name.lower():
                     continue
-                summary = re.sub(r"<[^>]+>", " ", help_html or "")
-                summary = re.sub(r"\s+", " ", summary).strip()
-                if len(summary) > 220:
-                    summary = summary[:220].rsplit(" ", 1)[0] + "..."
-                body = f"<b>{signature}</b>"
-                if summary:
-                    body += f"<br>{summary}"
-                point = editor.mapToGlobal(editor.cursorRect().bottomLeft())
-                QToolTip.showText(point, body, editor)
+                arg_index = self._argument_index(text, open_index, position)
+                if params and arg_index >= len(params):
+                    # Matches QGIS's own function helper: another comma typed
+                    # past the last declared argument closes it rather than
+                    # leaving nothing sensible highlighted.
+                    self._hide_call_tip()
+                    return
+
+                body = self._signature_html(name, params, arg_index)
+                point = self._call_tip_point()
+                if self._call_tip is None:
+                    self._call_tip = CallTipPopup(editor)
+                self._call_tip.show_body(body, point)
                 return
-            QToolTip.hideText()
+            self._hide_call_tip()
         except Exception as exc:
             _dbg(f"Call tip failed: {exc}")
 
+    def _call_tip_point(self):
+        """Global position for the call tip: below the caret, with a gap."""
+        editor = self._editor
+        point = editor.mapToGlobal(editor.cursorRect().bottomLeft())
+        point.setY(point.y() + POPUP_VERTICAL_GAP)
+        return point
+
+    def _reposition_call_tip(self) -> None:
+        """Keep the call tip glued to the caret when the window itself moves.
+
+        Repositioning rather than recomputing content: a window move or
+        resize does not change what the caret is enclosed by, only where that
+        position now is on screen.
+        """
+        if self._call_tip is not None and self._call_tip.isVisible() and self._editor is not None:
+            try:
+                self._call_tip.reposition(self._call_tip_point())
+            except Exception:
+                pass
+
+    def _hide_call_tip(self) -> None:
+        if self._call_tip is not None:
+            try:
+                self._call_tip.hide()
+            except Exception:
+                pass
+
     @staticmethod
-    def _enclosing_function(text: str, position: int) -> str:
-        """Name of the function whose parentheses contain ``position``.
+    def _enclosing_function(text: str, position: int) -> Tuple[str, int]:
+        """``(name, open_paren_index)`` of the call enclosing ``position``.
 
         Walks backwards counting bracket depth, so a nested call reports the
-        innermost function - the one the caret is actually inside.
+        innermost function - the one the caret is actually inside. Returns
+        ``("", -1)`` when the caret is not inside any call.
         """
         depth = 0
         index = position - 1
@@ -1866,10 +2317,60 @@ class CustomAutocompleteController(QObject):
                     start = end
                     while start > 0 and (text[start - 1].isalnum() or text[start - 1] in "_$"):
                         start -= 1
-                    return text[start:end].strip()
+                    return text[start:end].strip(), end
                 depth -= 1
             index -= 1
-        return ""
+        return "", -1
+
+    @staticmethod
+    def _argument_index(text: str, open_index: int, position: int) -> int:
+        """How many top-level commas sit between the "(" and the caret.
+
+        Nested parentheses and quoted literals are skipped, so a comma inside
+        a nested call or a string value is never mistaken for an argument
+        separator. The result is which argument the caret is currently in,
+        0-based.
+        """
+        if open_index < 0:
+            return 0
+        depth = 0
+        quote = ""
+        argument = 0
+        index = open_index + 1
+        limit = min(position, len(text))
+        while index < limit:
+            char = text[index]
+            if quote:
+                if char == quote and text[index - 1] != "\\":
+                    quote = ""
+            elif char in ("'", '"'):
+                quote = char
+            elif char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+            elif char == "," and depth == 0:
+                argument += 1
+            index += 1
+        return argument
+
+    #: Colour marking the argument the caret is currently in - distinct from
+    #: the plain-bold function name, so the two kinds of emphasis read as
+    #: different things at a glance.
+    _CURRENT_ARG_COLOR = "#1a5fb4"
+
+    @classmethod
+    def _signature_html(cls, name: str, params: List[str], arg_index: int) -> str:
+        """The signature as HTML, with the current argument in colour."""
+        if not params:
+            return f"<b>{name}</b>()"
+        parts = [
+            f'<span style="color:{cls._CURRENT_ARG_COLOR};">{param}</span>'
+            if i == arg_index
+            else param
+            for i, param in enumerate(params)
+        ]
+        return f"<b>{name}</b>({', '.join(parts)})"
 
     def hide_popup(self) -> None:
         """Close the list and hand the caret back to the editor."""

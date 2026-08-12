@@ -68,8 +68,10 @@ from qgis.PyQt.QtGui import (
     QTextOption,
 )
 from qgis.PyQt.QtWidgets import (
+    QAbstractButton,
     QApplication,
     QCompleter,
+    QLineEdit,
     QPlainTextEdit,
     QTextEdit,
     QWidget,
@@ -122,7 +124,7 @@ except Exception:  # pragma: no cover
 # Configuration
 # --------------------------------------------------------------------------- #
 
-LOG_TAG = "RTL BiDi Editor"
+LOG_TAG = "RTL Expression Editor"
 
 #: Editor classes we take over, matched against the C++ QMetaObject
 #: inheritance chain (see CodeEditorWatcher._meta_class_names for why the
@@ -212,7 +214,16 @@ OVERLAY_FOREGROUND = ""
 DEBUG = True
 
 ENABLE_HIGHLIGHTING = True
-ENABLE_COMPLETER = True
+
+#: Off by default: this was the overlay's own always-on word completer,
+#: opening an ungrouped popup on every keystroke once COMPLETER_MIN_PREFIX
+#: characters were typed - with no way to ask for it, and no way to dismiss
+#: it short of typing past it. rtl_autocomplete.CustomAutocompleteController
+#: now covers the same ground (fields, functions, variables, values) and
+#: then some (grouping, a configurable lookup table), triggered only by
+#: Ctrl+Space. Left in place, disabled, rather than deleted, in case a future
+#: build needs a minimal fallback with no autocomplete module at all.
+ENABLE_COMPLETER = False
 
 #: Minimum prefix length before the completion popup appears.
 COMPLETER_MIN_PREFIX = 2
@@ -718,7 +729,8 @@ class OccurrenceHighlighter(QObject):
     def __init__(self, editor: QPlainTextEdit):
         super().__init__(editor)
         self._editor = editor
-        self._format = QTextCharFormat()
+        self._format_current = QTextCharFormat()
+        self._format_other = QTextCharFormat()
         self._build_format()
         try:
             editor.selectionChanged.connect(self.refresh)
@@ -729,13 +741,13 @@ class OccurrenceHighlighter(QObject):
     # -- appearance -------------------------------------------------------- #
 
     def _build_format(self) -> None:
-        """A faded version of whatever colour marks the selection.
+        """Two strengths of the same colour: strong for the selected word,
+        clearly visible (but weaker) for its other occurrences.
 
         Derived from the palette rather than hard-coded, so it tracks a custom
-        GUI theme automatically and always matches the selected word's colour.
-        The lightness guard is the same one the bracket matcher uses: a tint too
-        close to the background would be invisible, which is indistinguishable
-        from the feature not working.
+        GUI theme automatically. The lightness guard is the same one the
+        bracket matcher uses: a tint too close to the background would be
+        invisible, which is indistinguishable from the feature not working.
         """
         try:
             palette = self._editor.palette()
@@ -743,27 +755,20 @@ class OccurrenceHighlighter(QObject):
             background = palette.color(QPalette.ColorRole.Base)
             if abs(tint.lightness() - background.lightness()) < 30:
                 tint = QColor("#4a90d9")
-            # Faded: strong enough to see, weak enough that Qt's own selection
-            # paint on the selected word still reads as the primary marker.
-            tint.setAlpha(90)
         except Exception:
-            tint = QColor(74, 144, 217, 90)
-        self._format = QTextCharFormat()
-        self._format.setBackground(tint)
+            tint = QColor(74, 144, 217)
+
+        strong = QColor(tint)
+        strong.setAlpha(190)
+        self._format_current = QTextCharFormat()
+        self._format_current.setBackground(strong)
+
+        other = QColor(tint)
+        other.setAlpha(110)
+        self._format_other = QTextCharFormat()
+        self._format_other.setBackground(other)
 
     # -- matching ---------------------------------------------------------- #
-
-    def _is_field_name(self, text: str, needle: str) -> bool:
-        """True when the selection is used as a quoted field somewhere.
-
-        Whole-word matching is applied only to field names: selecting ``NAME``
-        should not light up the ``NAME`` inside ``F_NAME_2``. For anything else -
-        a value, a fragment - substring matching is more useful.
-        """
-        try:
-            return re.search('"' + re.escape(needle) + '"', text, re.IGNORECASE) is not None
-        except Exception:
-            return False
 
     def refresh(self) -> None:
         """Recompute the highlights for the current selection."""
@@ -790,29 +795,42 @@ class OccurrenceHighlighter(QObject):
                 return
 
             text = editor.toPlainText()
-            pattern = re.escape(needle)
-            if self._is_field_name(text, needle):
-                # Plain word boundaries. Treating @ and $ as word characters was
-                # tried and rejected: it made selecting "map_scale" skip
-                # @map_scale, since the @ then counted as part of the word - the
-                # opposite of what a reader expects.
-                pattern = r"(?<!\w)" + pattern + r"(?!\w)"
+            # Whole-word only, always - never a substring match. Plain word
+            # boundaries; @ and $ are deliberately NOT treated as word
+            # characters, so selecting "map_scale" still matches "@map_scale"
+            # instead of skipping it because the @ would otherwise count as
+            # part of the word.
+            pattern = r"(?<!\w)" + re.escape(needle) + r"(?!\w)"
 
-            selections = []
+            selection_start, selection_end = cursor.selectionStart(), cursor.selectionEnd()
             document = editor.document()
+            others = []
             for match in re.finditer(pattern, text, re.IGNORECASE):
-                selection = QTextEdit.ExtraSelection()
+                if match.start() == selection_start and match.end() == selection_end:
+                    continue  # the selection itself - marked separately, below
                 hit = QTextCursor(document)
                 hit.setPosition(match.start())
                 hit.setPosition(match.end(), QTextCursor.MoveMode.KeepAnchor)
-                selection.cursor = hit
-                selection.format = self._format
-                selections.append(selection)
-                if len(selections) >= self.MAX_MATCHES:
+                other = QTextEdit.ExtraSelection()
+                other.cursor = hit
+                other.format = self._format_other
+                others.append(other)
+                if len(others) >= self.MAX_MATCHES:
                     break
 
-            # A single hit is the selection itself - nothing to point out.
-            coordinator.publish("occurrences", selections if len(selections) > 1 else [])
+            if not others:
+                # Nothing else to point out.
+                coordinator.publish("occurrences", [])
+                return
+
+            current = QTextEdit.ExtraSelection()
+            current_cursor = QTextCursor(document)
+            current_cursor.setPosition(selection_start)
+            current_cursor.setPosition(selection_end, QTextCursor.MoveMode.KeepAnchor)
+            current.cursor = current_cursor
+            current.format = self._format_current
+
+            coordinator.publish("occurrences", [current] + others)
         except Exception as exc:
             _log(f"Occurrence highlighting failed: {exc}", Qgis.MessageLevel.Info)
 
@@ -832,6 +850,159 @@ class OccurrenceHighlighter(QObject):
             _coordinator_for(editor).clear("occurrences")
         except Exception:
             pass
+
+
+# --------------------------------------------------------------------------- #
+# Replace-bar shortcuts
+# --------------------------------------------------------------------------- #
+
+
+class ReplaceBarShortcuts(QObject):
+    """Enter / Shift+Enter in the "replace with" field trigger the matching
+    button in QGIS's own find/replace bar (Ctrl+H).
+
+    QGIS's bar already has "Replace" and "Replace All" buttons; this adds the
+    keyboard shortcut a user reaching for Enter naturally expects while
+    sitting in the field whose text is what actually gets inserted - not the
+    "find" field, which does something else entirely on Enter, and which this
+    class is careful never to touch.
+
+    Purely additive and self-disabling: watched via ``QApplication.
+    focusChanged`` rather than any hook into the bar itself, so it needs no
+    knowledge of which QGIS version's widget hierarchy it is looking at. If
+    the two buttons cannot be identified with confidence for any reason, it
+    simply never fires and QGIS's own key handling is completely unaffected.
+    """
+
+    def __init__(self, window: QWidget):
+        super().__init__(window)
+        self._window = window
+        self._watched: Optional[QLineEdit] = None
+        self._replace_btn: Optional[QAbstractButton] = None
+        self._replace_all_btn: Optional[QAbstractButton] = None
+        try:
+            app = QApplication.instance()
+            if app is not None:
+                app.focusChanged.connect(self._on_focus_changed)
+        except Exception as exc:
+            _log(f"Replace-bar shortcuts unavailable: {exc}", Qgis.MessageLevel.Info)
+
+    # -- identifying the "replace with" field ------------------------------- #
+
+    def _on_focus_changed(self, _old, new) -> None:
+        if not isinstance(new, QLineEdit):
+            return
+        try:
+            if self._window is None or new.window() is not self._window:
+                return  # a field in some other dialog entirely
+        except Exception:
+            return
+
+        if self._watched is not None and self._watched is not new:
+            try:
+                self._watched.removeEventFilter(self)
+            except Exception:
+                pass
+            self._watched = None
+
+        replace_btn, replace_all_btn = self._find_replace_buttons(new)
+        if replace_btn is None or replace_all_btn is None:
+            return  # not the "replace with" field, e.g. it is the "find" field
+
+        self._replace_btn = replace_btn
+        self._replace_all_btn = replace_all_btn
+        self._watched = new
+        try:
+            new.installEventFilter(self)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _find_replace_buttons(line_edit: QLineEdit):
+        """Find the sibling Replace / Replace All buttons for one field.
+
+        Walks a few parent levels up - the exact container depth varies by
+        QGIS version and by whether the bar is a plain toolbar or a widget
+        with its own layout - looking for two buttons recognisable as
+        "Replace" and "Replace All" from whatever text QGIS itself put on
+        them (a visible label, or a tooltip when the button is icon-only).
+        Read from the live widgets rather than hard-coded, so a translated
+        UI still matches and a QGIS version with a different button layout
+        just fails to match rather than clicking the wrong thing.
+        """
+        node = line_edit.parentWidget()
+        depth = 0
+        while node is not None and depth < 4:
+            replace_btn = None
+            replace_all_btn = None
+            for button in node.findChildren(QAbstractButton):
+                label = " ".join(
+                    part or ""
+                    for part in (
+                        button.text(),
+                        button.toolTip(),
+                        button.accessibleName(),
+                        button.objectName(),
+                    )
+                ).lower()
+                label = label.replace("&", "")
+                if "replace" not in label:
+                    continue
+                if "all" in label:
+                    replace_all_btn = replace_all_btn or button
+                else:
+                    replace_btn = replace_btn or button
+            if replace_btn is not None and replace_all_btn is not None:
+                return replace_btn, replace_all_btn
+            node = node.parentWidget()
+            depth += 1
+        return None, None
+
+    # -- the shortcut itself ------------------------------------------------ #
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802 (Qt override)
+        if (
+            obj is self._watched
+            and event.type() == QEvent.Type.KeyPress
+            and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+        ):
+            # Consumed unconditionally, matched button or not: a QLineEdit's
+            # own Enter/Return handling falls through to whichever button in
+            # the dialog is the "default" one (setDefault/autoDefault) once
+            # nothing else claims the key - that button is not necessarily
+            # "Replace" here. Letting that happen even once (because
+            # self._replace_btn came up empty) meant plain Enter could
+            # silently trigger Replace All instead of doing nothing.
+            shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+            target = self._replace_all_btn if shift else self._replace_btn
+            if target is not None:
+                try:
+                    if target.isEnabled():
+                        target.click()
+                except Exception:
+                    pass
+            return True
+        return False
+
+    # -- teardown ------------------------------------------------------------ #
+
+    def teardown(self) -> None:
+        """Disconnect and clear; safe to call more than once."""
+        try:
+            app = QApplication.instance()
+            if app is not None:
+                app.focusChanged.disconnect(self._on_focus_changed)
+        except Exception:
+            pass
+        if self._watched is not None:
+            try:
+                self._watched.removeEventFilter(self)
+            except Exception:
+                pass
+        self._watched = None
+        self._replace_btn = None
+        self._replace_all_btn = None
+        self._window = None
 
 
 # --------------------------------------------------------------------------- #
@@ -870,6 +1041,55 @@ class RtlOverlayEditor(QPlainTextEdit):
         self._detached = False
         self._highlighter: Optional[BidiSyntaxHighlighter] = None
         self._completer: Optional[QCompleter] = None
+
+        # Scintilla's own call tip (the argument-hint rectangle) and its own
+        # autocompletion list both react to the very edits and caret moves the
+        # overlay -> Scintilla sync pushes into it, popping up behind our own
+        # popups (rtl_autocomplete.CallTipPopup / AutocompletePopup) with no
+        # way for the user to dismiss them - the autocompletion list in
+        # particular would open on every keystroke, never only on our
+        # Ctrl+Space trigger. Both are disabled up front wherever the API is
+        # reachable; _cancel_native_popups() below is the backup for when it
+        # is not.
+        try:
+            from qgis.PyQt.Qsci import QsciScintilla
+
+            if isinstance(sci, QsciScintilla):
+                # PyQt6 nests these enums under the class; PyQt5 exposes them
+                # flat on QsciScintilla itself. Try both rather than assuming
+                # one binding.
+                calltips_none = getattr(
+                    getattr(QsciScintilla, "CallTipsStyle", QsciScintilla),
+                    "CallTipsNone",
+                )
+                acs_none = getattr(
+                    getattr(QsciScintilla, "AutoCompletionSource", QsciScintilla),
+                    "AcsNone",
+                )
+                sci.setCallTipsStyle(calltips_none)
+                sci.setAutoCompletionSource(acs_none)
+                sci.setAutoCompletionThreshold(-1)
+        except Exception:
+            pass
+
+        # The underlying editor keeps its own scrollbars even though the
+        # overlay sits on top of it and covers its full rect (_sync_geometry
+        # below): shrinking the dialog narrower or shorter than the text
+        # needs made TWO sets appear - Scintilla's own, and the overlay's.
+        # Suppressed via the raw Scintilla messages rather than a QsciScintilla-
+        # only setter, so this works even on a degraded, Base-only wrapper (see
+        # the class docstring on cross-module sip casts) - the same reasoning
+        # as _cancel_native_popups() below. Only the overlay's own scrollbars
+        # (a plain QPlainTextEdit's) are left to ever appear.
+        try:
+            # Hard-coded Scintilla message numbers as a fallback: these two
+            # are old, stable parts of the message set, but falling back
+            # rather than assuming the attribute name is exposed identically
+            # on every binding costs nothing.
+            sci.SendScintilla(getattr(sci, "SCI_SETHSCROLLBAR", 2130), 0)
+            sci.SendScintilla(getattr(sci, "SCI_SETVSCROLLBAR", 2280), 0)
+        except Exception:
+            pass
 
         cls_names = {klass.__name__ for klass in type(sci).__mro__}
         self._dialect = "sql" if "QgsCodeEditorSQL" in cls_names else "expression"
@@ -953,6 +1173,26 @@ class RtlOverlayEditor(QPlainTextEdit):
         except Exception as exc:
             self._occurrence_highlighter = None
             _log(f"Occurrence highlighting unavailable: {exc}", Qgis.MessageLevel.Info)
+
+        # --- replace-bar shortcuts ------------------------------------------
+        # Enter / Shift+Enter in QGIS's own Ctrl+H "replace with" field.
+        # Scoped to this dialog's top-level window, watched via
+        # QApplication.focusChanged rather than any hook into the bar itself.
+        #
+        # One instance per overlay editor, sharing nothing across them. If a
+        # single window ever hosted two targeted editors at once, each would
+        # react to Enter in that window's replace field, double-clicking the
+        # button. Every dialog this plugin targets (Expression Builder, Field
+        # Calculator, Layer Filter) has exactly one, so this is not worth the
+        # extra bookkeeping a shared-instance guard would add.
+        self._replace_bar_shortcuts = None
+        try:
+            window = self.window()
+            if window is not None:
+                self._replace_bar_shortcuts = ReplaceBarShortcuts(window)
+        except Exception as exc:
+            self._replace_bar_shortcuts = None
+            _log(f"Replace-bar shortcuts unavailable: {exc}", Qgis.MessageLevel.Info)
 
         # --- optional feature: description read mode ----------------------
         # Adds an in-editor switch when a lookup table with descriptions is
@@ -1276,6 +1516,7 @@ class RtlOverlayEditor(QPlainTextEdit):
                 # stops the echo from coming back to us.
                 self._sci.setText(text)
             self._push_cursor_to_sci()
+            self._cancel_native_popups()
         except RuntimeError:
             self._detached = True
         except Exception as exc:
@@ -1289,6 +1530,7 @@ class RtlOverlayEditor(QPlainTextEdit):
         self._syncing = True
         try:
             self._push_cursor_to_sci()
+            self._cancel_native_popups()
         except RuntimeError:
             self._detached = True
         except Exception as exc:
@@ -1306,6 +1548,26 @@ class RtlOverlayEditor(QPlainTextEdit):
         else:
             line, index = _line_index_from_offset(text, cursor.position())
             self._sci.setCursorPosition(line, index)
+
+    def _cancel_native_popups(self) -> None:
+        """Belt-and-suspenders backup for the setup done in ``__init__``.
+
+        Cancels any call tip or autocompletion list Scintilla just raised in
+        response to the push, synchronously and before Qt gets back to
+        painting - covering the case where ``setCallTipsStyle`` /
+        ``setAutoCompletionSource`` were unreachable (a degraded, Base-only
+        wrapper; see the class docstring on cross-module sip casts). Without
+        this, typing into the overlay could still pop Scintilla's own
+        suggestion list open on every keystroke, never only on Ctrl+Space.
+        """
+        try:
+            self._sci.SendScintilla(self._sci.SCI_CALLTIPCANCEL)
+        except Exception:
+            pass
+        try:
+            self._sci.SendScintilla(self._sci.SCI_AUTOCCANCEL)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ #
     # Completion
@@ -1446,6 +1708,13 @@ class RtlOverlayEditor(QPlainTextEdit):
             except Exception:
                 pass
             self._occurrence_highlighter = None
+        replace_shortcuts = getattr(self, "_replace_bar_shortcuts", None)
+        if replace_shortcuts is not None:
+            try:
+                replace_shortcuts.teardown()
+            except Exception:
+                pass
+            self._replace_bar_shortcuts = None
         matcher = getattr(self, "_bracket_matcher", None)
         if matcher is not None:
             try:
@@ -1521,7 +1790,7 @@ class CodeEditorWatcher(QObject):
         # Master switch (Settings -> General).  Default is enabled, so an
         # existing install behaves identically to before this feature existed.
         if Settings is not None and not Settings.plugin_enabled():
-            _log("RTL / BiDi editor is disabled in settings.", Qgis.MessageLevel.Info)
+            _log("RTL Expression Editor is disabled in settings.", Qgis.MessageLevel.Info)
             return
         app.installEventFilter(self)
         try:
@@ -1795,7 +2064,7 @@ class CodeEditorWatcher(QObject):
 # Exposed so the plugin can be inspected and re-triggered from the QGIS Python
 # Console without restarting QGIS:
 #
-#     from rtl_bidi_editor import rtl_bidi_editor as m
+#     from rtl_bidi_editor import rtl_editor as m
 #     m.rescan()
 # --------------------------------------------------------------------------- #
 
@@ -1888,7 +2157,7 @@ class RtlBidiEditorPlugin:
                 self._watcher.install()  # idempotent
             else:
                 self._watcher.uninstall()
-                _log("RTL / BiDi editor disabled.", Qgis.MessageLevel.Info)
+                _log("RTL Expression Editor disabled.", Qgis.MessageLevel.Info)
         except Exception as exc:
             _log(f"Could not apply settings: {exc}", Qgis.MessageLevel.Warning)
 
@@ -1903,7 +2172,7 @@ class RtlBidiEditorPlugin:
             self._watcher.install()
             if SETTINGS_BUS is not None:
                 SETTINGS_BUS.changed.connect(self.apply_settings)
-            _log("RTL / BiDi editor active.", Qgis.MessageLevel.Success)
+            _log("RTL Expression Editor active.", Qgis.MessageLevel.Success)
             _dbg(
                 f"watching editor classes {sorted(TARGET_EDITOR_CLASSES)}; "
                 f"detection = Show-event filter + focusChanged signal"

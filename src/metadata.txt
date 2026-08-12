@@ -9,9 +9,8 @@ about=QGIS's built-in editor (QScintilla) does not display right-to-left text co
 
     The plugin also offers an optional advanced auto-complete system. Choose any project layer and its fields as the source of allowed values, with optional descriptions, groups and group descriptions. Press Ctrl+Space to complete either a field name or a value, and the suggestions adapt automatically to the field being queried and to the layer you are working on.
 
-
     When a custom auto-complete source is configured, an optional Read Mode switch appears inside the editor. Read Mode shows the value descriptions instead of the stored codes, making a long expression far easier tounderstand, and never alters the expression itself. Where the same code has different meanings in different groups, the description you picked is saved in the project file and restored automatically, so Read Mode always shows the right one, for everyone who opens the project.
-version=1.3
+version=1.4
 author=Jossef Kanter
 email=jossefkan@gmail.com
 
@@ -29,8 +28,32 @@ server=False
 
 ** v1.4(12.08.2026):
     - Added: Ctrl+Space now also suggests fields, functions and variables, with signatures and help.
-    - Added: typing "(" shows the function's signature and description.
+    - Added: typing parentheses shows the function's signature and description.
     - Added: selecting a word now highlights its other occurrences, including while using Find.
+    - Added: autocomplete now works even without a configured lookup table.
+    - Added: suggestions now also appear automatically while typing, not only with Ctrl+Space.
+    - Added: a function helper now shows the function name and its arguments while typing inside it.
+    - Added: a setting for how many values are suggested when no lookup table is configured.
+    - Added: Enter / Shift+Enter in the Ctrl+H replace bar now replace one occurrence or all occurrences.
+    - Improved: the suggestion list is now grouped exactly like the Expression Builder's own categories.
+    - Improved: functions in the suggestion list now show only their name, not their arguments.
+    - Improved: simplified suggestion rules - field names after ", values after ', everything else otherwise.
+    - Improved: the function helper now follows the caret and the window, and opens or closes automatically when moving in or out of a function call.
+    - Improved: the function helper now shows the current argument in color and no longer shows a description.
+    - Improved: word highlighting now always matches whole words only, with the selected word shown clearly and other matches shown in a lighter, but still clearly visible, color.
+    - Improved: the suggestion list and function helper are now positioned further from the text so they no longer overlap it.
+    - Improved: the function helper's current argument is now shown in blue instead of red.
+    - Fixed: a crash that could break autocomplete ("cannot import name _find_context_layer").
+    - Fixed: the suggestion list and function helper sometimes opened without pressing Ctrl+Space.
+    - Fixed: the function helper could get stuck on screen after switching to another window.
+    - Fixed: selecting a suggestion sometimes duplicated quote characters.
+    - Fixed: the plugin name showed as "RTL BiDi Editor" in the Log Messages panel.
+    - Fixed: pressing Escape while the suggestion list was open could close the whole window instead of just the list.
+    - Fixed: pressing Enter in the Ctrl+H replace field could replace all occurrences instead of just the current one.
+    - Fixed: shrinking the window could show duplicate scrollbars; only the RTL editor's own remain, positioned clear of the read-mode switch.
+    - Fixed: on Linux, the suggestion list could flash open and immediately disappear.
+    - Added: a test suite covering the editor, its sync with the core editor, autocomplete, the function helper and every other feature.
+    - Added: a "Run Tests" button in Settings, for development checkouts, showing a pass/fail summary and the full log.
 
 ** v1.3 (10.08.2026):
   - Improved: the suggestion list now shows values without their surrounding quotes.
