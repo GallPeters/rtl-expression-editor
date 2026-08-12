@@ -549,7 +549,16 @@ class SettingsDialog(QDialog):
             result = run_all.main(verbosity=2, stream=buffer)
             log_text = buffer.getvalue()
         except Exception as exc:
-            log_text = f"Could not run the test suite:\n{exc}"
+            # The full traceback, not just str(exc): a bare exception message
+            # like "_qgis_app_init_qgis() takes 0 positional arguments but 1
+            # was given" gives no clue which call in the chain actually
+            # raised it, or from which module - exactly the information
+            # needed to diagnose an environment-specific failure (this one
+            # only reproduces inside an already-running QGIS session, never
+            # in a standalone interpreter).
+            import traceback
+
+            log_text = f"Could not run the test suite:\n{traceback.format_exc()}"
             _log(f"Run Tests failed: {exc}")
         finally:
             self.btn_run_tests.setEnabled(True)

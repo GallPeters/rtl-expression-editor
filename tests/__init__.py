@@ -71,11 +71,26 @@ import importlib.util
 import sys
 from pathlib import Path
 
-from qgis.testing import start_app
+from qgis.core import QgsApplication
 
-# Idempotent: safe even if something else already started the QGIS
-# application in this process (e.g. running inside the QGIS Python Console).
-start_app()
+# start_app() bootstraps a whole new QgsApplication from scratch - meant for
+# a standalone test process that has none yet. Its own idempotency guard
+# only knows about a QgsApplication *it* previously started (tracked in a
+# module-level global inside qgis.testing itself); it has no way to notice
+# one that QGIS Desktop itself already constructed and initialised before
+# this ever runs - exactly the case for the Settings dialog's "Run Tests"
+# button, executing inside the user's already-open, already-initialised
+# session. Attempting to start a second one there does not fail cleanly -
+# it surfaces many calls later as a confusing, unrelated-looking TypeError
+# from deep inside Qt/SIP's own plumbing. Checking for an existing instance
+# first, ourselves, is what actually makes this safe either way: a
+# standalone interpreter (python3 -m tests.run_all) has none yet and still
+# gets one bootstrapped exactly as before; a live QGIS session already has
+# one and this becomes a no-op.
+if QgsApplication.instance() is None:
+    from qgis.testing import start_app
+
+    start_app()
 
 #: Fixed name every test module imports the plugin under, regardless of what
 #: its real install folder is actually called.
