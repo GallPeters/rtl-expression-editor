@@ -8,7 +8,7 @@ import unittest
 from qgis.PyQt.QtGui import QTextCursor
 from qgis.PyQt.QtWidgets import QPlainTextEdit
 
-from .. import rtl_editor as ed
+from src import rtl_editor as ed
 
 
 class OccurrenceHighlighterTests(unittest.TestCase):

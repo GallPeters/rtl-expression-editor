@@ -3,7 +3,7 @@
 
 import unittest
 
-from ..rtl_settings import Settings
+from src.rtl_settings import Settings
 
 
 class SettingsRoundTripTests(unittest.TestCase):

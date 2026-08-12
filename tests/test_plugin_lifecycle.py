@@ -3,8 +3,8 @@
 
 import unittest
 
-from .. import classFactory
-from .. import rtl_editor as ed
+from src import classFactory
+from src import rtl_editor as ed
 
 
 class PluginLifecycleTests(unittest.TestCase):

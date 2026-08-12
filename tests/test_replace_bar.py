@@ -8,7 +8,7 @@ from qgis.PyQt.QtCore import QEvent, Qt
 from qgis.PyQt.QtGui import QKeyEvent
 from qgis.PyQt.QtWidgets import QDialog, QHBoxLayout, QLineEdit, QPushButton
 
-from .. import rtl_editor as ed
+from src import rtl_editor as ed
 
 
 def _build_bar():

@@ -41,23 +41,35 @@ QGIS's built-in editor doesn't render RTL and mixed text correctly. This plugin 
 
 ## Running the tests
 
-The `test/` folder ships with the plugin and covers the editor and its sync
-with the core editor, autocomplete (with and without a configured lookup
-table), the function helper, read mode, occurrence highlighting, the
-replace-bar shortcuts and the plugin's own load/unload cycle. It is not run
-automatically - these are developer/QA tests, run on demand.
+The `tests/` folder at the repository root - a sibling of `src/`, not part of
+it - covers the editor and its sync with the core editor, autocomplete (with
+and without a configured lookup table), the function helper, read mode,
+occurrence highlighting, the replace-bar shortcuts and the plugin's own
+load/unload cycle. It ships with the repository, not with a packaged release
+(only `src/`'s contents are packaged), and is never run automatically -
+these are developer/QA tests, run on demand.
 
-From the QGIS Python Console, after installing the plugin:
+From the QGIS Python Console, with the repository checked out somewhere on
+disk:
 
 ```python
-from rtl_bidi_editor.test import run_all
+import sys
+sys.path.insert(0, r"<path to the repository root>")
+from tests import run_all
 run_all.main()
 ```
 
 From a shell, using QGIS's own Python interpreter (the exact launcher name
 depends on the platform/QGIS build, e.g. `python-qgis-qt6.bat` on Windows,
-`python3` inside `qgis --code` on Linux):
+`python3` inside `qgis --code` on Linux), run from the repository root:
 
 ```
-python3 -m rtl_bidi_editor.test.run_all
+python3 -m tests.run_all
 ```
+
+If the QGIS profile's plugin points straight at this repository's `src/`
+folder (a common way to develop against a live QGIS, e.g. via a symlink),
+the plugin's own Settings dialog also gets a **Run Tests** button under a
+"Developer" section that does the same thing and shows a pass/fail summary
+plus the full log. It only appears when `tests/` is found as a sibling of
+the running plugin's own directory - never for a normal end-user install.

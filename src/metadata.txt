@@ -53,6 +53,7 @@ server=False
     - Fixed: shrinking the window could show duplicate scrollbars; only the RTL editor's own remain, positioned clear of the read-mode switch.
     - Fixed: on Linux, the suggestion list could flash open and immediately disappear.
     - Added: a test suite covering the editor, its sync with the core editor, autocomplete, the function helper and every other feature.
+    - Added: a "Run Tests" button in Settings, for development checkouts, showing a pass/fail summary and the full log.
 
 ** v1.3 (10.08.2026):
   - Improved: the suggestion list now shows values without their surrounding quotes.

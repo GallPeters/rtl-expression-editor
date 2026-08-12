@@ -16,8 +16,8 @@ import unittest
 from qgis.core import QgsExpression, QgsFeature, QgsProject
 from qgis.PyQt.QtWidgets import QPlainTextEdit
 
-from .. import rtl_autocomplete as ac
-from ..rtl_settings import Settings
+from src import rtl_autocomplete as ac
+from src.rtl_settings import Settings
 from .utils import make_context_layer, make_lookup_layer, reset_plugin_settings
 
 
@@ -92,13 +92,16 @@ class WithoutAnyLookupTableTests(unittest.TestCase):
     the layer being edited, values from the layer's own data."""
 
     def setUp(self):
-        QgsProject.instance().removeAllMapLayers()
         reset_plugin_settings()
         self.layer = make_context_layer(("NAME", "COUNTRY"))
         QgsProject.instance().addMapLayer(self.layer)
 
     def tearDown(self):
-        QgsProject.instance().removeAllMapLayers()
+        # Remove only the layer this test added - never every layer in the
+        # project, which could be the user's own if this suite is ever run
+        # from inside a live QGIS session (e.g. the Settings dialog's "Run
+        # Tests" button) rather than a disposable qgis.testing process.
+        QgsProject.instance().removeMapLayer(self.layer.id())
         reset_plugin_settings()
 
     def test_context_field_names_reads_the_layers_own_fields(self):
@@ -129,7 +132,6 @@ class WithALookupTableTests(unittest.TestCase):
     grouped and described."""
 
     def setUp(self):
-        QgsProject.instance().removeAllMapLayers()
         reset_plugin_settings()
         self.context_layer = make_context_layer(("STATUS", "COUNTRY"))
         self.lookup_layer = make_lookup_layer()
@@ -147,7 +149,9 @@ class WithALookupTableTests(unittest.TestCase):
 
     def tearDown(self):
         reset_plugin_settings()
-        QgsProject.instance().removeAllMapLayers()
+        # Only the two layers this test added - see the note in
+        # WithoutAnyLookupTableTests.tearDown above.
+        QgsProject.instance().removeMapLayers([self.context_layer.id(), self.lookup_layer.id()])
         ac.cache().invalidate()
 
     def test_configuration_is_usable(self):
@@ -173,7 +177,6 @@ class AutocompletePopupFlowTests(unittest.TestCase):
     the level closest to what actually happens in the Expression Builder."""
 
     def setUp(self):
-        QgsProject.instance().removeAllMapLayers()
         reset_plugin_settings()
         self.layer = make_context_layer(("NAME", "COUNTRY"))
         QgsProject.instance().addMapLayer(self.layer)
@@ -186,7 +189,7 @@ class AutocompletePopupFlowTests(unittest.TestCase):
 
     def tearDown(self):
         self.controller.teardown()
-        QgsProject.instance().removeAllMapLayers()
+        QgsProject.instance().removeMapLayer(self.layer.id())
         reset_plugin_settings()
 
     def _set_text_and_cursor(self, text: str, position: int) -> None:

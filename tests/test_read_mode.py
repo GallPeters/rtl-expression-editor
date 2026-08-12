@@ -6,8 +6,8 @@ import unittest
 
 from qgis.core import QgsProject
 
-from .. import rtl_readmode as rm
-from ..rtl_settings import Settings
+from src import rtl_readmode as rm
+from src.rtl_settings import Settings
 from .utils import make_lookup_layer, reset_plugin_settings
 
 
@@ -53,13 +53,25 @@ class SubstituteDescriptionsTests(unittest.TestCase):
         )
 
     def test_a_remembered_choice_resolves_the_ambiguous_code(self):
-        rm.ChoiceMemory.remember("mytable", "code", "610", "greenhouse", 0, "ctx")
-        mapping = {"code": {"610": ["mosque", "greenhouse"]}}
-        expr = "\"CODE\" = '610'"
-        self.assertEqual(
-            rm.substitute_descriptions(expr, mapping, "mytable", "ctx"),
-            '"CODE" = greenhouse',
-        )
+        # ChoiceMemory.remember() writes into the ACTIVE QgsProject's custom
+        # properties - snapshot and restore that one entry, so this leaves no
+        # residue in a real project if run from inside a live QGIS session.
+        project = QgsProject.instance()
+        original, existed = project.readEntry("rtl_bidi_editor", "value_choices", "")
+        try:
+            rm.ChoiceMemory.remember("mytable", "code", "610", "greenhouse", 0, "ctx")
+            mapping = {"code": {"610": ["mosque", "greenhouse"]}}
+            expr = "\"CODE\" = '610'"
+            self.assertEqual(
+                rm.substitute_descriptions(expr, mapping, "mytable", "ctx"),
+                '"CODE" = greenhouse',
+            )
+        finally:
+            if existed:
+                project.writeEntry("rtl_bidi_editor", "value_choices", original)
+            else:
+                project.removeEntry("rtl_bidi_editor", "value_choices")
+            rm.ChoiceMemory.invalidate()
 
 
 class OccurrenceIndexTests(unittest.TestCase):
@@ -84,7 +96,6 @@ class OccurrenceIndexTests(unittest.TestCase):
 
 class DescriptionResolverTests(unittest.TestCase):
     def setUp(self):
-        QgsProject.instance().removeAllMapLayers()
         reset_plugin_settings()
         self.layer = make_lookup_layer()
         QgsProject.instance().addMapLayer(self.layer)
@@ -97,7 +108,10 @@ class DescriptionResolverTests(unittest.TestCase):
 
     def tearDown(self):
         reset_plugin_settings()
-        QgsProject.instance().removeAllMapLayers()
+        # Only the layer this test added - never every layer in the project,
+        # which could be the user's own if this suite is run from inside a
+        # live QGIS session.
+        QgsProject.instance().removeMapLayer(self.layer.id())
         rm.DescriptionResolver.invalidate()
 
     def test_mapping_builds_field_to_code_to_descriptions(self):
