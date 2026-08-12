@@ -1,0 +1,9 @@
+# Claude Code session/project files - local to this machine, not part of the plugin.
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+
+# Editors
+.vscode/

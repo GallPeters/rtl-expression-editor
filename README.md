@@ -32,6 +32,34 @@ QGIS's built-in editor doesn't render RTL and mixed text correctly. This plugin 
 2. Restart QGIS.
 3. Enable **RTL Companion Editor** in Plugin Manager.
 
+### Installing from source instead
+
+Everything QGIS needs to load the plugin lives in `src/` - `__init__.py`,
+`metadata.txt`, `LICENSE`, `icon.png` and every `rtl_*.py` module, all as
+direct siblings of each other. That's the important part: QGIS's plugin
+loader requires `__init__.py` to sit next to `rtl_editor.py` and friends, not
+one directory above them.
+
+So install by copying (or zipping) `src/`'s **contents** - not the `src`
+folder itself - into a folder named however you like inside your QGIS
+profile's plugin directory, e.g.:
+
+```
+<QGIS profile>/python/plugins/rtl_expression_editor/__init__.py
+<QGIS profile>/python/plugins/rtl_expression_editor/metadata.txt
+<QGIS profile>/python/plugins/rtl_expression_editor/rtl_editor.py
+...
+```
+
+Copying the repository root (or `src/` as a nested subfolder) instead
+produces `ModuleNotFoundError: No module named
+'<plugin folder>.rtl_editor'` - `__init__.py`'s `from .rtl_editor import ...`
+only resolves when the two are direct siblings. The `tests/` folder is a
+sibling of `src/` on purpose, not part of it: it ships with the repository
+for development, never with a packaged release. `releases/` holds the actual
+`src/`-contents-only zips built for past versions, as a reference for the
+expected layout.
+
 ## Usage
 
 1. Open a supported dialog (e.g. `Layer → Filter / Query Builder`).
