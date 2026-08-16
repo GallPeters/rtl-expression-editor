@@ -1135,13 +1135,21 @@ class AutocompletePopup(QListWidget):
 
     @staticmethod
     def _make_title(text: str) -> QListWidgetItem:
-        """The dataset/field heading - bigger and bolder than a group header
-        (see ``_make_header``), so it reads as one level up in the hierarchy
-        even when the list is also grouped."""
+        """The dataset/field heading - a little bigger and bolder than a
+        group header (see ``_make_header``), so it reads as one level up in
+        the hierarchy even when the list is also grouped, without dominating
+        the rest of the popup."""
         item = QListWidgetItem(text)
         font = QFont(item.font())
         font.setBold(True)
-        font.setPointSize(font.pointSize() + 2)
+        if font.pointSize() > 0:
+            font.setPointSize(font.pointSize() + 1)
+        else:
+            # Some platforms configure the base font by pixel size rather
+            # than point size, in which case pointSize() returns -1 rather
+            # than a usable number - fall back to the pixel-size equivalent
+            # rather than silently leaving the title unenlarged.
+            font.setPixelSize(max(1, font.pixelSize() + 1))
         item.setFont(font)
         item.setFlags(Qt.ItemFlag.NoItemFlags)  # not selectable, not enabled
         item.setForeground(QColor("#1a5276"))

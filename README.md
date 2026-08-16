@@ -103,9 +103,15 @@ colleagues without asking them to configure anything themselves:
    happens to install the plugin. No Import Settings click needed, nothing
    to configure by hand.
 
-This automatic import only ever runs once, and only when nothing is already
-configured - it will not overwrite a colleague's own later changes, and
-re-running it (e.g. after updating the plugin) is safe.
+This is tracked by the bundled file's own content, not by whether
+autocomplete already looks configured - reinstalling the plugin never
+clears its settings, so it applies the bundled file whether this is a
+genuinely fresh install or a reinstall over an existing one (e.g. while
+testing the zip yourself). It only skips re-applying a file whose exact
+content has already been imported before, so a later, unrelated change made
+through the Settings dialog is never silently reverted on the next startup
+- and a new export replacing that file (a newer, updated zip) is always
+picked up again.
 
 Prefer to do it manually instead? The Settings dialog's **Export Settings** /
 **Import Settings** buttons work the same way at any time, for one-off

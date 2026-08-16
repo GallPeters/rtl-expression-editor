@@ -74,13 +74,14 @@ CONFIG_MARKER = "rtl_expression_editor_settings"
 #: forward-compatible) plugin version still applies whatever it recognises.
 CONFIG_FORMAT_VERSION = 1
 
-#: Filename Export Settings suggests by default, and the one Import Settings
-#: auto-loads on the plugin's first activation if found sitting next to it -
-#: see Settings.apply_bundled_config_if_present(). Using the same name for
-#: both halves is what makes "export, then drop the file in the plugin
-#: folder before zipping it up" work with no extra step: a colleague who
-#: installs that zip gets it applied automatically, without ever opening the
-#: Settings dialog themselves.
+#: Filename Export Settings suggests by default, and the one auto-imported
+#: on plugin activation whenever it is found sitting next to the plugin's
+#: own modules with content not already applied to this profile - see
+#: Settings.apply_bundled_config_if_present(). Using the same name for both
+#: halves is what makes "export, then drop the file in the plugin folder
+#: before zipping it up" work with no extra step: a colleague who installs
+#: that zip gets it applied automatically, without ever opening the Settings
+#: dialog themselves.
 BUNDLED_CONFIG_FILENAME = "rtl_expression_editor_settings.json"
 
 
@@ -445,20 +446,26 @@ class Settings:
         BUS.changed.emit()
         return warnings
 
-    # -- bundled config, applied automatically on first activation --------- #
+    # -- bundled config, applied automatically on activation --------------- #
 
     @classmethod
-    def bundled_config_already_applied(cls) -> bool:
-        """Whether ``apply_bundled_config_if_present()`` has already acted -
-        successfully applied a bundled file, or found something already
-        configured that it correctly left alone. Persisted across QGIS
-        sessions, so it runs at most once per profile rather than on every
-        startup."""
-        return cls._get_bool("ac/bundled_config_applied", False)
+    def _bundled_config_hash(cls) -> str:
+        """A fingerprint of the last bundled file this profile applied.
+
+        Tracking by CONTENT rather than a plain "have we ever done this"
+        flag is what makes re-installing the plugin (uninstall, then install
+        a new zip that bundles a different, freshly re-exported settings
+        file) actually pick up the new file: uninstalling a plugin removes
+        its files, but never touches QgsSettings, which is where all of this
+        is stored - a one-shot boolean flag would stay set from a previous
+        install and permanently block every later one on the same profile,
+        which is exactly the bug this replaced.
+        """
+        return cls._get_str("ac/bundled_config_hash", "")
 
     @classmethod
-    def _mark_bundled_config_applied(cls) -> None:
-        cls._set("ac/bundled_config_applied", True)
+    def _set_bundled_config_hash(cls, value: str) -> None:
+        cls._set("ac/bundled_config_hash", value or "")
 
     @classmethod
     def apply_bundled_config_if_present(cls, plugin_dir: Optional[Path] = None) -> Optional[List[str]]:
@@ -469,48 +476,49 @@ class Settings:
         the plugin folder, zip it up: a colleague who installs that zip gets
         it applied with no Import Settings click of their own.
 
-        Deliberately conservative, in three ways:
+        Applies unconditionally whenever the bundled file's own content is
+        new to this profile - the same overwrite-without-asking behaviour
+        Import Settings already has, just run automatically. Deliberately
+        does NOT check whether autocomplete is "already configured" before
+        applying: since setting it up manually is the normal first step
+        before ever exporting a bundled file in the first place, that check
+        made this a no-op for exactly the reinstall-to-verify workflow it
+        exists for.
 
-        * Runs at most once ever per QGIS profile (see
-          ``bundled_config_already_applied()``) - a later, deliberate change
-          to the settings is never silently overwritten by this running
-          again on a subsequent startup.
-        * Never overwrites an already-configured autocomplete source -
-          if one is already set (a manual setup, or an earlier successful
-          auto-import), this is marked done and skipped rather than
-          clobbering it.
-        * A missing file is not an error and is not marked done: it is
-          simply "nothing to do yet", so a bundled file added by a later
-          plugin update still gets picked up on its first activation.
+        What it does guard against is reapplying the SAME bundled file over
+        and over: every field the file mentions is written on every
+        successful run, and doing that on every single QGIS startup would
+        silently revert any later, unrelated change made through the
+        Settings dialog back to the bundled values. A hash of the file's
+        content (see ``_bundled_config_hash()``) is recorded after a
+        successful apply, and skips a later run only when that exact
+        content is unchanged - a differently-exported bundled file (a new
+        zip with updated settings) always gets applied again.
 
-        Returns the warnings from ``apply_dict()`` if a file was found and
-        applied, or ``None`` if nothing was done.
+        Returns the warnings from ``apply_dict()`` if a (new) file was found
+        and applied, or ``None`` if nothing was done.
         """
-        if cls.bundled_config_already_applied():
-            return None
-
         base_dir = plugin_dir or Path(__file__).resolve().parent
         candidate = base_dir / BUNDLED_CONFIG_FILENAME
         try:
-            found = candidate.is_file()
+            raw = candidate.read_bytes()
         except Exception:
-            found = False
-        if not found:
-            return None
+            return None  # nothing bundled (yet)
 
-        if cls.autocomplete_enabled() or cls.layer_id():
-            # Something is already configured - never overwrite it silently.
-            cls._mark_bundled_config_applied()
-            return None
+        import hashlib
+
+        digest = hashlib.sha256(raw).hexdigest()
+        if digest == cls._bundled_config_hash():
+            return None  # this exact file was already applied
 
         try:
-            data = json.loads(candidate.read_text(encoding="utf-8"))
+            data = json.loads(raw.decode("utf-8"))
             warnings = cls.apply_dict(data, plugin_dir=base_dir)
         except Exception as exc:
             _log(f"Could not auto-import bundled settings ({candidate}): {exc}")
-            return None  # not marked done - a later, fixed file gets a retry
+            return None  # hash not recorded - a later, fixed file gets a retry
 
-        cls._mark_bundled_config_applied()
+        cls._set_bundled_config_hash(digest)
         return warnings
 
 

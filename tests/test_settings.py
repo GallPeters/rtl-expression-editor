@@ -516,15 +516,19 @@ class SettingsDialogLabelTooltipTests(unittest.TestCase):
 
 class BundledConfigAutoImportTests(unittest.TestCase):
     """Settings.apply_bundled_config_if_present() - the auto-import that
-    lets a colleague's zip carry a ready-made configuration, applied on the
-    plugin's first activation with no Import Settings click of their own."""
+    lets a colleague's zip carry a ready-made configuration, applied with no
+    Import Settings click of their own. Tracked by the bundled file's own
+    content, not a one-shot flag - reinstalling the plugin never clears
+    QgsSettings, so a boolean "already done" would permanently block a later
+    reinstall carrying a newly re-exported file, which is exactly the bug
+    this replaced."""
 
     def setUp(self):
         self._ac_enabled = Settings.autocomplete_enabled()
         self._layer_id = Settings.layer_id()
         self._fields = {key: Settings.field(key) for key in Settings.FIELD_KEYS}
-        self._already_applied = Settings.bundled_config_already_applied()
-        Settings._set("ac/bundled_config_applied", False)
+        self._hash = Settings._bundled_config_hash()
+        Settings._set_bundled_config_hash("")
         Settings.set_autocomplete_enabled(False)
         Settings.set_layer_id("")
 
@@ -533,16 +537,23 @@ class BundledConfigAutoImportTests(unittest.TestCase):
         Settings.set_layer_id(self._layer_id)
         for key, value in self._fields.items():
             Settings.set_field(key, value)
-        Settings._set("ac/bundled_config_applied", self._already_applied)
+        Settings._set_bundled_config_hash(self._hash)
 
-    def test_no_bundled_file_does_nothing_and_is_not_marked_done(self):
+    def test_no_bundled_file_does_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:
             result = Settings.apply_bundled_config_if_present(Path(tmp))
         self.assertIsNone(result)
-        self.assertFalse(Settings.bundled_config_already_applied())
+        self.assertEqual(Settings._bundled_config_hash(), "")
 
-    def test_a_bundled_file_is_applied_when_nothing_is_configured_yet(self):
+    def test_a_bundled_file_is_applied_even_when_something_is_already_configured(self):
+        """Regression: reinstalling the plugin never clears QgsSettings, so
+        by the time a colleague (or the same person, re-testing) reinstalls
+        with a bundled file, autocomplete is almost always already
+        "configured" from before - that must not block the import."""
         from _rtl_plugin import rtl_settings as settings_module
+
+        Settings.set_autocomplete_enabled(True)
+        Settings.set_layer_id("some-pre-existing-id")
 
         with tempfile.TemporaryDirectory() as tmp:
             plugin_dir = Path(tmp)
@@ -570,55 +581,60 @@ class BundledConfigAutoImportTests(unittest.TestCase):
 
             self.assertEqual(warnings, [])
             self.assertTrue(Settings.autocomplete_enabled())
-            self.assertTrue(Settings.bundled_config_already_applied())
+            self.assertNotEqual(Settings.layer_id(), "some-pre-existing-id")
             layer = Settings.autocomplete_layer()
             self.assertIsNotNone(layer)
             QgsProject.instance().removeMapLayer(layer.id())
 
-    def test_runs_at_most_once_even_if_the_file_is_still_there(self):
+    def test_the_same_unchanged_file_is_not_reapplied_on_a_later_call(self):
+        """Regression guard the other way: once a given bundled file's
+        content has been applied, running again with THE SAME bytes must be
+        a no-op - otherwise a later, unrelated Settings change would be
+        silently reverted on every subsequent QGIS startup."""
         from _rtl_plugin import rtl_settings as settings_module
 
         with tempfile.TemporaryDirectory() as tmp:
             plugin_dir = Path(tmp)
             (plugin_dir / settings_module.BUNDLED_CONFIG_FILENAME).write_text(
-                json.dumps({"rtl_expression_editor_settings": True}), encoding="utf-8"
-            )
-            first = Settings.apply_bundled_config_if_present(plugin_dir)
-            second = Settings.apply_bundled_config_if_present(plugin_dir)
-
-        self.assertIsNotNone(first)
-        self.assertIsNone(second)
-
-    def test_does_not_overwrite_an_already_configured_source(self):
-        from _rtl_plugin import rtl_settings as settings_module
-
-        Settings.set_autocomplete_enabled(True)
-        Settings.set_layer_id("some-existing-id")
-        with tempfile.TemporaryDirectory() as tmp:
-            plugin_dir = Path(tmp)
-            (plugin_dir / settings_module.BUNDLED_CONFIG_FILENAME).write_text(
-                json.dumps(
-                    {
-                        "rtl_expression_editor_settings": True,
-                        "autocomplete_enabled": True,
-                        "autocomplete_layer": {
-                            "name": "other",
-                            "provider": "ogr",
-                            "path_relative_to_plugin": None,
-                            "path_absolute": None,
-                            "uri_suffix": "",
-                        },
-                    }
-                ),
+                json.dumps({"rtl_expression_editor_settings": True, "max_suggested_values": 7}),
                 encoding="utf-8",
             )
-            result = Settings.apply_bundled_config_if_present(plugin_dir)
+            first = Settings.apply_bundled_config_if_present(plugin_dir)
+            self.assertIsNotNone(first)
 
-        self.assertIsNone(result)
-        self.assertEqual(Settings.layer_id(), "some-existing-id")  # left untouched
-        self.assertTrue(Settings.bundled_config_already_applied())
+            Settings.set_max_suggested_values(99)  # a later, unrelated manual change
+            second = Settings.apply_bundled_config_if_present(plugin_dir)
 
-    def test_a_malformed_bundled_file_is_not_marked_done(self):
+        self.assertIsNone(second)
+        self.assertEqual(Settings.max_suggested_values(), 99)  # left untouched
+
+    def test_a_changed_bundled_file_is_applied_again(self):
+        """A new export (different content, same filename) - e.g. a second
+        reinstall with an updated bundled config - must be picked up, not
+        blocked by the previous file having already been applied."""
+        from _rtl_plugin import rtl_settings as settings_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin_dir = Path(tmp)
+            config_path = plugin_dir / settings_module.BUNDLED_CONFIG_FILENAME
+            config_path.write_text(
+                json.dumps({"rtl_expression_editor_settings": True, "max_suggested_values": 7}),
+                encoding="utf-8",
+            )
+            first = Settings.apply_bundled_config_if_present(plugin_dir)
+            self.assertIsNotNone(first)
+            self.assertEqual(Settings.max_suggested_values(), 7)
+
+            config_path.write_text(
+                json.dumps({"rtl_expression_editor_settings": True, "max_suggested_values": 42}),
+                encoding="utf-8",
+            )
+            second = Settings.apply_bundled_config_if_present(plugin_dir)
+
+        self.assertIsNotNone(second)
+        self.assertEqual(Settings.max_suggested_values(), 42)
+
+    def test_a_malformed_bundled_file_is_not_recorded_as_applied(self):
         from _rtl_plugin import rtl_settings as settings_module
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -629,7 +645,7 @@ class BundledConfigAutoImportTests(unittest.TestCase):
             result = Settings.apply_bundled_config_if_present(plugin_dir)
 
         self.assertIsNone(result)
-        self.assertFalse(Settings.bundled_config_already_applied())
+        self.assertEqual(Settings._bundled_config_hash(), "")
 
 
 if __name__ == "__main__":

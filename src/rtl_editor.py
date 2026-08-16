@@ -2183,11 +2183,11 @@ class RtlBidiEditorPlugin:
 
     def _apply_bundled_config(self) -> None:
         """Auto-import a settings file bundled next to the plugin's own
-        modules, if one is there and nothing is configured yet - see
-        Settings.apply_bundled_config_if_present() for the full explanation
-        and the safeguards around it. A no-op on every ordinary install,
-        which has no such file; failures here must never break plugin
-        startup, so they are only ever logged.
+        modules, if one is there and its content has not already been
+        applied to this profile - see
+        Settings.apply_bundled_config_if_present() for the full explanation.
+        A no-op on every ordinary install, which has no such file; failures
+        here must never break plugin startup, so they are only ever logged.
         """
         if Settings is None:
             return
