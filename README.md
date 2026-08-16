@@ -89,15 +89,27 @@ colleagues without asking them to configure anything themselves:
 1. Configure the plugin normally, pointing the lookup layer at a data file
    copied *inside* the plugin's own install folder (e.g.
    `<plugin folder>/data/lookup.gpkg`).
-2. Click **Export Settings**. When the lookup layer's file lives inside the
-   plugin folder, the exported file records its path *relative* to that
-   folder, not the absolute path on your own machine.
+2. Click **Export Settings**, saving it with its suggested default name and
+   location - directly inside the plugin folder, alongside `rtl_editor.py`.
+   When the lookup layer's file lives inside that same folder, the exported
+   file also records its path *relative* to it, not the absolute path on
+   your own machine.
 3. Zip up the plugin folder as usual, with the data file and the exported
    JSON file both included inside it.
-4. A colleague installs the zip and, in their own Settings dialog, clicks
-   **Import Settings** and picks the JSON file - the bundled data file is
-   located and loaded automatically from its recorded relative path,
-   wherever their profile happens to install the plugin.
+4. A colleague installs the zip - that's it. The next time the plugin
+   activates, it notices the bundled settings file sitting next to its own
+   modules and imports it automatically, locating and loading the bundled
+   data file from its recorded relative path, wherever their profile
+   happens to install the plugin. No Import Settings click needed, nothing
+   to configure by hand.
+
+This automatic import only ever runs once, and only when nothing is already
+configured - it will not overwrite a colleague's own later changes, and
+re-running it (e.g. after updating the plugin) is safe.
+
+Prefer to do it manually instead? The Settings dialog's **Export Settings** /
+**Import Settings** buttons work the same way at any time, for one-off
+sharing or for updating an already-configured installation.
 
 A lookup layer that lives outside the plugin folder (a database connection,
 or a file elsewhere on disk) is still exported for convenience, but only as

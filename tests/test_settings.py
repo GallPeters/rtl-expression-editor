@@ -471,5 +471,166 @@ class SettingsExportImportTests(unittest.TestCase):
                 shutil.rmtree(other_install, ignore_errors=True)
 
 
+def _row_label_for(dialog, widget):
+    """The QFormLayout row label associated with ``widget``, wherever in the
+    dialog its form actually lives - avoids assuming which QFormLayout
+    instance (there is more than one) owns which widget."""
+    from qgis.PyQt.QtWidgets import QFormLayout
+
+    for form in dialog.findChildren(QFormLayout):
+        label = form.labelForField(widget)
+        if label is not None:
+            return label
+    return None
+
+
+class SettingsDialogLabelTooltipTests(unittest.TestCase):
+    """A parameter's tooltip must show when hovering its NAME (the
+    QFormLayout row label), not only its input control - see
+    SettingsDialog._mirror_label_tooltip()."""
+
+    def test_row_labels_carry_the_same_tooltip_as_their_widget(self):
+        from qgis.PyQt.QtCore import Qt
+
+        from _rtl_plugin.rtl_settings import SettingsDialog
+
+        dialog = SettingsDialog()
+        try:
+            widgets = [
+                dialog.cmb_layer,
+                dialog.cmb_mode,
+                dialog.spin_max_values,
+                *dialog.field_combos.values(),
+            ]
+            for widget in widgets:
+                label = _row_label_for(dialog, widget)
+                self.assertIsNotNone(label, f"no row label found for {widget.toolTip()[:30]!r}")
+                self.assertTrue(label.toolTip())
+                self.assertEqual(label.toolTip(), widget.toolTip())
+                # Most of these widgets start disabled (custom autocomplete
+                # is off by default) - the label must still show its tooltip.
+                self.assertTrue(label.testAttribute(Qt.WidgetAttribute.WA_AlwaysShowToolTips))
+        finally:
+            dialog.deleteLater()
+
+
+class BundledConfigAutoImportTests(unittest.TestCase):
+    """Settings.apply_bundled_config_if_present() - the auto-import that
+    lets a colleague's zip carry a ready-made configuration, applied on the
+    plugin's first activation with no Import Settings click of their own."""
+
+    def setUp(self):
+        self._ac_enabled = Settings.autocomplete_enabled()
+        self._layer_id = Settings.layer_id()
+        self._fields = {key: Settings.field(key) for key in Settings.FIELD_KEYS}
+        self._already_applied = Settings.bundled_config_already_applied()
+        Settings._set("ac/bundled_config_applied", False)
+        Settings.set_autocomplete_enabled(False)
+        Settings.set_layer_id("")
+
+    def tearDown(self):
+        Settings.set_autocomplete_enabled(self._ac_enabled)
+        Settings.set_layer_id(self._layer_id)
+        for key, value in self._fields.items():
+            Settings.set_field(key, value)
+        Settings._set("ac/bundled_config_applied", self._already_applied)
+
+    def test_no_bundled_file_does_nothing_and_is_not_marked_done(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = Settings.apply_bundled_config_if_present(Path(tmp))
+        self.assertIsNone(result)
+        self.assertFalse(Settings.bundled_config_already_applied())
+
+    def test_a_bundled_file_is_applied_when_nothing_is_configured_yet(self):
+        from _rtl_plugin import rtl_settings as settings_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin_dir = Path(tmp)
+            data_dir = plugin_dir / "data"
+            data_dir.mkdir()
+            (data_dir / "lookup.geojson").write_text(_GEOJSON_SAMPLE, encoding="utf-8")
+
+            config = {
+                "rtl_expression_editor_settings": True,
+                "autocomplete_enabled": True,
+                "autocomplete_fields": {"field_names": "field_name", "value": "value"},
+                "autocomplete_layer": {
+                    "name": "lookup",
+                    "provider": "ogr",
+                    "path_relative_to_plugin": "data/lookup.geojson",
+                    "path_absolute": None,
+                    "uri_suffix": "",
+                },
+            }
+            (plugin_dir / settings_module.BUNDLED_CONFIG_FILENAME).write_text(
+                json.dumps(config), encoding="utf-8"
+            )
+
+            warnings = Settings.apply_bundled_config_if_present(plugin_dir)
+
+            self.assertEqual(warnings, [])
+            self.assertTrue(Settings.autocomplete_enabled())
+            self.assertTrue(Settings.bundled_config_already_applied())
+            layer = Settings.autocomplete_layer()
+            self.assertIsNotNone(layer)
+            QgsProject.instance().removeMapLayer(layer.id())
+
+    def test_runs_at_most_once_even_if_the_file_is_still_there(self):
+        from _rtl_plugin import rtl_settings as settings_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin_dir = Path(tmp)
+            (plugin_dir / settings_module.BUNDLED_CONFIG_FILENAME).write_text(
+                json.dumps({"rtl_expression_editor_settings": True}), encoding="utf-8"
+            )
+            first = Settings.apply_bundled_config_if_present(plugin_dir)
+            second = Settings.apply_bundled_config_if_present(plugin_dir)
+
+        self.assertIsNotNone(first)
+        self.assertIsNone(second)
+
+    def test_does_not_overwrite_an_already_configured_source(self):
+        from _rtl_plugin import rtl_settings as settings_module
+
+        Settings.set_autocomplete_enabled(True)
+        Settings.set_layer_id("some-existing-id")
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin_dir = Path(tmp)
+            (plugin_dir / settings_module.BUNDLED_CONFIG_FILENAME).write_text(
+                json.dumps(
+                    {
+                        "rtl_expression_editor_settings": True,
+                        "autocomplete_enabled": True,
+                        "autocomplete_layer": {
+                            "name": "other",
+                            "provider": "ogr",
+                            "path_relative_to_plugin": None,
+                            "path_absolute": None,
+                            "uri_suffix": "",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = Settings.apply_bundled_config_if_present(plugin_dir)
+
+        self.assertIsNone(result)
+        self.assertEqual(Settings.layer_id(), "some-existing-id")  # left untouched
+        self.assertTrue(Settings.bundled_config_already_applied())
+
+    def test_a_malformed_bundled_file_is_not_marked_done(self):
+        from _rtl_plugin import rtl_settings as settings_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin_dir = Path(tmp)
+            (plugin_dir / settings_module.BUNDLED_CONFIG_FILENAME).write_text(
+                "{not valid json", encoding="utf-8"
+            )
+            result = Settings.apply_bundled_config_if_present(plugin_dir)
+
+        self.assertIsNone(result)
+        self.assertFalse(Settings.bundled_config_already_applied())
+
+
 if __name__ == "__main__":
     unittest.main()

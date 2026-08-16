@@ -74,6 +74,15 @@ CONFIG_MARKER = "rtl_expression_editor_settings"
 #: forward-compatible) plugin version still applies whatever it recognises.
 CONFIG_FORMAT_VERSION = 1
 
+#: Filename Export Settings suggests by default, and the one Import Settings
+#: auto-loads on the plugin's first activation if found sitting next to it -
+#: see Settings.apply_bundled_config_if_present(). Using the same name for
+#: both halves is what makes "export, then drop the file in the plugin
+#: folder before zipping it up" work with no extra step: a colleague who
+#: installs that zip gets it applied automatically, without ever opening the
+#: Settings dialog themselves.
+BUNDLED_CONFIG_FILENAME = "rtl_expression_editor_settings.json"
+
 
 class SettingsImportError(Exception):
     """The file as a whole could not be applied - wrong format, or not
@@ -436,6 +445,74 @@ class Settings:
         BUS.changed.emit()
         return warnings
 
+    # -- bundled config, applied automatically on first activation --------- #
+
+    @classmethod
+    def bundled_config_already_applied(cls) -> bool:
+        """Whether ``apply_bundled_config_if_present()`` has already acted -
+        successfully applied a bundled file, or found something already
+        configured that it correctly left alone. Persisted across QGIS
+        sessions, so it runs at most once per profile rather than on every
+        startup."""
+        return cls._get_bool("ac/bundled_config_applied", False)
+
+    @classmethod
+    def _mark_bundled_config_applied(cls) -> None:
+        cls._set("ac/bundled_config_applied", True)
+
+    @classmethod
+    def apply_bundled_config_if_present(cls, plugin_dir: Optional[Path] = None) -> Optional[List[str]]:
+        """Auto-import a settings file bundled next to the plugin's own
+        modules, if one is there - the distribute-a-preconfigured-plugin
+        workflow finished: export, drop the file (named
+        ``BUNDLED_CONFIG_FILENAME``) and the data file it points to inside
+        the plugin folder, zip it up: a colleague who installs that zip gets
+        it applied with no Import Settings click of their own.
+
+        Deliberately conservative, in three ways:
+
+        * Runs at most once ever per QGIS profile (see
+          ``bundled_config_already_applied()``) - a later, deliberate change
+          to the settings is never silently overwritten by this running
+          again on a subsequent startup.
+        * Never overwrites an already-configured autocomplete source -
+          if one is already set (a manual setup, or an earlier successful
+          auto-import), this is marked done and skipped rather than
+          clobbering it.
+        * A missing file is not an error and is not marked done: it is
+          simply "nothing to do yet", so a bundled file added by a later
+          plugin update still gets picked up on its first activation.
+
+        Returns the warnings from ``apply_dict()`` if a file was found and
+        applied, or ``None`` if nothing was done.
+        """
+        if cls.bundled_config_already_applied():
+            return None
+
+        base_dir = plugin_dir or Path(__file__).resolve().parent
+        candidate = base_dir / BUNDLED_CONFIG_FILENAME
+        try:
+            found = candidate.is_file()
+        except Exception:
+            found = False
+        if not found:
+            return None
+
+        if cls.autocomplete_enabled() or cls.layer_id():
+            # Something is already configured - never overwrite it silently.
+            cls._mark_bundled_config_applied()
+            return None
+
+        try:
+            data = json.loads(candidate.read_text(encoding="utf-8"))
+            warnings = cls.apply_dict(data, plugin_dir=base_dir)
+        except Exception as exc:
+            _log(f"Could not auto-import bundled settings ({candidate}): {exc}")
+            return None  # not marked done - a later, fixed file gets a retry
+
+        cls._mark_bundled_config_applied()
+        return warnings
+
 
 def _describe_layer_source(layer) -> dict:
     """Capture a layer's source portably, for ``Settings.export_dict()``.
@@ -631,6 +708,7 @@ class SettingsDialog(QDialog):
             "show this many of the field's own distinct, non-null values."
         )
         values_row.addRow("Suggested values without a lookup table", self.spin_max_values)
+        self._mirror_label_tooltip(values_row, self.spin_max_values)
         general_layout.addLayout(values_row)
 
         content_layout.addWidget(general)
@@ -774,13 +852,17 @@ class SettingsDialog(QDialog):
         # and everything in self.config is disabled whenever the custom
         # autocomplete checkbox above is unchecked, which is the default. Set
         # WA_AlwaysShowToolTips explicitly, so the tooltips explaining each
-        # field are visible even before the feature is turned on.
+        # field are visible even before the feature is turned on - on both
+        # the input widget itself and its row label (see
+        # _mirror_label_tooltip), since hovering the parameter's NAME is
+        # exactly as natural as hovering the control beside it.
         tooltip_widgets = [self.cmb_mode, self.chk_ac]
         if self.cmb_layer is not None:
             tooltip_widgets.append(self.cmb_layer)
             tooltip_widgets.extend(self.field_combos.values())
         for widget in tooltip_widgets:
             widget.setAttribute(Qt.WidgetAttribute.WA_AlwaysShowToolTips, True)
+            self._mirror_label_tooltip(form, widget)
 
         ac_layout.addWidget(self.config)
 
@@ -1124,6 +1206,25 @@ class SettingsDialog(QDialog):
             combo.setFilters(QgsMapLayerProxyModel.Filter.VectorLayer)
         except Exception:
             pass  # unfiltered is acceptable
+
+    @staticmethod
+    def _mirror_label_tooltip(form: QFormLayout, widget) -> None:
+        """Copy ``widget``'s tooltip onto its QFormLayout row label too.
+
+        ``form.addRow("Some label", widget)`` creates the row label as a
+        separate QLabel that ``setToolTip()`` on the input widget never
+        reaches - a tooltip set only on the combo/spinbox shows when hovering
+        the control itself, but not over the parameter NAME beside it, which
+        is where a user new to a setting looks first. Mirroring the same text
+        onto that label (and, since it is also disabled whenever its field
+        is, allowing it to show a tooltip while disabled too) is what makes
+        hovering the label actually work.
+        """
+        label = form.labelForField(widget)
+        if label is None:
+            return
+        label.setToolTip(widget.toolTip())
+        label.setAttribute(Qt.WidgetAttribute.WA_AlwaysShowToolTips, True)
 
     def _on_layer_changed(self, layer) -> None:
         """Repopulate every field selector from the newly chosen layer."""

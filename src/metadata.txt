@@ -32,8 +32,12 @@ server=False
   - Added: the suggestion list now shows a title - the dataset/layer name when naming a field, the field name when picking its value.
   - Added: Export Settings / Import Settings in the Settings dialog, saving and loading the whole configuration as a JSON file.
   - Added: an imported configuration can locate its autocomplete lookup layer automatically when bundled inside the plugin folder, even after a reinstall to a different location.
+  - Added: a settings file bundled next to the plugin's own files is now imported automatically the first time the plugin activates, so a preconfigured plugin needs no setup at all after installing.
   - Improved: detailed tooltips throughout the Settings dialog, with concrete examples, for anyone configuring custom autocomplete for the first time.
   - Improved: the new title above the suggestion list is shown larger than a group heading, for a clear visual hierarchy.
+  - Improved: the Settings window can now be resized freely, with its contents scrolling instead of forcing a very tall window.
+  - Fixed: tooltips on settings parameters now also appear when hovering their name, not only their input control, including while disabled.
+  - Fixed: importing settings that successfully restored the autocomplete layer no longer left a stale "layer is no longer in this project" warning on screen.
 
 ** v1.4 (12.08.2026):
   - Added: Ctrl+Space now also suggests fields, functions and variables, with signatures and help.

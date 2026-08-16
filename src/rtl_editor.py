@@ -2172,6 +2172,7 @@ class RtlBidiEditorPlugin:
             self._watcher.install()
             if SETTINGS_BUS is not None:
                 SETTINGS_BUS.changed.connect(self.apply_settings)
+            self._apply_bundled_config()
             _log("RTL Expression Editor active.", Qgis.MessageLevel.Success)
             _dbg(
                 f"watching editor classes {sorted(TARGET_EDITOR_CLASSES)}; "
@@ -2179,6 +2180,30 @@ class RtlBidiEditorPlugin:
             )
         except Exception as exc:
             _log(f"Startup failed: {exc}", Qgis.MessageLevel.Critical)
+
+    def _apply_bundled_config(self) -> None:
+        """Auto-import a settings file bundled next to the plugin's own
+        modules, if one is there and nothing is configured yet - see
+        Settings.apply_bundled_config_if_present() for the full explanation
+        and the safeguards around it. A no-op on every ordinary install,
+        which has no such file; failures here must never break plugin
+        startup, so they are only ever logged.
+        """
+        if Settings is None:
+            return
+        try:
+            warnings = Settings.apply_bundled_config_if_present()
+        except Exception as exc:
+            _log(f"Could not auto-import bundled settings: {exc}", Qgis.MessageLevel.Warning)
+            return
+        if warnings is None:
+            return
+        _log(
+            "RTL Expression Editor: bundled settings imported automatically.",
+            Qgis.MessageLevel.Success,
+        )
+        for warning in warnings:
+            _log(f"Bundled settings: {warning}", Qgis.MessageLevel.Warning)
 
     def unload(self) -> None:
         global _WATCHER
