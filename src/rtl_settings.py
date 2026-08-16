@@ -22,8 +22,9 @@ Two pieces live here:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from qgis.PyQt.QtCore import QObject, Qt, pyqtSignal
 from qgis.PyQt.QtGui import QFont
@@ -33,8 +34,10 @@ from qgis.PyQt.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFormLayout,
     QGroupBox,
+    QHBoxLayout,
     QLabel,
     QMessageBox,
     QPlainTextEdit,
@@ -57,6 +60,29 @@ except ImportError:  # pragma: no cover
 
 #: All keys live under this prefix inside QgsSettings.
 SETTINGS_PREFIX = "plugins/rtl_bidi_editor/"
+
+#: Top-level marker key in an exported settings file, so a JSON file that
+#: happens to parse but is not actually one of ours is rejected with a clear
+#: message instead of being silently misapplied - see Settings.apply_dict().
+CONFIG_MARKER = "rtl_expression_editor_settings"
+
+#: Bumped only if the exported shape changes in a way older code could not
+#: read correctly. apply_dict() does not reject a different version outright
+#: - every field is read with a default, so a file from an older (or newer,
+#: forward-compatible) plugin version still applies whatever it recognises.
+CONFIG_FORMAT_VERSION = 1
+
+
+class SettingsImportError(Exception):
+    """The file as a whole could not be applied - wrong format, or not
+    parseable at all.
+
+    Reserved for problems that make the *entire* file untrustworthy. A
+    configured lookup layer that cannot actually be found is deliberately
+    NOT one of these: it is reported as a soft warning instead (see
+    Settings.apply_dict()), so the rest of a mostly-good file still gets
+    applied rather than being thrown away over one missing layer.
+    """
 
 
 def _log(message: str) -> None:
@@ -321,6 +347,237 @@ class Settings:
                 return False, f"field '{name}' no longer exists in the layer"
         return True, ""
 
+    # -- export / import ---------------------------------------------------- #
+
+    @classmethod
+    def export_dict(cls) -> dict:
+        """Everything needed to reproduce this configuration elsewhere.
+
+        The autocomplete lookup layer is described by its *source*, never by
+        its QGIS layer id: an id is only meaningful inside the project it was
+        assigned in, so it could never be resolved in a colleague's project.
+        When the source file lives inside this plugin's own install
+        directory (or a subfolder of it), its path is additionally recorded
+        relative to that directory - see ``_describe_layer_source()`` - so
+        the same exported file keeps working after the plugin is reinstalled
+        somewhere else entirely, as long as the data file travels with it.
+        """
+        data = {
+            CONFIG_MARKER: True,
+            "format_version": CONFIG_FORMAT_VERSION,
+            "plugin_enabled": cls.plugin_enabled(),
+            "max_suggested_values": cls.max_suggested_values(),
+            "default_read_mode": cls.default_read_mode(),
+            "autocomplete_enabled": cls.autocomplete_enabled(),
+            "autocomplete_fields": {key: cls.field(key) for key in cls.FIELD_KEYS},
+            "autocomplete_layer": None,
+        }
+        layer = cls.autocomplete_layer()
+        if layer is not None:
+            data["autocomplete_layer"] = _describe_layer_source(layer)
+        return data
+
+    @classmethod
+    def apply_dict(cls, data: dict, plugin_dir: Optional[Path] = None) -> List[str]:
+        """Validate then apply an exported configuration. Returns warnings.
+
+        Raises ``SettingsImportError`` for a file that cannot be trusted as a
+        whole (wrong format, not even a dict). Nothing is written until every
+        value has been read out of ``data`` successfully, so a file that
+        fails validation never leaves a half-applied configuration behind.
+
+        A lookup layer that cannot be found or loaded is a *soft* failure:
+        every other setting is still applied, and the layer is left cleanly
+        unconfigured (never pointing at a stale, nonexistent id) with the
+        problem reported back through the returned list of warnings.
+        """
+        if not isinstance(data, dict) or not data.get(CONFIG_MARKER):
+            raise SettingsImportError(
+                "This file is not an RTL Expression Editor settings export."
+            )
+
+        warnings: List[str] = []
+
+        plugin_enabled = bool(data.get("plugin_enabled", True))
+        default_read_mode = bool(data.get("default_read_mode", False))
+        ac_enabled = bool(data.get("autocomplete_enabled", False))
+
+        try:
+            max_values = int(data.get("max_suggested_values", 10))
+        except (TypeError, ValueError):
+            max_values = 10
+            warnings.append("'max_suggested_values' was invalid; kept at 10.")
+
+        fields = data.get("autocomplete_fields")
+        if not isinstance(fields, dict):
+            fields = {}
+            if data.get("autocomplete_fields") is not None:
+                warnings.append("'autocomplete_fields' was malformed; ignored.")
+
+        layer_id = ""
+        layer_info = data.get("autocomplete_layer")
+        if ac_enabled and layer_info:
+            layer_id, layer_warning = _resolve_layer_from_description(layer_info, plugin_dir)
+            if layer_warning:
+                warnings.append(layer_warning)
+
+        # Only now, with the whole file read without raising, is anything
+        # actually written.
+        cls.set_plugin_enabled(plugin_enabled)
+        cls.set_max_suggested_values(max_values)
+        cls.set_default_read_mode(default_read_mode)
+        cls.set_autocomplete_enabled(ac_enabled)
+        for key in cls.FIELD_KEYS:
+            cls.set_field(key, str(fields.get(key, "") or ""))
+        cls.set_layer_id(layer_id)
+
+        BUS.changed.emit()
+        return warnings
+
+
+def _describe_layer_source(layer) -> dict:
+    """Capture a layer's source portably, for ``Settings.export_dict()``.
+
+    File-based sources (Shapefile, GeoPackage, CSV, ...) get their path
+    recorded twice: as an absolute path (works if the importing machine
+    happens to have the same layout), and - when the file lives inside this
+    plugin's own directory - relative to that directory, which is what makes
+    "bundle the data file inside the plugin zip" actually work regardless of
+    where the plugin ends up installed. A database connection or an in-memory
+    layer has no such file to point at; only the raw values are recorded, on
+    a best-effort basis, since there is nothing portable to make relative.
+    """
+    info: Dict[str, Optional[str]] = {
+        "name": "",
+        "provider": "",
+        "path_relative_to_plugin": None,
+        "path_absolute": None,
+        "uri_suffix": "",
+    }
+    try:
+        info["name"] = layer.name()
+    except Exception:
+        pass
+    try:
+        info["provider"] = layer.providerType()
+    except Exception:
+        pass
+    try:
+        source = layer.source() or ""
+    except Exception:
+        source = ""
+
+    # A GDAL/OGR source may carry extra "|layername=..." style clauses after
+    # the file path itself - kept as-is and reattached on import, so e.g. a
+    # specific layer inside a multi-layer GeoPackage is preserved.
+    path_part, sep, suffix = source.partition("|")
+    info["uri_suffix"] = (sep + suffix) if sep else ""
+    path_part = path_part.strip()
+
+    # A real filesystem path never contains these - a memory layer's source
+    # is a query string ("Point?crs=...&field=...") and a database URI is
+    # "key=value ..." pairs, neither of which is anything to make relative.
+    looks_like_path = bool(path_part) and not any(ch in path_part for ch in "?=&")
+    if not looks_like_path:
+        info["path_absolute"] = source or None
+        return info
+
+    try:
+        path = Path(path_part).resolve()
+    except Exception:
+        info["path_absolute"] = path_part
+        return info
+
+    info["path_absolute"] = str(path)
+    try:
+        plugin_dir = Path(__file__).resolve().parent
+        info["path_relative_to_plugin"] = path.relative_to(plugin_dir).as_posix()
+    except ValueError:
+        pass  # outside the plugin directory - only the absolute path applies
+    return info
+
+
+def _resolve_layer_from_description(info, plugin_dir: Optional[Path] = None) -> Tuple[str, str]:
+    """Return ``(layer_id, warning)`` for an exported layer description.
+
+    ``layer_id`` is ``""`` whenever nothing could be resolved - never a
+    dangling id pointing at a layer that does not exist, which is what keeps
+    a failed import from leaving the plugin's autocomplete pointed at
+    nothing in a way that looks configured but silently is not.
+
+    Resolution order: reuse an already-loaded layer with a matching source
+    first (so importing the same file twice, or onto a project that already
+    has the layer, never adds a duplicate); otherwise load it fresh, trying
+    the plugin-relative path before the absolute one, since a plugin-relative
+    path is the one still valid after the plugin is reinstalled somewhere
+    else - the absolute path mainly helps re-importing on the same machine.
+    """
+    if not isinstance(info, dict):
+        return "", "The autocomplete layer description was malformed; not configured."
+
+    name = str(info.get("name") or "lookup table")
+    provider = str(info.get("provider") or "ogr")
+    relative = info.get("path_relative_to_plugin")
+    absolute = info.get("path_absolute")
+    suffix = str(info.get("uri_suffix") or "")
+
+    base_dir = plugin_dir or Path(__file__).resolve().parent
+    candidates: List[Path] = []
+    if relative:
+        try:
+            candidates.append((base_dir / relative).resolve())
+        except Exception:
+            pass
+    if absolute:
+        try:
+            candidates.append(Path(absolute).resolve())
+        except Exception:
+            pass
+
+    if not candidates:
+        return (
+            "",
+            f"Autocomplete layer '{name}' has no usable path recorded (it was likely a "
+            "database or in-memory layer, which cannot be bundled); please configure it "
+            "manually.",
+        )
+
+    project = QgsProject.instance()
+
+    # 1. An already-loaded layer with the same source file wins outright.
+    for path in candidates:
+        for existing in project.mapLayers().values():
+            try:
+                existing_source = (existing.source() or "").partition("|")[0].strip()
+                if existing_source and Path(existing_source).resolve() == path:
+                    return existing.id(), ""
+            except Exception:
+                continue
+
+    # 2. Load fresh from whichever candidate actually exists on disk.
+    for path in candidates:
+        try:
+            if not path.exists():
+                continue
+        except Exception:
+            continue
+        try:
+            from qgis.core import QgsVectorLayer
+
+            layer = QgsVectorLayer(str(path) + suffix, name, provider)
+            if layer.isValid():
+                project.addMapLayer(layer)
+                return layer.id(), ""
+        except Exception:
+            continue
+
+    tried = ", ".join(str(p) for p in candidates)
+    return (
+        "",
+        f"Autocomplete layer '{name}' could not be found (tried: {tried}). "
+        "Autocomplete is left unconfigured until it is reselected in Settings.",
+    )
+
 
 class SettingsDialog(QDialog):
     """Plugins -> RTL Text Editor -> Settings.
@@ -367,7 +624,12 @@ class SettingsDialog(QDialog):
         self.chk_ac = QCheckBox("Enable custom autocomplete source", ac_group)
         self.chk_ac.setToolTip(
             "Look up allowed values from a project layer and offer them with "
-            "Ctrl+Space while editing an expression or filter."
+            "Ctrl+Space (and automatically while typing) in an expression or "
+            "filter.\n\n"
+            "This is entirely optional: fields, functions, variables and "
+            "operators are always suggested regardless of this setting. "
+            "Turning it on only adds a lookup table's own values and "
+            "descriptions on top of that."
         )
         ac_layout.addWidget(self.chk_ac)
 
@@ -388,6 +650,20 @@ class SettingsDialog(QDialog):
             self.cmb_layer = QgsMapLayerComboBox(self.config)
             self._apply_vector_filter(self.cmb_layer)
             self.cmb_layer.setAllowEmptyLayer(True)
+            self.cmb_layer.setToolTip(
+                "The project layer or table that defines what Ctrl+Space "
+                "suggests. Each row describes one (field, value) pair - e.g. "
+                "a row with 'STATUS' / '1' / 'Active' makes the editor offer "
+                "1 (Active) when completing the STATUS field.\n\n"
+                "This is a normal vector layer, added to the project like any "
+                "other (e.g. a CSV or GeoPackage table with no geometry). "
+                "Leave it empty to suggest only the fields and values already "
+                "present in the layer being edited, with no lookup table at "
+                "all.\n\n"
+                "Use 'Export Settings' below to save this configuration - "
+                "including a portable reference to this layer's file - so it "
+                "can be shared with colleagues."
+            )
             heading = QLabel("<b>Required</b>", self.config)
             form.addRow(heading)
             form.addRow("Lookup layer", self.cmb_layer)
@@ -418,25 +694,51 @@ class SettingsDialog(QDialog):
                 form.addRow(label, combo)
 
             self.field_combos["field_names"].setToolTip(
-                "Column listing the field names you want suggestions for, "
-                "e.g. NAME, COUNTRY, STATUS."
+                "The column that names WHICH field each row's value belongs "
+                "to, e.g. a row containing 'STATUS' here matches completions "
+                "for the STATUS field.\n\n"
+                "One row per (field, value) pair, so the same field name "
+                "repeats across as many rows as it has values - e.g. three "
+                "rows all naming 'STATUS' for its three possible values."
             )
             self.field_combos["value"].setToolTip(
-                "Column holding the values inserted into the expression."
+                "The column holding the value inserted into the expression "
+                "when a suggestion is picked, e.g. 1, 2, 'IL', 'US'.\n\n"
+                "Inserted exactly as stored - if the field needs a quoted "
+                "text literal, store it already quoted here, e.g. 'IL' "
+                "rather than IL, so the expression stays valid."
             )
             self.field_combos["table"].setToolTip(
-                "Column holding the source table name. Leave empty to offer "
-                "values regardless of which layer is being edited."
+                "The column naming WHICH layer/table each row applies to, so "
+                "the same field name (e.g. STATUS) can mean something "
+                "different in two different layers.\n\n"
+                "Compare against the layer's actual data source name (e.g. "
+                "'countries' for a GeoPackage layer named 'countries'), not "
+                "necessarily its display name in the Layers panel - use the "
+                "'RTL autocomplete - diagnostic' report (Ctrl+Shift+D while "
+                "editing) if unsure what a layer's source name is.\n\n"
+                "Leave empty to offer these values regardless of which layer "
+                "is being edited."
             )
             self.field_combos["group_code"].setToolTip(
-                "Column used to group the suggestions."
+                "The column used to group suggestions under a heading, e.g. "
+                "all STATUS values sharing group_code 'G1' are shown "
+                "together under one heading.\n\n"
+                "Used together with 'Group descriptions column' below - with "
+                "only one of the two set, suggestions are shown ungrouped."
             )
             self.field_combos["group_description"].setToolTip(
-                "Column shown beside each group heading."
+                "The column shown beside each group heading, e.g. group_code "
+                "'G1' with group_description 'Life cycle' shows the heading "
+                "'G1 (Life cycle)' above every row sharing that code."
             )
             self.field_combos["description"].setToolTip(
-                "Shown beside each value, e.g. 'IL (Israel)'. Only the value is "
-                "ever inserted into the expression."
+                "The column shown beside each value in the suggestion list, "
+                "e.g. value '1' with description 'Active' is offered as "
+                "'1 (Active)'.\n\n"
+                "Only the value itself - never the description - is ever "
+                "inserted into the expression. Leave empty to show plain "
+                "values with no description."
             )
 
             self.cmb_layer.layerChanged.connect(self._on_layer_changed)
@@ -459,6 +761,46 @@ class SettingsDialog(QDialog):
         ac_layout.addWidget(self.lbl_warning)
 
         root.addWidget(ac_group)
+
+        # -- Import / Export ------------------------------------------------ #
+        io_group = QGroupBox("Import / Export Settings", self)
+        io_layout = QVBoxLayout(io_group)
+        io_label = QLabel(
+            "Save this configuration to a file, or load one prepared by "
+            "someone else - useful for distributing a ready-made "
+            "autocomplete source to colleagues.",
+            io_group,
+        )
+        io_label.setWordWrap(True)
+        io_layout.addWidget(io_label)
+        io_buttons_row = QHBoxLayout()
+        self.btn_export = QPushButton("Export Settings...", io_group)
+        self.btn_export.setToolTip(
+            "Save every setting on this dialog - including the autocomplete "
+            "lookup layer and its column mapping - to a JSON file.\n\n"
+            "If the lookup layer's file lives inside this plugin's own "
+            "install folder, the file it is saved to also records a path "
+            "relative to that folder. Distribute the exported file together "
+            "with that data file (e.g. both copied into the plugin's folder "
+            "before zipping it up) and 'Import Settings' will locate it "
+            "automatically on another machine, wherever the plugin ends up "
+            "installed."
+        )
+        self.btn_export.clicked.connect(self._export_settings)
+        self.btn_import = QPushButton("Import Settings...", io_group)
+        self.btn_import.setToolTip(
+            "Load a configuration previously saved with 'Export Settings'.\n\n"
+            "If its autocomplete lookup layer was bundled next to the "
+            "plugin, it is located and loaded automatically - no need to "
+            "pick it again. If it cannot be found, every other setting is "
+            "still applied and you are told exactly what to reconfigure by "
+            "hand."
+        )
+        self.btn_import.clicked.connect(self._import_settings)
+        io_buttons_row.addWidget(self.btn_export)
+        io_buttons_row.addWidget(self.btn_import)
+        io_layout.addLayout(io_buttons_row)
+        root.addWidget(io_group)
 
         # -- Developer -------------------------------------------------------
         # Only shown at all when a development checkout's tests/ folder is
@@ -489,6 +831,119 @@ class SettingsDialog(QDialog):
         self.chk_enabled.toggled.connect(ac_group.setEnabled)
 
         self._load()
+
+    # ------------------------------------------------------------------ #
+    # Import / Export
+    # ------------------------------------------------------------------ #
+
+    def _dict_from_dialog(self) -> dict:
+        """Build an exportable dict straight from the widgets on screen.
+
+        Deliberately does NOT go through ``Settings.set_*()``/``export_dict()``:
+        Export should reflect whatever is currently shown, including changes
+        not yet confirmed with OK, without the side effect of persisting them
+        - so clicking Export and then Cancelling this dialog still cancels,
+        exactly as it always has.
+        """
+        if self.cmb_layer is not None:
+            layer = self.cmb_layer.currentLayer()
+            fields = {key: combo.currentField() for key, combo in self.field_combos.items()}
+        else:
+            layer = Settings.autocomplete_layer()
+            fields = {key: Settings.field(key) for key in Settings.FIELD_KEYS}
+        try:
+            default_read_mode = bool(self.cmb_mode.currentData())
+        except Exception:
+            default_read_mode = Settings.default_read_mode()
+        return {
+            CONFIG_MARKER: True,
+            "format_version": CONFIG_FORMAT_VERSION,
+            "plugin_enabled": self.chk_enabled.isChecked(),
+            "max_suggested_values": self.spin_max_values.value(),
+            "default_read_mode": default_read_mode,
+            "autocomplete_enabled": self.chk_ac.isChecked(),
+            "autocomplete_fields": fields,
+            "autocomplete_layer": _describe_layer_source(layer) if layer is not None else None,
+        }
+
+    def _export_settings(self) -> None:
+        """Save everything currently shown in this dialog to a JSON file."""
+        start_dir = str(Path(__file__).resolve().parent)
+        path, _filter = QFileDialog.getSaveFileName(
+            self,
+            "Export Settings",
+            str(Path(start_dir) / "rtl_expression_editor_settings.json"),
+            "JSON files (*.json)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".json"):
+            path += ".json"
+        try:
+            data = self._dict_from_dialog()
+            Path(path).write_text(
+                json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Export Settings", f"Could not write the file:\n{exc}")
+            return
+
+        note = ""
+        layer_info = data.get("autocomplete_layer")
+        if layer_info and layer_info.get("path_relative_to_plugin"):
+            note = (
+                "\n\nTo share this with a bundled lookup layer, copy the data "
+                "file into the plugin folder alongside this export before "
+                "zipping it up - the relative path recorded inside it will "
+                "then resolve correctly after installation, wherever that "
+                "turns out to be."
+            )
+        elif layer_info:
+            note = (
+                "\n\nNote: the lookup layer's file is outside this plugin's "
+                "own folder, so only its absolute path was recorded - this "
+                "will only resolve automatically on a machine with the same "
+                "file layout. Move the data file inside the plugin folder "
+                "and re-export to make it fully portable."
+            )
+        QMessageBox.information(self, "Export Settings", f"Settings exported to:\n{path}{note}")
+
+    def _import_settings(self) -> None:
+        """Load and apply a configuration exported by ``_export_settings``."""
+        start_dir = str(Path(__file__).resolve().parent)
+        path, _filter = QFileDialog.getOpenFileName(
+            self, "Import Settings", start_dir, "JSON files (*.json);;All files (*)"
+        )
+        if not path:
+            return
+
+        try:
+            raw = Path(path).read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except Exception as exc:
+            QMessageBox.warning(self, "Import Settings", f"Could not read the file:\n{exc}")
+            return
+
+        try:
+            warnings = Settings.apply_dict(data, plugin_dir=Path(__file__).resolve().parent)
+        except SettingsImportError as exc:
+            QMessageBox.warning(self, "Import Settings", str(exc))
+            return
+        except Exception as exc:
+            QMessageBox.warning(self, "Import Settings", f"Could not apply the settings:\n{exc}")
+            return
+
+        self._load()  # refresh every widget from what was just applied
+
+        if warnings:
+            QMessageBox.warning(
+                self,
+                "Import Settings",
+                "Settings were imported, but with some issues:\n\n"
+                + "\n".join(f"- {w}" for w in warnings),
+            )
+        else:
+            QMessageBox.information(self, "Import Settings", "Settings imported successfully.")
 
     # ------------------------------------------------------------------ #
     # Developer: run the test suite

@@ -1068,8 +1068,16 @@ class AutocompletePopup(QListWidget):
 
     # -- population -------------------------------------------------------- #
 
-    def populate(self, entries: Sequence[AutocompleteEntry]) -> int:
+    def populate(self, entries: Sequence[AutocompleteEntry], title: str = "") -> int:
         """Fill the list, inserting group headers when grouping is configured.
+
+        ``title`` is an optional heading shown above everything else - the
+        layer/dataset name when offering field names, or the field name when
+        offering its values (see ``CustomAutocompleteController._collect_entries``)
+        - so the user always knows at a glance which dataset or field the list
+        belongs to. Deliberately sized larger than a group header (see
+        ``_make_title``/``_make_header``) so the hierarchy reads unambiguously:
+        title, then group, then value.
 
         Returns the number of selectable value rows.
         """
@@ -1077,6 +1085,9 @@ class AutocompletePopup(QListWidget):
         grouped = any(e.group_label for e in entries)
         selectable = 0
         current_group = None
+
+        if title:
+            self.addItem(self._make_title(title))
 
         for entry in entries[:MAX_DISPLAYED]:
             if grouped and entry.group_label != current_group:
@@ -1120,6 +1131,20 @@ class AutocompletePopup(QListWidget):
         item.setFont(font)
         item.setFlags(Qt.ItemFlag.NoItemFlags)  # not selectable, not enabled
         item.setForeground(QColor("#4271ae"))
+        return item
+
+    @staticmethod
+    def _make_title(text: str) -> QListWidgetItem:
+        """The dataset/field heading - bigger and bolder than a group header
+        (see ``_make_header``), so it reads as one level up in the hierarchy
+        even when the list is also grouped."""
+        item = QListWidgetItem(text)
+        font = QFont(item.font())
+        font.setBold(True)
+        font.setPointSize(font.pointSize() + 2)
+        item.setFont(font)
+        item.setFlags(Qt.ItemFlag.NoItemFlags)  # not selectable, not enabled
+        item.setForeground(QColor("#1a5276"))
         return item
 
     # -- navigation -------------------------------------------------------- #
@@ -1250,6 +1275,11 @@ class CustomAutocompleteController(QObject):
         self._field_mode = False
         #: True while the popup lists values (quoted literals) for a field.
         self._value_mode = False
+        #: Heading shown above the popup's contents - the dataset/layer name
+        #: for a field list, the field name for a values list, empty
+        #: otherwise. Recomputed by ``_collect_entries`` every time the
+        #: context is (re)evaluated, not on every refilter keystroke.
+        self._popup_title = ""
         #: True while a key event is being re-sent to the editor, to stop the
         #: editor branch of eventFilter from re-entering the popup handler.
         self._forwarding = False
@@ -1878,12 +1908,47 @@ class CustomAutocompleteController(QObject):
         tables = resolve_table_candidates(probe) if usable else []
 
         if kind == "fields":
+            # Naming a field: the title is WHICH dataset/layer its fields
+            # belong to, so a user working across several layers is never in
+            # doubt about which one this list describes.
+            self._popup_title = self._layer_display_name(layer)
             return self._field_entries(layer, usable, tables)
         if kind == "values":
-            return self._value_entries(text_before, layer, usable, tables)
+            # Typing a value: the title is WHICH field it belongs to. Set to
+            # "" up front so a field that turns out to have nothing to offer
+            # never carries over a stale title from a previous, unrelated
+            # popup.
+            self._popup_title = ""
+            entries = self._value_entries(text_before, layer, usable, tables)
+            if entries:
+                self._popup_title = self._field_name
+            return entries
         if kind == "variables":
+            self._popup_title = ""
             return self._variable_entries(layer)
+        self._popup_title = ""
         return self._full_entries(layer)
+
+    @staticmethod
+    def _layer_display_name(layer) -> str:
+        """The name shown as the fields list's title.
+
+        ``layer.name()`` is the same label the Layers panel shows, so it is
+        what the user already recognises - falls back to the underlying
+        source table name on the rare layer that reports no name at all.
+        """
+        if layer is None:
+            return ""
+        try:
+            name = layer.name()
+            if name:
+                return name
+        except Exception:
+            pass
+        try:
+            return source_table_name(layer)
+        except Exception:
+            return ""
 
     @staticmethod
     def _field_entries(layer, usable: bool, tables: Sequence[str]) -> List[AutocompleteEntry]:
@@ -2084,7 +2149,7 @@ class CustomAutocompleteController(QObject):
             # Filter the popup as well as the editor: as a Qt.Popup window it
             # holds the keyboard and mouse grabs (see eventFilter).
             self._popup.installEventFilter(self)
-        self._popup.populate(subset)
+        self._popup.populate(subset, self._popup_title)
         if show or self._popup.isVisible():
             self._popup.show_at_cursor()
 

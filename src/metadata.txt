@@ -10,7 +10,9 @@ about=QGIS's built-in editor (QScintilla) does not display right-to-left text co
     The plugin also offers an optional advanced auto-complete system. Choose any project layer and its fields as the source of allowed values, with optional descriptions, groups and group descriptions. Press Ctrl+Space to complete either a field name or a value, and the suggestions adapt automatically to the field being queried and to the layer you are working on.
 
     When a custom auto-complete source is configured, an optional Read Mode switch appears inside the editor. Read Mode shows the value descriptions instead of the stored codes, making a long expression far easier tounderstand, and never alters the expression itself. Where the same code has different meanings in different groups, the description you picked is saved in the project file and restored automatically, so Read Mode always shows the right one, for everyone who opens the project.
-version=1.4
+
+    The whole configuration, including the auto-complete source, can be exported to a file and imported again elsewhere - useful for sharing a ready-made setup with colleagues.
+version=1.5
 author=Jossef Kanter
 email=jossefkan@gmail.com
 
@@ -25,6 +27,13 @@ experimental=False
 deprecated=False
 hasProcessingProvider=no
 server=False
+
+** v1.5 (16.08.2026):
+  - Added: the suggestion list now shows a title - the dataset/layer name when naming a field, the field name when picking its value.
+  - Added: Export Settings / Import Settings in the Settings dialog, saving and loading the whole configuration as a JSON file.
+  - Added: an imported configuration can locate its autocomplete lookup layer automatically when bundled inside the plugin folder, even after a reinstall to a different location.
+  - Improved: detailed tooltips throughout the Settings dialog, with concrete examples, for anyone configuring custom autocomplete for the first time.
+  - Improved: the new title above the suggestion list is shown larger than a group heading, for a clear visual hierarchy.
 
 ** v1.4 (12.08.2026):
   - Added: Ctrl+Space now also suggests fields, functions and variables, with signatures and help.

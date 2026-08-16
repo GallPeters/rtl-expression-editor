@@ -79,6 +79,31 @@ The tests locate the plugin's modules by looking for `rtl_editor.py` next to
 them rather than assuming any particular folder name, so this works
 regardless of what the plugin folder itself is called.
 
+#### Sharing a pre-configured autocomplete source
+
+The Settings dialog's **Export Settings** / **Import Settings** buttons save
+and load the whole configuration - including the autocomplete lookup layer
+and its column mapping - as a JSON file. To hand a ready-made setup to
+colleagues without asking them to configure anything themselves:
+
+1. Configure the plugin normally, pointing the lookup layer at a data file
+   copied *inside* the plugin's own install folder (e.g.
+   `<plugin folder>/data/lookup.gpkg`).
+2. Click **Export Settings**. When the lookup layer's file lives inside the
+   plugin folder, the exported file records its path *relative* to that
+   folder, not the absolute path on your own machine.
+3. Zip up the plugin folder as usual, with the data file and the exported
+   JSON file both included inside it.
+4. A colleague installs the zip and, in their own Settings dialog, clicks
+   **Import Settings** and picks the JSON file - the bundled data file is
+   located and loaded automatically from its recorded relative path,
+   wherever their profile happens to install the plugin.
+
+A lookup layer that lives outside the plugin folder (a database connection,
+or a file elsewhere on disk) is still exported for convenience, but only as
+an absolute path - portable only back to the same machine, not to a
+colleague's.
+
 ## Usage
 
 1. Open a supported dialog (e.g. `Layer → Filter / Query Builder`).

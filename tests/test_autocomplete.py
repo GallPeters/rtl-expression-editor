@@ -14,6 +14,7 @@ passing across QGIS upgrades without needing to be updated by hand.
 import unittest
 
 from qgis.core import QgsExpression, QgsFeature, QgsProject
+from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtWidgets import QPlainTextEdit
 
 from _rtl_plugin import rtl_autocomplete as ac
@@ -226,6 +227,65 @@ class AutocompletePopupFlowTests(unittest.TestCase):
         popup.setCurrentRow(row)
         self.controller.accept_current()
         self.assertEqual(self.editor.toPlainText(), '"NAME"')
+
+    def test_fields_popup_title_is_the_layer_name(self):
+        """Naming a field: the title says WHICH dataset it belongs to."""
+        self._set_text_and_cursor('"', 1)
+        self.controller.trigger()
+        self.assertEqual(self.controller._popup_title, self.layer.name())
+
+    def test_values_popup_title_is_the_field_name(self):
+        """Typing a value: the title says WHICH field it belongs to."""
+        provider = self.layer.dataProvider()
+        feature = QgsFeature(self.layer.fields())
+        feature.setAttribute("NAME", "Foo")
+        provider.addFeature(feature)
+
+        text = "\"NAME\" = '"
+        self._set_text_and_cursor(text, len(text))
+        self.controller.trigger()
+        self.assertEqual(self.controller._popup_title, "NAME")
+
+    def test_the_full_grouped_list_has_no_title(self):
+        """No single dataset/field applies to the mixed function/variable/
+        operator list, so no heading is shown for it."""
+        self._set_text_and_cursor("", 0)
+        self.controller.trigger()
+        self.assertEqual(self.controller._popup_title, "")
+
+
+class AutocompletePopupTitleRenderingTests(unittest.TestCase):
+    """AutocompletePopup.populate()'s title row - inserted above every group,
+    and sized larger than a group header so the hierarchy stays legible."""
+
+    def setUp(self):
+        self.editor = QPlainTextEdit()
+        self.popup = ac.AutocompletePopup(self.editor)
+
+    def tearDown(self):
+        self.popup.deleteLater()
+
+    def test_title_is_the_first_row_and_not_selectable(self):
+        entries = [ac.AutocompleteEntry(value="1", group_code="G1")]
+        self.popup.populate(entries, title="STATUS")
+        title_item = self.popup.item(0)
+        self.assertEqual(title_item.text(), "STATUS")
+        self.assertFalse(title_item.flags() & Qt.ItemFlag.ItemIsSelectable)
+
+    def test_no_title_row_when_title_is_empty(self):
+        entries = [ac.AutocompleteEntry(value="1")]  # ungrouped, so item(0) is the value itself
+        count_without_title = self.popup.populate(entries, title="")
+        self.assertEqual(self.popup.item(0).data(ac.VALUE_ROLE), "1")
+        self.assertEqual(count_without_title, 1)
+
+    def test_title_font_is_larger_than_a_group_header_font(self):
+        entries = [ac.AutocompleteEntry(value="1", group_code="G1")]
+        self.popup.populate(entries, title="STATUS")
+        title_item = self.popup.item(0)
+        header_item = self.popup.item(1)
+        self.assertGreater(title_item.font().pointSize(), header_item.font().pointSize())
+        self.assertTrue(title_item.font().bold())
+        self.assertTrue(header_item.font().bold())
 
 
 if __name__ == "__main__":
