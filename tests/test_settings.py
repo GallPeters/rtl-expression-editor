@@ -416,6 +416,38 @@ class SettingsExportImportTests(unittest.TestCase):
         self.assertTrue(any("could not be found" in w for w in warnings))
         self.assertEqual(Settings.layer_id(), "")
 
+    def test_a_referenced_layer_is_resolved_even_when_autocomplete_enabled_is_false(self):
+        """Regression: a file exported before ticking "Enable custom
+        autocomplete source" (an easy thing to forget) still has a fully
+        configured layer and fields - those must still be loaded, not
+        silently dropped just because the enabled flag itself was off."""
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin_dir = Path(tmp)
+            data_dir = plugin_dir / "data"
+            data_dir.mkdir()
+            (data_dir / "lookup.geojson").write_text(_GEOJSON_SAMPLE, encoding="utf-8")
+
+            data = {
+                "rtl_expression_editor_settings": True,
+                "autocomplete_enabled": False,
+                "autocomplete_fields": {"field_names": "field_name", "value": "value"},
+                "autocomplete_layer": {
+                    "name": "lookup",
+                    "provider": "ogr",
+                    "path_relative_to_plugin": "data/lookup.geojson",
+                    "path_absolute": None,
+                    "uri_suffix": "",
+                },
+            }
+            warnings = Settings.apply_dict(data, plugin_dir=plugin_dir)
+
+            self.assertEqual(warnings, [])
+            self.assertFalse(Settings.autocomplete_enabled())  # respected as exported
+            layer = Settings.autocomplete_layer()
+            self.assertIsNotNone(layer)  # but still loaded into the project
+            self.assertTrue(layer.isValid())
+            QgsProject.instance().removeMapLayer(layer.id())
+
     def test_export_then_apply_round_trips_a_bundled_layer(self):
         """The full distribution scenario: export from one "install"
         location, apply as if on a colleague's machine where the plugin (and

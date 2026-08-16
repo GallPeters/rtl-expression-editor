@@ -2165,6 +2165,11 @@ class RtlBidiEditorPlugin:
 
     def initGui(self) -> None:  # noqa: N802 (QGIS plugin API)
         global _WATCHER
+        # Tried first and independently of everything else below: a bundled
+        # settings file should still get imported even if some other startup
+        # step below it were to fail, and it must never itself be able to
+        # block the rest of startup either.
+        self._apply_bundled_config()
         try:
             self._add_menu()
             self._watcher = CodeEditorWatcher()
@@ -2172,7 +2177,6 @@ class RtlBidiEditorPlugin:
             self._watcher.install()
             if SETTINGS_BUS is not None:
                 SETTINGS_BUS.changed.connect(self.apply_settings)
-            self._apply_bundled_config()
             _log("RTL Expression Editor active.", Qgis.MessageLevel.Success)
             _dbg(
                 f"watching editor classes {sorted(TARGET_EDITOR_CLASSES)}; "
@@ -2183,27 +2187,18 @@ class RtlBidiEditorPlugin:
 
     def _apply_bundled_config(self) -> None:
         """Auto-import a settings file bundled next to the plugin's own
-        modules, if one is there and its content has not already been
-        applied to this profile - see
-        Settings.apply_bundled_config_if_present() for the full explanation.
-        A no-op on every ordinary install, which has no such file; failures
-        here must never break plugin startup, so they are only ever logged.
+        modules, if one is there - see
+        Settings.apply_bundled_config_if_present() for the full explanation;
+        it does its own logging of what happened (found and applied, found
+        but already imported before, or malformed). A no-op on every
+        ordinary install, which has no such file.
         """
         if Settings is None:
             return
         try:
-            warnings = Settings.apply_bundled_config_if_present()
+            Settings.apply_bundled_config_if_present()
         except Exception as exc:
             _log(f"Could not auto-import bundled settings: {exc}", Qgis.MessageLevel.Warning)
-            return
-        if warnings is None:
-            return
-        _log(
-            "RTL Expression Editor: bundled settings imported automatically.",
-            Qgis.MessageLevel.Success,
-        )
-        for warning in warnings:
-            _log(f"Bundled settings: {warning}", Qgis.MessageLevel.Warning)
 
     def unload(self) -> None:
         global _WATCHER

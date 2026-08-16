@@ -283,7 +283,12 @@ class AutocompletePopupTitleRenderingTests(unittest.TestCase):
         self.popup.populate(entries, title="STATUS")
         title_item = self.popup.item(0)
         header_item = self.popup.item(1)
-        self.assertGreater(title_item.font().pointSize(), header_item.font().pointSize())
+        # pointSizeF(), not the integer pointSize(): the title's size is
+        # only +0.5pt over the base font (a deliberately subtle step - see
+        # AutocompletePopup._make_title), which the rounding/truncating
+        # integer accessor could report as equal to the (unchanged) header
+        # size rather than greater.
+        self.assertGreater(title_item.font().pointSizeF(), header_item.font().pointSizeF())
         self.assertTrue(title_item.font().bold())
         self.assertTrue(header_item.font().bold())
 

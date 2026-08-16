@@ -38,6 +38,8 @@ server=False
   - Improved: the Settings window can now be resized freely, with its contents scrolling instead of forcing a very tall window.
   - Fixed: tooltips on settings parameters now also appear when hovering their name, not only their input control, including while disabled.
   - Fixed: importing settings that successfully restored the autocomplete layer no longer left a stale "layer is no longer in this project" warning on screen.
+  - Fixed: a bundled/imported configuration now loads its lookup layer into the project even if "Enable custom autocomplete source" was left unticked when it was exported.
+  - Fixed: the automatic bundled-settings import could silently fail to run after reinstalling the plugin over an existing configuration.
 
 ** v1.4 (12.08.2026):
   - Added: Ctrl+Space now also suggests fields, functions and variables, with signatures and help.

@@ -428,7 +428,15 @@ class Settings:
 
         layer_id = ""
         layer_info = data.get("autocomplete_layer")
-        if ac_enabled and layer_info:
+        if layer_info:
+            # Resolved whenever the file references one, regardless of
+            # whether "autocomplete_enabled" also happens to be true -
+            # loading the referenced layer into the project is exactly what
+            # "import the config" means; gating it on the enabled flag used
+            # to mean a bundled file exported with the feature not yet
+            # ticked on (an easy thing to forget before Export Settings)
+            # never got its layer loaded at all, even though everything
+            # else about it was configured correctly.
             layer_id, layer_warning = _resolve_layer_from_description(layer_info, plugin_dir)
             if layer_warning:
                 warnings.append(layer_warning)
@@ -498,27 +506,44 @@ class Settings:
         Returns the warnings from ``apply_dict()`` if a (new) file was found
         and applied, or ``None`` if nothing was done.
         """
+        import hashlib
+
+        from qgis.core import Qgis, QgsMessageLog
+
+        def _report(message: str, level=Qgis.MessageLevel.Info) -> None:
+            try:
+                QgsMessageLog.logMessage(message, "RTL Expression Editor", level)
+            except Exception:
+                pass
+
         base_dir = plugin_dir or Path(__file__).resolve().parent
         candidate = base_dir / BUNDLED_CONFIG_FILENAME
         try:
             raw = candidate.read_bytes()
         except Exception:
-            return None  # nothing bundled (yet)
-
-        import hashlib
+            # The common case - a normal install has no such file - stays
+            # completely silent rather than logging on every startup.
+            return None
 
         digest = hashlib.sha256(raw).hexdigest()
         if digest == cls._bundled_config_hash():
-            return None  # this exact file was already applied
+            _report(f"Bundled settings file found ({candidate}) but already imported; skipping.")
+            return None
 
         try:
             data = json.loads(raw.decode("utf-8"))
             warnings = cls.apply_dict(data, plugin_dir=base_dir)
         except Exception as exc:
-            _log(f"Could not auto-import bundled settings ({candidate}): {exc}")
+            _report(
+                f"Could not auto-import bundled settings ({candidate}): {exc}",
+                Qgis.MessageLevel.Warning,
+            )
             return None  # hash not recorded - a later, fixed file gets a retry
 
         cls._set_bundled_config_hash(digest)
+        _report(f"Bundled settings imported automatically from {candidate}.", Qgis.MessageLevel.Success)
+        for warning in warnings:
+            _report(f"Bundled settings: {warning}", Qgis.MessageLevel.Warning)
         return warnings
 
 

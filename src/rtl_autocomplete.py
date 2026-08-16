@@ -1142,11 +1142,15 @@ class AutocompletePopup(QListWidget):
         item = QListWidgetItem(text)
         font = QFont(item.font())
         font.setBold(True)
-        if font.pointSize() > 0:
-            font.setPointSize(font.pointSize() + 1)
+        if font.pointSizeF() > 0:
+            # A fractional size (setPointSizeF, not setPointSize) is what
+            # makes a genuinely subtle +0.5pt step possible - the smallest
+            # bump that still reads as "one level up" from a same-size bold
+            # group heading without the title dominating the popup.
+            font.setPointSizeF(font.pointSizeF() + 0.5)
         else:
             # Some platforms configure the base font by pixel size rather
-            # than point size, in which case pointSize() returns -1 rather
+            # than point size, in which case pointSizeF() returns -1 rather
             # than a usable number - fall back to the pixel-size equivalent
             # rather than silently leaving the title unenlarged.
             font.setPixelSize(max(1, font.pixelSize() + 1))
