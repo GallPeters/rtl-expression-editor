@@ -36,12 +36,14 @@ from qgis.PyQt.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -594,6 +596,22 @@ class SettingsDialog(QDialog):
 
         root = QVBoxLayout(self)
 
+        # Every group below goes inside a scroll area rather than straight
+        # into the dialog: stacked one after another (General, Custom
+        # Autocomplete with its whole column mapping, Import / Export,
+        # Developer) they are taller than fits on many screens, and a plain
+        # QVBoxLayout forces the dialog's minimum height to fit all of them
+        # at once - the window could not actually be made shorter. Scrolling
+        # the content instead leaves the dialog freely resizable; only the OK
+        # / Cancel buttons stay outside the scroll area, always visible.
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        content = QWidget(scroll)
+        content_layout = QVBoxLayout(content)
+        scroll.setWidget(content)
+        root.addWidget(scroll)
+
         # -- General ------------------------------------------------------- #
         general = QGroupBox("General", self)
         general_layout = QVBoxLayout(general)
@@ -615,7 +633,7 @@ class SettingsDialog(QDialog):
         values_row.addRow("Suggested values without a lookup table", self.spin_max_values)
         general_layout.addLayout(values_row)
 
-        root.addWidget(general)
+        content_layout.addWidget(general)
 
         # -- Custom Autocomplete ------------------------------------------- #
         ac_group = QGroupBox("Custom Autocomplete", self)
@@ -752,6 +770,18 @@ class SettingsDialog(QDialog):
         )
         form.addRow("Default editor mode", self.cmb_mode)
 
+        # Qt hides tooltips on a disabled widget unless it is told not to -
+        # and everything in self.config is disabled whenever the custom
+        # autocomplete checkbox above is unchecked, which is the default. Set
+        # WA_AlwaysShowToolTips explicitly, so the tooltips explaining each
+        # field are visible even before the feature is turned on.
+        tooltip_widgets = [self.cmb_mode, self.chk_ac]
+        if self.cmb_layer is not None:
+            tooltip_widgets.append(self.cmb_layer)
+            tooltip_widgets.extend(self.field_combos.values())
+        for widget in tooltip_widgets:
+            widget.setAttribute(Qt.WidgetAttribute.WA_AlwaysShowToolTips, True)
+
         ac_layout.addWidget(self.config)
 
         self.lbl_warning = QLabel("", ac_group)
@@ -760,7 +790,7 @@ class SettingsDialog(QDialog):
         self.lbl_warning.setVisible(False)
         ac_layout.addWidget(self.lbl_warning)
 
-        root.addWidget(ac_group)
+        content_layout.addWidget(ac_group)
 
         # -- Import / Export ------------------------------------------------ #
         io_group = QGroupBox("Import / Export Settings", self)
@@ -800,7 +830,7 @@ class SettingsDialog(QDialog):
         io_buttons_row.addWidget(self.btn_export)
         io_buttons_row.addWidget(self.btn_import)
         io_layout.addLayout(io_buttons_row)
-        root.addWidget(io_group)
+        content_layout.addWidget(io_group)
 
         # -- Developer -------------------------------------------------------
         # Only shown at all when a development checkout's tests/ folder is
@@ -815,9 +845,9 @@ class SettingsDialog(QDialog):
             self.btn_run_tests.setToolTip(f"Run the test suite in:\n{tests_dir}")
             self.btn_run_tests.clicked.connect(self._run_tests)
             dev_layout.addWidget(self.btn_run_tests)
-            root.addWidget(dev_group)
+            content_layout.addWidget(dev_group)
 
-        root.addStretch(1)
+        content_layout.addStretch(1)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
@@ -831,6 +861,17 @@ class SettingsDialog(QDialog):
         self.chk_enabled.toggled.connect(ac_group.setEnabled)
 
         self._load()
+
+        # Open at a height that comfortably fits the screen rather than the
+        # content's full natural height - the scroll area above means this is
+        # only a starting size, not a lower limit: the window is still freely
+        # resizable, including smaller, from here.
+        try:
+            screen = self.screen() or QApplication.primaryScreen()
+            available = screen.availableGeometry().height() if screen is not None else 720
+        except Exception:
+            available = 720
+        self.resize(560, max(360, min(720, int(available * 0.85))))
 
     # ------------------------------------------------------------------ #
     # Import / Export
@@ -1138,6 +1179,13 @@ class SettingsDialog(QDialog):
                 + ". Please reselect them."
             )
             self.lbl_warning.setVisible(True)
+        else:
+            # _load() can run more than once per dialog (e.g. after Import
+            # Settings resolves a layer that was previously missing) - clear
+            # a stale warning from an earlier call instead of leaving it
+            # displayed forever once shown once.
+            self.lbl_warning.setText("")
+            self.lbl_warning.setVisible(False)
 
     def _on_accept(self) -> None:
         """Validate, then persist and broadcast."""
