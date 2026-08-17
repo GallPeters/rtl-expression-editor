@@ -824,6 +824,46 @@ def force_ltr_paragraphs(text: str) -> str:
     return _LRM + text.replace("\n", "\n" + _LRM)
 
 
+#: First Strong Isolate / Pop Directional Isolate (U+2068 / U+2069) - the
+#: Unicode-recommended way to embed a run of text whose own script is
+#: unknown or mixed inside surrounding text, without letting its direction
+#: leak out and affect its neighbours. See _isolate() for why a single
+#: paragraph-level LRM (force_ltr_paragraphs) is not enough on its own.
+_FSI = "⁨"
+_PDI = "⁩"
+
+
+def _isolate(label: str) -> str:
+    """Wrap one substituted label so it never bidi-merges with whatever
+    substituted label sits next to it.
+
+    force_ltr_paragraphs() pins the overall PARAGRAPH direction, but that
+    alone does not stop two adjacent RTL runs, separated only by a neutral
+    character (a comma, a space, "="), from being treated as ONE combined
+    bidi run and reordered as a unit: in "מבנה דת, מבנה חקלאי", the comma
+    between two Hebrew phrases resolves to the SAME direction as its
+    neighbours, extending the RTL run across it - so the Unicode Bidi
+    Algorithm can still visually swap the two phrases relative to each
+    other even though the line as a whole is anchored left-to-right.
+
+    Wrapping each substituted label individually in an isolate (rather
+    than just relying on the paragraph-level mark) is what actually
+    prevents that: per the Unicode bidi spec, an isolate is treated as one
+    opaque, neutral unit by everything OUTSIDE it, so the structural
+    characters around it (operators, commas, parentheses) always resolve
+    against the surrounding left-to-right paragraph, never against
+    whatever direction happens to be inside a neighbouring label. Each
+    label's OWN text still resolves its own internal direction normally -
+    Hebrew still reads right-to-left within itself - only the relative
+    ordering BETWEEN labels (and everything structural around them) is
+    protected, no matter how many of them sit next to each other or how
+    deeply the expression nests.
+    """
+    if not label:
+        return label
+    return _FSI + label + _PDI
+
+
 def substitute_descriptions(
     text: str,
     mapping: Dict[str, Dict[str, List[str]]],
@@ -869,9 +909,11 @@ def substitute_descriptions(
                 # like a value's code disappears in favour of its
                 # description, not shown alongside it. No parentheses:
                 # this is the field's name AS the read-mode text, the same
-                # relationship a value has to its description.
+                # relationship a value has to its description. Isolated
+                # (see _isolate()) so it cannot bidi-merge with the value
+                # label that follows it.
                 out.append(text[last_end:match.start()])
-                out.append(field_desc)
+                out.append(_isolate(field_desc))
                 last_end = match.end()
             continue
 
@@ -906,8 +948,13 @@ def substitute_descriptions(
         # Read mode is a human-readable rendering rather than valid SQL - the
         # real expression is untouched underneath - so quoting adds nothing and
         # misleads when the description is numeric.
+        #
+        # Isolated (see _isolate()) so that two of these sitting next to each
+        # other - e.g. "2300, 2301" both becoming Hebrew descriptions inside
+        # an IN (...) list - never bidi-merge into one run and swap order
+        # relative to each other, no matter how many of them there are.
         out.append(text[last_end:match.start()])
-        out.append(label)
+        out.append(_isolate(label))
         last_end = match.end()
 
     if not out:
@@ -988,12 +1035,16 @@ def _pick_label(
     if len(candidates) == 1:
         return _render(candidates[0], persist=False)
 
+    # Each candidate isolated individually (see _isolate()) before joining -
+    # otherwise two adjacent RTL meanings ("mosque / greenhouse" in Hebrew)
+    # could bidi-merge across the " / " separator and swap order, the same
+    # problem a comma-separated IN (...) list has.
     if mode == "alt":
         # dict.fromkeys(): de-duplicated, order-preserving - two distinct
         # primary descriptions can share one alternative, or both fall back
         # to their own (different) primary text.
-        return " / ".join(dict.fromkeys(_render(candidate, persist=False) for candidate in candidates))
-    return " / ".join(normalize_code(candidate) for candidate in candidates)
+        return " / ".join(dict.fromkeys(_isolate(_render(candidate, persist=False)) for candidate in candidates))
+    return " / ".join(_isolate(normalize_code(candidate)) for candidate in candidates)
 
 
 # --------------------------------------------------------------------------- #

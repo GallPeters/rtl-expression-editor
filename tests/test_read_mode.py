@@ -13,6 +13,13 @@ from _rtl_plugin.rtl_settings import Settings
 from .utils import make_context_layer, make_lookup_layer, reset_plugin_settings
 
 
+def iso(text: str) -> str:
+    """Wrap ``text`` exactly the way substitute_descriptions() isolates a
+    substituted label - see rtl_readmode._isolate() for why every label is
+    individually wrapped in a bidi isolate rather than left as plain text."""
+    return rm._FSI + text + rm._PDI
+
+
 class NormalizeCodeTests(unittest.TestCase):
     def test_strips_one_matching_pair_of_quotes(self):
         self.assertEqual(rm.normalize_code("'farm'"), "farm")
@@ -30,7 +37,7 @@ class SubstituteDescriptionsTests(unittest.TestCase):
         expr = "\"STATUS\" = '1' OR \"STATUS\" = '2'"
         self.assertEqual(
             rm.substitute_descriptions(expr, mapping),
-            '"STATUS" = Active OR "STATUS" = Inactive',
+            f'"STATUS" = {iso("Active")} OR "STATUS" = {iso("Inactive")}',
         )
 
     def test_leaves_unmapped_text_untouched(self):
@@ -44,14 +51,20 @@ class SubstituteDescriptionsTests(unittest.TestCase):
         expr = "\"OTHER\" = '610' AND \"F_ATT\" = '610'"
         self.assertEqual(
             rm.substitute_descriptions(expr, mapping),
-            "\"OTHER\" = '610' AND \"F_ATT\" = mosque",
+            f"\"OTHER\" = '610' AND \"F_ATT\" = {iso('mosque')}",
         )
 
     def test_an_ambiguous_code_shows_every_meaning_until_one_is_chosen(self):
+        # _pick_label() isolates each candidate before joining with " / ",
+        # and substitute_descriptions() isolates its WHOLE returned label
+        # again on top - a harmless, valid nested isolate, not a double
+        # substitution - see _isolate().
         mapping = {"code": {"610": ["mosque", "greenhouse"]}}
         expr = "\"CODE\" = '610'"
+        joined = f'{iso("mosque")} / {iso("greenhouse")}'
         self.assertEqual(
-            rm.substitute_descriptions(expr, mapping), '"CODE" = mosque / greenhouse'
+            rm.substitute_descriptions(expr, mapping),
+            f'"CODE" = {iso(joined)}',
         )
 
     def test_a_remembered_choice_resolves_the_ambiguous_code(self):
@@ -66,7 +79,7 @@ class SubstituteDescriptionsTests(unittest.TestCase):
             expr = "\"CODE\" = '610'"
             self.assertEqual(
                 rm.substitute_descriptions(expr, mapping, "mytable", "ctx"),
-                '"CODE" = greenhouse',
+                f'"CODE" = {iso("greenhouse")}',
             )
         finally:
             if existed:
@@ -82,7 +95,7 @@ class SubstituteDescriptionsTests(unittest.TestCase):
         result = rm.substitute_descriptions(
             expr, {}, field_descriptions={"type": "סוג"}
         )
-        self.assertEqual(result, "סוג = '1'")
+        self.assertEqual(result, f"{iso('סוג')} = '1'")
 
     def test_a_field_with_no_configured_description_is_left_untouched(self):
         expr = "\"TYPE\" = '1'"
@@ -95,7 +108,7 @@ class SubstituteDescriptionsTests(unittest.TestCase):
         expr = "\"STATUS\" = '1'"
         self.assertEqual(
             rm.substitute_descriptions(expr, mapping, mode="alt", alt_mapping=alt_mapping),
-            '"STATUS" = פעיל',
+            f'"STATUS" = {iso("פעיל")}',
         )
 
     def test_alt_mode_falls_back_to_the_primary_description_when_none_is_set(self):
@@ -105,7 +118,7 @@ class SubstituteDescriptionsTests(unittest.TestCase):
         expr = "\"STATUS\" = '1'"
         self.assertEqual(
             rm.substitute_descriptions(expr, mapping, mode="alt", alt_mapping={}),
-            '"STATUS" = Active',
+            f'"STATUS" = {iso("Active")}',
         )
 
     def test_alt_mode_respects_a_remembered_choice_among_several_meanings(self):
@@ -120,7 +133,7 @@ class SubstituteDescriptionsTests(unittest.TestCase):
                 rm.substitute_descriptions(
                     expr, mapping, "mytable", "ctx", mode="alt", alt_mapping=alt_mapping
                 ),
-                '"CODE" = חממה',
+                f'"CODE" = {iso("חממה")}',
             )
         finally:
             if existed:
@@ -178,10 +191,69 @@ class ForceLtrParagraphsTests(unittest.TestCase):
         # Logical order must already be field-desc, then IN, then the list
         # in its original order - force_ltr_paragraphs() only pins how that
         # order is laid out visually, it must never change it.
-        self.assertEqual(substituted, "ישות IN (בית כנסת, מבנה חקלאי)")
+        expected = f"{iso('ישות')} IN ({iso('בית כנסת')}, {iso('מבנה חקלאי')})"
+        self.assertEqual(substituted, expected)
 
         preview = rm.force_ltr_paragraphs(substituted)
-        self.assertEqual(preview, rm._LRM + "ישות IN (בית כנסת, מבנה חקלאי)")
+        self.assertEqual(preview, rm._LRM + expected)
+
+
+class BidiIsolationTests(unittest.TestCase):
+    """A single paragraph-level LRM (force_ltr_paragraphs) pins the overall
+    line to left-to-right, but does NOT by itself stop two adjacent RTL
+    labels - separated only by a neutral character like a comma or a space -
+    from bidi-merging into one run and swapping order relative to each
+    other. Each substituted label must be wrapped in its own bidi isolate
+    (see rtl_readmode._isolate()) to prevent that, no matter how many labels
+    sit next to each other or how deeply the expression nests.
+    """
+
+    def test_each_substituted_label_is_individually_isolated(self):
+        mapping = {"f_code": {"2300": ["בית כנסת"], "2301": ["מבנה חקלאי"]}}
+        result = rm.substitute_descriptions("\"F_CODE\" IN (2300, 2301)", mapping)
+        self.assertEqual(
+            result, f'"F_CODE" IN ({iso("בית כנסת")}, {iso("מבנה חקלאי")})'
+        )
+
+    def test_stripping_the_isolate_markers_recovers_the_original_left_to_right_order(self):
+        """The decisive check: whatever the isolates do visually, the
+        underlying LOGICAL sequence - field, operator, list in its original
+        order - must exactly match the source expression's own order,
+        regardless of how many RTL/LTR labels are involved or how they are
+        nested."""
+        mapping = {
+            "f_code": {"2300": ["מבנה דת"], "2301": ["מבנה חקלאי"], "2302": ["בית ספר"]}
+        }
+        expr = "\"F_CODE\" IN (2300, 2301, 2302)"
+        result = rm.substitute_descriptions(
+            expr, mapping, field_descriptions={"f_code": "ישות"}
+        )
+        stripped = result.replace(rm._FSI, "").replace(rm._PDI, "")
+        self.assertEqual(stripped, "ישות IN (מבנה דת, מבנה חקלאי, בית ספר)")
+
+    def test_a_nested_expression_keeps_every_label_in_source_order(self):
+        """No matter how much the expression is nested: two separate
+        field/value clauses joined by AND, each independently substituted,
+        must still read in their original left-to-right sequence once the
+        isolate markers are stripped."""
+        mapping = {
+            "f_code": {"2300": ["מבנה דת"]},
+            "f_type": {"1": ["פעיל"], "2": ["לא פעיל"]},
+        }
+        expr = "(\"F_CODE\" = 2300) AND (\"F_TYPE\" IN (1, 2))"
+        result = rm.substitute_descriptions(
+            expr, mapping, field_descriptions={"f_code": "ישות", "f_type": "סוג"}
+        )
+        stripped = result.replace(rm._FSI, "").replace(rm._PDI, "")
+        self.assertEqual(stripped, "(ישות = מבנה דת) AND (סוג IN (פעיל, לא פעיל))")
+
+    def test_ambiguous_meanings_joined_by_slash_are_each_isolated_too(self):
+        mapping = {"code": {"610": ["מסגד", "חממה"]}}
+        result = rm.substitute_descriptions("\"CODE\" = '610'", mapping)
+        joined = f'{iso("מסגד")} / {iso("חממה")}'
+        self.assertEqual(result, f'"CODE" = {iso(joined)}')
+        stripped = result.replace(rm._FSI, "").replace(rm._PDI, "")
+        self.assertEqual(stripped, '"CODE" = מסגד / חממה')
 
 
 class OccurrenceIndexTests(unittest.TestCase):
