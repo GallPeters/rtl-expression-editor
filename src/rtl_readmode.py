@@ -25,7 +25,7 @@ Three pieces:
 from __future__ import annotations
 
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from qgis.PyQt.QtCore import QEvent, QObject, QPointF, QRectF, Qt, pyqtSignal
 from qgis.PyQt.QtGui import QColor, QPainter, QPainterPath
@@ -59,6 +59,16 @@ def _log(message: str, level=Qgis.MessageLevel.Info) -> None:
 # --------------------------------------------------------------------------- #
 
 
+#: One track colour per mode, in order: edit (grey), read (blue), and - only
+#: when a third mode is enabled - alternative read (purple). Distinct hues
+#: rather than just knob position, so which mode is active is legible even
+#: at this widget's small size.
+_MODE_COLORS = (QColor("#b8b8b8"), QColor("#4a90d9"), QColor("#8a5fd1"))
+
+#: One label per mode, used both for the tooltip and to build it.
+_MODE_LABELS = ("Edit mode (show codes)", "Read mode (show descriptions)", "Alternative read mode")
+
+
 class SlideSwitch(QAbstractButton):
     """A small pill toggle, drawn rather than themed.
 
@@ -66,18 +76,64 @@ class SlideSwitch(QAbstractButton):
     stylesheet that could clash with the user's QGIS theme.  Kept deliberately
     small and low-contrast: it lives inside the editor, so it must read as a
     control without competing with the text.
+
+    Cycles through ``mode_count`` positions (2: edit/read, or 3: edit/read/
+    alternative read - see ``ReadModeController``) rather than being a plain
+    boolean: clicking always advances to the next mode, wrapping back to the
+    first after the last, which needs no more than one click target no matter
+    how many modes there are.
     """
 
-    def __init__(self, parent=None):
+    #: Emitted with the new mode index (0 = edit) whenever it changes, either
+    #: by a click or by ``setMode()``.
+    modeChanged = pyqtSignal(int)
+
+    def __init__(self, parent=None, mode_count: int = 2):
         super().__init__(parent)
-        self.setCheckable(True)
+        self.setCheckable(False)
+        self._mode_count = max(2, min(3, int(mode_count)))
+        self._mode = 0
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFixedSize(38, 18)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # never steal caret focus
+        self.clicked.connect(self._advance)
+        self._update_tooltip()
+
+    def _update_tooltip(self) -> None:
+        current = _MODE_LABELS[self._mode]
         self.setToolTip(
-            "Show descriptions instead of codes (read-only preview).\n"
+            f"{current}. Click to switch to the next mode.\n"
             "The saved expression always keeps the original codes."
         )
+
+    def mode(self) -> int:
+        return self._mode
+
+    def setMode(self, mode: int) -> None:  # noqa: N802 (matches Qt widget-property naming)
+        mode = max(0, min(self._mode_count - 1, int(mode)))
+        if mode == self._mode:
+            return
+        self._mode = mode
+        self._update_tooltip()
+        self.update()
+        self.modeChanged.emit(self._mode)
+
+    def setModeCount(self, count: int) -> None:  # noqa: N802
+        """Switch between 2-position (edit/read) and 3-position (+ alternative
+        read) - called whenever an alternative description column is added,
+        changed or removed in Settings."""
+        count = max(2, min(3, int(count)))
+        if count == self._mode_count:
+            return
+        self._mode_count = count
+        if self._mode >= count:
+            self.setMode(count - 1)
+        else:
+            self._update_tooltip()
+        self.update()
+
+    def _advance(self) -> None:
+        self.setMode((self._mode + 1) % self._mode_count)
 
     def paintEvent(self, _event) -> None:  # noqa: N802 (Qt override)
         painter = QPainter(self)
@@ -86,8 +142,7 @@ class SlideSwitch(QAbstractButton):
         rect = QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0)
         radius = rect.height() / 2.0
 
-        on = self.isChecked()
-        track = QColor("#4a90d9") if on else QColor("#b8b8b8")
+        track = _MODE_COLORS[min(self._mode, len(_MODE_COLORS) - 1)]
         if not self.isEnabled():
             track = QColor("#d0d0d0")
 
@@ -96,7 +151,9 @@ class SlideSwitch(QAbstractButton):
         painter.fillPath(path, track)
 
         knob_d = rect.height() - 4.0
-        knob_x = rect.right() - knob_d - 2.0 if on else rect.left() + 2.0
+        travel = rect.width() - knob_d - 4.0
+        fraction = self._mode / (self._mode_count - 1) if self._mode_count > 1 else 0.0
+        knob_x = rect.left() + 2.0 + fraction * travel
         painter.setBrush(QColor("#ffffff"))
         painter.setPen(Qt.PenStyle.NoPen)
         painter.drawEllipse(QPointF(knob_x + knob_d / 2.0, rect.center().y()), knob_d / 2.0, knob_d / 2.0)
@@ -136,15 +193,43 @@ def _connect_project_invalidation(callback) -> bool:
     return connected
 
 
-class DescriptionResolver:
-    """Builds ``field -> {code: [descriptions]}`` for one table context.
+#: What DescriptionResolver.mapping() returns for one table context:
+#:
+#: * ``values``  - ``field -> {code: [description, ...]}``, unchanged in
+#:   shape from before the alternative-description column existed, so
+#:   ``_pick_label()``'s primary-mode logic needed no changes at all.
+#: * ``alt_values`` - ``field -> {code: {description: alt_description}}`` -
+#:   for whichever primary description ends up chosen (by
+#:   ``_pick_label()``), the alternative sitting next to *that same row*.
+#:   Looked up by the description's own text, not stored anywhere per choice
+#:   - see ChoiceMemory and _pick_label() for why that is what makes the
+#:   alternative description available immediately for already-remembered
+#:   choices, with no migration needed, as soon as the column is configured.
+#: * ``field_descriptions`` - ``field -> field_description``, one flat
+#:   description per field name, for the read-mode field-name annotation.
+ValueMapping = Dict[str, Dict[str, List[str]]]
+AltValueMapping = Dict[str, Dict[str, Dict[str, str]]]
+FieldDescriptions = Dict[str, str]
+ReadModeMapping = Tuple[ValueMapping, AltValueMapping, FieldDescriptions]
 
-    Cached per table context and dropped whenever settings change, so switching
-    to read mode repeatedly costs one query at most.
+#: An empty result, returned whenever nothing is configured or found -
+#: named so every early-return in _load() states its shape the same way.
+_EMPTY_MAPPING: ReadModeMapping = ({}, {}, {})
+
+
+class DescriptionResolver:
+    """Builds the read-mode mapping (see ``ReadModeMapping``) for one table
+    context.
+
+    Cached per table context and dropped whenever settings change or the
+    lookup layer's own data changes, so switching to read mode repeatedly
+    costs one query at most.
     """
 
-    _cache: Dict[str, Dict[str, Dict[str, List[str]]]] = {}
+    _cache: Dict[str, ReadModeMapping] = {}
     _hooked = False
+    _watched_layer_id: str = ""
+    _watched_layer = None
 
     @classmethod
     def _ensure_hook(cls) -> None:
@@ -158,13 +243,63 @@ class DescriptionResolver:
         cls._hooked = True
 
     @classmethod
+    def _sync_layer_hooks(cls) -> None:
+        """Keep edit-signal connections pointed at the configured layer.
+
+        Mirrors ``AutocompleteCache._sync_layer_hooks()``: without this, an
+        edit to the lookup table's own data (a changed description, or a
+        newly filled-in alternative-description column) would not be
+        reflected until something else happened to invalidate the cache -
+        settings being resaved, or the project reloading.
+        """
+        layer = Settings.autocomplete_layer()
+        layer_id = layer.id() if layer is not None else ""
+        if layer_id == cls._watched_layer_id:
+            return
+
+        if cls._watched_layer is not None:
+            for signal_name in (
+                "dataChanged",
+                "featureAdded",
+                "featuresDeleted",
+                "attributeValueChanged",
+                "willBeDeleted",
+            ):
+                try:
+                    getattr(cls._watched_layer, signal_name).disconnect(cls._on_layer_touched)
+                except Exception:
+                    pass
+
+        cls._watched_layer = layer
+        cls._watched_layer_id = layer_id
+
+        if layer is None:
+            return
+        for signal_name in (
+            "dataChanged",
+            "featureAdded",
+            "featuresDeleted",
+            "attributeValueChanged",
+            "willBeDeleted",
+        ):
+            try:
+                getattr(layer, signal_name).connect(cls._on_layer_touched)
+            except Exception:
+                pass  # not every provider exposes every signal
+
+    @classmethod
+    def _on_layer_touched(cls, *_args) -> None:
+        cls._cache.clear()
+
+    @classmethod
     def invalidate(cls) -> None:
         """Drop the mapping cache. Safe to call from a signal."""
         cls._cache.clear()
 
     @classmethod
-    def mapping(cls, table_candidates: List[str]) -> Dict[str, Dict[str, List[str]]]:
+    def mapping(cls, table_candidates: List[str]) -> ReadModeMapping:
         cls._ensure_hook()
+        cls._sync_layer_hooks()
         key = "|".join(sorted(t.lower() for t in table_candidates))
         if key in cls._cache:
             return cls._cache[key]
@@ -173,18 +308,26 @@ class DescriptionResolver:
         return result
 
     @classmethod
-    def _load(cls, table_candidates: List[str]) -> Dict[str, Dict[str, List[str]]]:
-        mapping: Dict[str, Dict[str, List[str]]] = {}
+    def _load(cls, table_candidates: List[str]) -> ReadModeMapping:
+        values: ValueMapping = {}
+        alt_values: AltValueMapping = {}
+        field_descriptions: FieldDescriptions = {}
+
         layer = Settings.autocomplete_layer()
         if layer is None:
-            return mapping
+            return _EMPTY_MAPPING
 
         f_names = Settings.field("field_names")
         f_value = Settings.field("value")
         f_desc = Settings.field("description")
+        f_alt_desc = Settings.field("alt_description")
+        f_field_desc = Settings.field("field_description")
         f_table = Settings.field("table")
-        if not (f_names and f_value and f_desc):
-            return mapping  # nothing to substitute without a description field
+
+        have_values = bool(f_names and f_value and f_desc)
+        have_field_desc = bool(f_names and f_field_desc)
+        if not (have_values or have_field_desc):
+            return _EMPTY_MAPPING  # nothing configured to substitute at all
 
         request = QgsFeatureRequest()
         if f_table and table_candidates:
@@ -203,21 +346,36 @@ class DescriptionResolver:
         try:
             for feature in layer.getFeatures(request):
                 field = cls._text(feature, f_names).lower()
+                if not field:
+                    continue
+
+                if have_field_desc and field not in field_descriptions:
+                    fdesc = cls._text(feature, f_field_desc)
+                    if fdesc:
+                        field_descriptions[field] = fdesc
+
+                if not have_values:
+                    continue
                 code = cls._text(feature, f_value)
                 description = cls._text(feature, f_desc)
-                if not (field and code and description):
+                if not (code and description):
                     continue
+                alt_description = cls._text(feature, f_alt_desc) if f_alt_desc else ""
                 # Key by both spellings so a table storing codes with or
                 # without quotes both resolve.
                 for variant in {code, normalize_code(code)}:
                     if not variant:
                         continue
-                    bucket = mapping.setdefault(field, {}).setdefault(variant, [])
+                    bucket = values.setdefault(field, {}).setdefault(variant, [])
                     if description not in bucket:
                         bucket.append(description)
+                    if alt_description:
+                        alt_values.setdefault(field, {}).setdefault(variant, {})[
+                            description
+                        ] = alt_description
         except Exception as exc:
             _log(f"Read-mode mapping failed: {exc}", Qgis.MessageLevel.Warning)
-        return mapping
+        return values, alt_values, field_descriptions
 
     @staticmethod
     def _text(feature, field_name: str) -> str:
@@ -484,6 +642,9 @@ def substitute_descriptions(
     mapping: Dict[str, Dict[str, List[str]]],
     table: str = "",
     context: str = "",
+    mode: str = "primary",
+    alt_mapping: Optional[Dict[str, Dict[str, Dict[str, str]]]] = None,
+    field_descriptions: Optional[Dict[str, str]] = None,
 ) -> str:
     """Replace value codes with descriptions, for display only.
 
@@ -493,8 +654,15 @@ def substitute_descriptions(
 
     When a code has several meanings under the same field, the choice the user
     made in the completion popup decides. See ``_pick_label``.
+
+    ``mode="alt"`` renders each value's alternative description instead of its
+    primary one - see ``_pick_label``. ``field_descriptions``, when given,
+    additionally annotates each quoted field reference itself, e.g. ``"TYPE"``
+    becomes ``"TYPE" (description)`` - independent of ``mode``, since a field's
+    own description is not a primary/alternative pair, just one label.
     """
-    if not mapping:
+    field_descriptions = field_descriptions or {}
+    if not mapping and not field_descriptions:
         return text
 
     out: List[str] = []
@@ -506,6 +674,12 @@ def substitute_descriptions(
         field = match.group("field")
         if field is not None:
             current_field = field.strip().lower()
+            field_desc = field_descriptions.get(current_field)
+            if field_desc:
+                out.append(text[last_end:match.start()])
+                out.append(match.group(0))  # the original "FIELDNAME", unchanged
+                out.append(f" ({field_desc})")
+                last_end = match.end()
             continue
 
         literal = match.group("quoted")
@@ -527,7 +701,8 @@ def substitute_descriptions(
         index = counters.get(seen_key, 0)
         counters[seen_key] = index + 1
 
-        label = _pick_label(candidates, table, current_field, code, index, context)
+        alt_for_code = (alt_mapping or {}).get(current_field, {}).get(code, {})
+        label = _pick_label(candidates, table, current_field, code, index, context, mode, alt_for_code)
         if not label:
             continue
 
@@ -555,6 +730,8 @@ def _pick_label(
     code: str,
     occurrence: int = 0,
     context: str = "",
+    mode: str = "primary",
+    alt_for_code: Optional[Dict[str, str]] = None,
 ) -> str:
     """Choose among competing descriptions for one code.
 
@@ -571,19 +748,41 @@ def _pick_label(
     does not determine which 610 is being excluded. A rule that is right most of
     the time invites trust it has not earned, and two interacting mechanisms are
     harder to reason about than one. Remembering is the only mechanism.
+
+    ``mode="alt"`` renders whichever description ends up chosen through its
+    own alternative text instead (``alt_for_code``, keyed by the primary
+    description) - falling back to the primary text when that particular row
+    has no alternative of its own, so alternative mode never looks broken for
+    an entry the alternative column simply has nothing to say about.
+
+    This is deliberately what makes a remembered choice made before an
+    alternative-description column even existed "just work" once one is
+    added: the remembered value is always the PRIMARY description text (see
+    ChoiceMemory), and the alternative is looked up fresh, by that same text,
+    every time - never stored alongside the choice itself. Nothing needs
+    migrating; the very next read of alternative mode already reflects it.
     """
-    # Descriptions are normalised for DISPLAY only. A table that stores values
-    # with their quotes included, e.g. the literal ``'farm'``, would otherwise
-    # render as ``''farm''`` once the substitution re-wraps a quoted literal.
-    # Matching against remembered choices uses the raw stored form, so the two
-    # stay consistent.
+    alt_for_code = alt_for_code or {}
+
+    def _render(description: str) -> str:
+        rendered = normalize_code(description)
+        if mode != "alt":
+            return rendered
+        alt = alt_for_code.get(description, "")
+        return normalize_code(alt) if alt else rendered
+
     if len(candidates) == 1:
-        return normalize_code(candidates[0])
+        return _render(candidates[0])
 
     remembered = ChoiceMemory.recall(table, field, code, occurrence, context)
     if remembered and remembered in candidates:
-        return normalize_code(remembered)
+        return _render(remembered)
 
+    if mode == "alt":
+        # dict.fromkeys(): de-duplicated, order-preserving - two distinct
+        # primary descriptions can share one alternative, or both fall back
+        # to their own (different) primary text.
+        return " / ".join(dict.fromkeys(_render(candidate) for candidate in candidates))
     return " / ".join(normalize_code(candidate) for candidate in candidates)
 
 
@@ -612,8 +811,8 @@ class ReadModeController(QObject):
             return
 
         try:
-            self._switch = SlideSwitch(editor)
-            self._switch.toggled.connect(self._on_toggled)
+            self._switch = SlideSwitch(editor, mode_count=self._mode_count())
+            self._switch.modeChanged.connect(self._on_mode_changed)
             self._switch.show()
             self._switch.raise_()
             editor.installEventFilter(self)
@@ -632,10 +831,12 @@ class ReadModeController(QObject):
                 pass
             self._reposition()
             # Apply the configured default mode once the dialog has settled.
+            # Only ever the primary read mode (mode 1) - there is no separate
+            # setting for defaulting straight into alternative mode.
             if Settings.default_read_mode():
                 from qgis.PyQt.QtCore import QTimer
 
-                QTimer.singleShot(0, lambda: self._switch and self._switch.setChecked(True))
+                QTimer.singleShot(0, lambda: self._switch and self._switch.setMode(1))
         except Exception as exc:
             _log(f"Read mode unavailable: {exc}", Qgis.MessageLevel.Warning)
             self._switch = None
@@ -644,12 +845,22 @@ class ReadModeController(QObject):
 
     @staticmethod
     def _feature_available() -> bool:
-        """Only offer read mode when there is something to substitute."""
+        """Only offer read mode when there is something to substitute -
+        either value descriptions, or field-name descriptions on their own."""
         try:
             usable, _ = Settings.autocomplete_is_usable()
-            return bool(usable and Settings.field("description"))
+            return bool(usable and (Settings.field("description") or Settings.field("field_description")))
         except Exception:
             return False
+
+    @staticmethod
+    def _mode_count() -> int:
+        """2 (edit/read), or 3 once an alternative value description column
+        is configured - see SlideSwitch."""
+        try:
+            return 3 if Settings.field("alt_description") else 2
+        except Exception:
+            return 2
 
     # -- layout ------------------------------------------------------------ #
 
@@ -693,12 +904,12 @@ class ReadModeController(QObject):
 
     # -- mode switching ---------------------------------------------------- #
 
-    def _on_toggled(self, checked: bool) -> None:
+    def _on_mode_changed(self, mode: int) -> None:
         try:
-            if checked:
-                self._enter_read_mode()
-            else:
+            if mode == 0:
                 self._leave_read_mode()
+            else:
+                self._enter_read_mode(alt=(mode == 2))
         except Exception as exc:
             _log(f"Read mode toggle failed: {exc}", Qgis.MessageLevel.Warning)
 
@@ -725,32 +936,41 @@ class ReadModeController(QObject):
         finally:
             editor.blockSignals(blocked)
 
-    def _enter_read_mode(self) -> None:
+    def _enter_read_mode(self, alt: bool = False) -> None:
         editor = self._editor
-        if editor is None or self._active:
+        if editor is None:
             return
 
-        # Take the authoritative text from Scintilla when available, so the
-        # preview reflects what QGIS will actually save.
-        sci = getattr(editor, "_sci", None)
-        try:
-            self._original = sci.text() if sci is not None else editor.toPlainText()
-            self._original = self._original.replace("\r\n", "\n").replace("\r", "\n")
-        except Exception:
-            self._original = editor.toPlainText()
+        # Only capture the authoritative text and read-only state on the
+        # actual edit -> read transition. Switching directly between read and
+        # alternative read (mode 1 <-> mode 2, without passing back through
+        # edit mode) must recompute the preview under the new mode without
+        # touching either - re-capturing here would take the PREVIEW itself
+        # as the "original" text, corrupting it.
+        if not self._active:
+            sci = getattr(editor, "_sci", None)
+            try:
+                self._original = sci.text() if sci is not None else editor.toPlainText()
+                self._original = self._original.replace("\r\n", "\n").replace("\r", "\n")
+            except Exception:
+                self._original = editor.toPlainText()
+            self._was_read_only = editor.isReadOnly()
 
+        sci = getattr(editor, "_sci", None)
         from .rtl_autocomplete import resolve_table_candidates
 
         tables = resolve_table_candidates(sci if sci is not None else editor)
-        mapping = DescriptionResolver.mapping(tables)
+        values, alt_values, field_descriptions = DescriptionResolver.mapping(tables)
         preview = substitute_descriptions(
-            self._original,
-            mapping,
+            self._original or "",
+            values,
             tables[0] if tables else "",
             expression_context_key(sci if sci is not None else editor),
+            mode="alt" if alt else "primary",
+            alt_mapping=alt_values,
+            field_descriptions=field_descriptions,
         )
 
-        self._was_read_only = editor.isReadOnly()
         self._active = True
         self._set_text_silently(preview)
         editor.setReadOnly(True)

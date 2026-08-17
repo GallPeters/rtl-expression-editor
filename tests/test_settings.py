@@ -204,6 +204,7 @@ class DescribeLayerSourceTests(unittest.TestCase):
 
         self.assertEqual(info["name"], "lookup")
         self.assertEqual(info["provider"], "ogr")
+        self.assertEqual(info["kind"], "file")
         self.assertEqual(info["path_relative_to_plugin"], "data/lookup.gpkg")
         self.assertEqual(info["uri_suffix"], "|layername=lookup")
         self.assertTrue(info["path_absolute"])
@@ -220,16 +221,39 @@ class DescribeLayerSourceTests(unittest.TestCase):
             with mock.patch.object(settings_module, "__file__", fake_module_file):
                 info = settings_module._describe_layer_source(layer)
 
+        self.assertEqual(info["kind"], "file")
         self.assertIsNone(info["path_relative_to_plugin"])
         self.assertEqual(info["path_absolute"], str(outside_file.resolve()))
 
-    def test_a_non_file_source_records_only_the_raw_value(self):
+    def test_a_memory_layer_source_is_recorded_as_a_connection_with_no_path(self):
         from _rtl_plugin import rtl_settings as settings_module
 
         layer = _FakeLayer("mem", "memory", "Point?crs=EPSG:4326&field=name:string")
         info = settings_module._describe_layer_source(layer)
+        self.assertEqual(info["kind"], "connection")
         self.assertIsNone(info["path_relative_to_plugin"])
         self.assertEqual(info["path_absolute"], "Point?crs=EPSG:4326&field=name:string")
+
+    def test_a_database_connections_username_and_password_are_never_recorded(self):
+        """Regression/security: an exported settings file can be shared or
+        bundled into a plugin zip - a database layer's credentials must
+        never end up in it, even though everything else about the
+        connection (needed to attempt reconnecting) still should."""
+        from qgis.core import QgsDataSourceUri
+
+        from _rtl_plugin import rtl_settings as settings_module
+
+        uri = QgsDataSourceUri()
+        uri.setConnection("dbhost", "5432", "mydb", "alice", "s3cr3t")
+        uri.setDataSource("public", "buildings", "geom")
+        layer = _FakeLayer("buildings", "postgres", uri.uri())
+
+        info = settings_module._describe_layer_source(layer)
+
+        self.assertEqual(info["kind"], "connection")
+        self.assertNotIn("s3cr3t", info["path_absolute"])
+        self.assertNotIn("alice", info["path_absolute"])
+        self.assertIn("mydb", info["path_absolute"])
 
 
 class ResolveLayerFromDescriptionTests(unittest.TestCase):
@@ -314,6 +338,73 @@ class ResolveLayerFromDescriptionTests(unittest.TestCase):
         from _rtl_plugin import rtl_settings as settings_module
 
         info = {"name": "lookup", "provider": "memory", "path_relative_to_plugin": None, "path_absolute": None, "uri_suffix": ""}
+        layer_id, warning = settings_module._resolve_layer_from_description(info, Path.cwd())
+        self.assertEqual(layer_id, "")
+        self.assertTrue(warning)
+
+    def test_a_file_that_exists_but_will_not_load_is_reported_not_accessible(self):
+        """Distinct from "not found": the path is there, but the layer still
+        fails to open (corrupted/unsupported content, permissions, ...)."""
+        from _rtl_plugin import rtl_settings as settings_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin_dir = Path(tmp)
+            bad_file = plugin_dir / "lookup.gpkg"
+            bad_file.write_text("this is not a real GeoPackage", encoding="utf-8")
+
+            info = {
+                "name": "lookup",
+                "provider": "ogr",
+                "kind": "file",
+                "path_relative_to_plugin": "lookup.gpkg",
+                "path_absolute": None,
+                "uri_suffix": "",
+            }
+            layer_id, warning = settings_module._resolve_layer_from_description(info, plugin_dir)
+
+        self.assertEqual(layer_id, "")
+        self.assertIn("not accessible", warning)
+        self.assertNotIn("could not be found", warning)
+
+    def test_a_connection_reuses_an_already_loaded_layer_with_the_same_source(self):
+        from _rtl_plugin import rtl_settings as settings_module
+        from qgis.core import QgsVectorLayer
+
+        existing = QgsVectorLayer("Point?crs=EPSG:4326&field=name:string", "existing", "memory")
+        self.assertTrue(existing.isValid())
+        QgsProject.instance().addMapLayer(existing)
+        try:
+            info = {
+                "name": "lookup",
+                "provider": "memory",
+                "kind": "connection",
+                "path_absolute": existing.source(),
+                "uri_suffix": "",
+            }
+            layer_id, warning = settings_module._resolve_layer_from_description(info, Path.cwd())
+            self.assertEqual(warning, "")
+            self.assertEqual(layer_id, existing.id())
+        finally:
+            QgsProject.instance().removeMapLayer(existing.id())
+
+    def test_a_connection_that_cannot_be_reached_is_reported_not_accessible(self):
+        from _rtl_plugin import rtl_settings as settings_module
+
+        info = {
+            "name": "remote_table",
+            "provider": "ogr",
+            "kind": "connection",
+            "path_absolute": "not a real connection string at all",
+            "uri_suffix": "",
+        }
+        layer_id, warning = settings_module._resolve_layer_from_description(info, Path.cwd())
+        self.assertEqual(layer_id, "")
+        self.assertIn("not accessible", warning)
+
+    def test_a_connection_with_no_information_recorded_gives_a_clear_warning(self):
+        from _rtl_plugin import rtl_settings as settings_module
+
+        info = {"name": "remote_table", "provider": "postgres", "kind": "connection", "path_absolute": None}
         layer_id, warning = settings_module._resolve_layer_from_description(info, Path.cwd())
         self.assertEqual(layer_id, "")
         self.assertTrue(warning)
@@ -544,140 +635,6 @@ class SettingsDialogLabelTooltipTests(unittest.TestCase):
                 self.assertTrue(label.testAttribute(Qt.WidgetAttribute.WA_AlwaysShowToolTips))
         finally:
             dialog.deleteLater()
-
-
-class BundledConfigAutoImportTests(unittest.TestCase):
-    """Settings.apply_bundled_config_if_present() - the auto-import that
-    lets a colleague's zip carry a ready-made configuration, applied with no
-    Import Settings click of their own. Tracked by the bundled file's own
-    content, not a one-shot flag - reinstalling the plugin never clears
-    QgsSettings, so a boolean "already done" would permanently block a later
-    reinstall carrying a newly re-exported file, which is exactly the bug
-    this replaced."""
-
-    def setUp(self):
-        self._ac_enabled = Settings.autocomplete_enabled()
-        self._layer_id = Settings.layer_id()
-        self._fields = {key: Settings.field(key) for key in Settings.FIELD_KEYS}
-        self._hash = Settings._bundled_config_hash()
-        Settings._set_bundled_config_hash("")
-        Settings.set_autocomplete_enabled(False)
-        Settings.set_layer_id("")
-
-    def tearDown(self):
-        Settings.set_autocomplete_enabled(self._ac_enabled)
-        Settings.set_layer_id(self._layer_id)
-        for key, value in self._fields.items():
-            Settings.set_field(key, value)
-        Settings._set_bundled_config_hash(self._hash)
-
-    def test_no_bundled_file_does_nothing(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            result = Settings.apply_bundled_config_if_present(Path(tmp))
-        self.assertIsNone(result)
-        self.assertEqual(Settings._bundled_config_hash(), "")
-
-    def test_a_bundled_file_is_applied_even_when_something_is_already_configured(self):
-        """Regression: reinstalling the plugin never clears QgsSettings, so
-        by the time a colleague (or the same person, re-testing) reinstalls
-        with a bundled file, autocomplete is almost always already
-        "configured" from before - that must not block the import."""
-        from _rtl_plugin import rtl_settings as settings_module
-
-        Settings.set_autocomplete_enabled(True)
-        Settings.set_layer_id("some-pre-existing-id")
-
-        with tempfile.TemporaryDirectory() as tmp:
-            plugin_dir = Path(tmp)
-            data_dir = plugin_dir / "data"
-            data_dir.mkdir()
-            (data_dir / "lookup.geojson").write_text(_GEOJSON_SAMPLE, encoding="utf-8")
-
-            config = {
-                "rtl_expression_editor_settings": True,
-                "autocomplete_enabled": True,
-                "autocomplete_fields": {"field_names": "field_name", "value": "value"},
-                "autocomplete_layer": {
-                    "name": "lookup",
-                    "provider": "ogr",
-                    "path_relative_to_plugin": "data/lookup.geojson",
-                    "path_absolute": None,
-                    "uri_suffix": "",
-                },
-            }
-            (plugin_dir / settings_module.BUNDLED_CONFIG_FILENAME).write_text(
-                json.dumps(config), encoding="utf-8"
-            )
-
-            warnings = Settings.apply_bundled_config_if_present(plugin_dir)
-
-            self.assertEqual(warnings, [])
-            self.assertTrue(Settings.autocomplete_enabled())
-            self.assertNotEqual(Settings.layer_id(), "some-pre-existing-id")
-            layer = Settings.autocomplete_layer()
-            self.assertIsNotNone(layer)
-            QgsProject.instance().removeMapLayer(layer.id())
-
-    def test_the_same_unchanged_file_is_not_reapplied_on_a_later_call(self):
-        """Regression guard the other way: once a given bundled file's
-        content has been applied, running again with THE SAME bytes must be
-        a no-op - otherwise a later, unrelated Settings change would be
-        silently reverted on every subsequent QGIS startup."""
-        from _rtl_plugin import rtl_settings as settings_module
-
-        with tempfile.TemporaryDirectory() as tmp:
-            plugin_dir = Path(tmp)
-            (plugin_dir / settings_module.BUNDLED_CONFIG_FILENAME).write_text(
-                json.dumps({"rtl_expression_editor_settings": True, "max_suggested_values": 7}),
-                encoding="utf-8",
-            )
-            first = Settings.apply_bundled_config_if_present(plugin_dir)
-            self.assertIsNotNone(first)
-
-            Settings.set_max_suggested_values(99)  # a later, unrelated manual change
-            second = Settings.apply_bundled_config_if_present(plugin_dir)
-
-        self.assertIsNone(second)
-        self.assertEqual(Settings.max_suggested_values(), 99)  # left untouched
-
-    def test_a_changed_bundled_file_is_applied_again(self):
-        """A new export (different content, same filename) - e.g. a second
-        reinstall with an updated bundled config - must be picked up, not
-        blocked by the previous file having already been applied."""
-        from _rtl_plugin import rtl_settings as settings_module
-
-        with tempfile.TemporaryDirectory() as tmp:
-            plugin_dir = Path(tmp)
-            config_path = plugin_dir / settings_module.BUNDLED_CONFIG_FILENAME
-            config_path.write_text(
-                json.dumps({"rtl_expression_editor_settings": True, "max_suggested_values": 7}),
-                encoding="utf-8",
-            )
-            first = Settings.apply_bundled_config_if_present(plugin_dir)
-            self.assertIsNotNone(first)
-            self.assertEqual(Settings.max_suggested_values(), 7)
-
-            config_path.write_text(
-                json.dumps({"rtl_expression_editor_settings": True, "max_suggested_values": 42}),
-                encoding="utf-8",
-            )
-            second = Settings.apply_bundled_config_if_present(plugin_dir)
-
-        self.assertIsNotNone(second)
-        self.assertEqual(Settings.max_suggested_values(), 42)
-
-    def test_a_malformed_bundled_file_is_not_recorded_as_applied(self):
-        from _rtl_plugin import rtl_settings as settings_module
-
-        with tempfile.TemporaryDirectory() as tmp:
-            plugin_dir = Path(tmp)
-            (plugin_dir / settings_module.BUNDLED_CONFIG_FILENAME).write_text(
-                "{not valid json", encoding="utf-8"
-            )
-            result = Settings.apply_bundled_config_if_present(plugin_dir)
-
-        self.assertIsNone(result)
-        self.assertEqual(Settings._bundled_config_hash(), "")
 
 
 if __name__ == "__main__":

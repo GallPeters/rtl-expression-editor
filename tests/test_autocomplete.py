@@ -254,6 +254,64 @@ class AutocompletePopupFlowTests(unittest.TestCase):
         self.assertEqual(self.controller._popup_title, "")
 
 
+class PopupTitleDescriptionEnrichmentTests(unittest.TestCase):
+    """The title also shows the dataset's/field's own configured
+    description, e.g. "context (הקשר)" or "STATUS (מצב)" - sourced from the
+    lookup table's Table description / Field description columns."""
+
+    def setUp(self):
+        reset_plugin_settings()
+        self.context_layer = make_context_layer(("STATUS", "COUNTRY"))
+        self.lookup_layer = make_lookup_layer()
+        QgsProject.instance().addMapLayers([self.context_layer, self.lookup_layer])
+
+        Settings.set_autocomplete_enabled(True)
+        Settings.set_layer_id(self.lookup_layer.id())
+        Settings.set_field("field_names", "field_name")
+        Settings.set_field("value", "value")
+        Settings.set_field("description", "description")
+        Settings.set_field("table", "table")
+        Settings.set_field("table_description", "table_description")
+        Settings.set_field("field_description", "field_description")
+        ac.cache().invalidate()
+
+        self.editor = QPlainTextEdit()
+        self.editor.layer = lambda: self.context_layer
+        self.controller = ac.CustomAutocompleteController(self.editor)
+
+    def tearDown(self):
+        self.controller.teardown()
+        QgsProject.instance().removeMapLayers([self.context_layer.id(), self.lookup_layer.id()])
+        reset_plugin_settings()
+        ac.cache().invalidate()
+
+    def _set_text_and_cursor(self, text: str, position: int) -> None:
+        self.editor.setPlainText(text)
+        cursor = self.editor.textCursor()
+        cursor.setPosition(position)
+        self.editor.setTextCursor(cursor)
+
+    def test_fields_title_is_enriched_with_the_table_description(self):
+        self._set_text_and_cursor('"', 1)
+        self.controller.trigger()
+        self.assertEqual(self.controller._popup_title, "context (הקשר)")
+
+    def test_values_title_is_enriched_with_the_field_description(self):
+        text = "\"STATUS\" = '"
+        self._set_text_and_cursor(text, len(text))
+        self.controller.trigger()
+        self.assertEqual(self.controller._popup_title, "STATUS (מצב)")
+
+    def test_title_has_no_parenthetical_when_no_description_is_configured(self):
+        Settings.set_field("table_description", "")
+        Settings.set_field("field_description", "")
+        ac.cache().invalidate()
+
+        self._set_text_and_cursor('"', 1)
+        self.controller.trigger()
+        self.assertEqual(self.controller._popup_title, "context")
+
+
 class AutocompletePopupTitleRenderingTests(unittest.TestCase):
     """AutocompletePopup.populate()'s title row - inserted above every group,
     and sized larger than a group header so the hierarchy stays legible."""

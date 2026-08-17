@@ -84,38 +84,31 @@ regardless of what the plugin folder itself is called.
 The Settings dialog's **Export Settings** / **Import Settings** buttons save
 and load the whole configuration - including the autocomplete lookup layer
 and its column mapping - as a JSON file. To hand a ready-made setup to
-colleagues without asking them to configure anything themselves:
+colleagues:
 
 1. Configure the plugin normally, pointing the lookup layer at a data file
    copied *inside* the plugin's own install folder (e.g.
    `<plugin folder>/data/lookup.gpkg`).
-2. Click **Export Settings**, saving it with its suggested default name and
-   location - directly inside the plugin folder, alongside `rtl_editor.py`.
-   When the lookup layer's file lives inside that same folder, the exported
-   file also records its path *relative* to it, not the absolute path on
-   your own machine.
-3. Zip up the plugin folder as usual, with the data file and the exported
-   JSON file both included inside it.
-4. A colleague installs the zip - that's it. The next time the plugin
-   activates, it notices the bundled settings file sitting next to its own
-   modules and imports it automatically, locating and loading the bundled
-   data file from its recorded relative path, wherever their profile
-   happens to install the plugin. No Import Settings click needed, nothing
-   to configure by hand.
+2. Click **Export Settings**. When the lookup layer's file lives inside that
+   same folder, the exported file also records its path *relative* to it,
+   not the absolute path on your own machine.
+3. Zip up the plugin folder, with the data file and the exported JSON file
+   both included inside it.
+4. A colleague installs the zip, then opens **Settings** and clicks
+   **Import Settings**, picking the JSON file bundled inside the plugin
+   folder. Its lookup layer is located and loaded automatically from the
+   relative path recorded in the file - reused if a matching layer is
+   already in the project, otherwise loaded fresh - wherever their profile
+   happens to install the plugin.
 
-This is tracked by the bundled file's own content, not by whether
-autocomplete already looks configured - reinstalling the plugin never
-clears its settings, so it applies the bundled file whether this is a
-genuinely fresh install or a reinstall over an existing one (e.g. while
-testing the zip yourself). It only skips re-applying a file whose exact
-content has already been imported before, so a later, unrelated change made
-through the Settings dialog is never silently reverted on the next startup
-- and a new export replacing that file (a newer, updated zip) is always
-picked up again.
-
-Prefer to do it manually instead? The Settings dialog's **Export Settings** /
-**Import Settings** buttons work the same way at any time, for one-off
-sharing or for updating an already-configured installation.
+If the layer cannot be resolved, every other setting is still applied and
+the reason is reported clearly: **not found** (no file exists at the
+recorded path - it was not actually bundled, or ended up somewhere else) or
+**not accessible** (a file was found but could not be opened - permissions
+or an unsupported format - or a database connection failed, most often
+because credentials are missing: usernames and passwords are deliberately
+never written into an exported file, so each colleague still needs their
+own valid login to that database).
 
 A lookup layer that lives outside the plugin folder (a database connection,
 or a file elsewhere on disk) is still exported for convenience, but only as

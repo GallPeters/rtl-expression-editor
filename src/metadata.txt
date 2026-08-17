@@ -9,7 +9,7 @@ about=QGIS's built-in editor (QScintilla) does not display right-to-left text co
 
     The plugin also offers an optional advanced auto-complete system. Choose any project layer and its fields as the source of allowed values, with optional descriptions, groups and group descriptions. Press Ctrl+Space to complete either a field name or a value, and the suggestions adapt automatically to the field being queried and to the layer you are working on.
 
-    When a custom auto-complete source is configured, an optional Read Mode switch appears inside the editor. Read Mode shows the value descriptions instead of the stored codes, making a long expression far easier tounderstand, and never alters the expression itself. Where the same code has different meanings in different groups, the description you picked is saved in the project file and restored automatically, so Read Mode always shows the right one, for everyone who opens the project.
+    When a custom auto-complete source is configured, an optional Read Mode switch appears inside the editor. Read Mode shows the value descriptions instead of the stored codes, making a long expression far easier tounderstand, and never alters the expression itself. Where the same code has different meanings in different groups, the description you picked is saved in the project file and restored automatically, so Read Mode always shows the right one, for everyone who opens the project. An optional second, alternative description per value adds a third switch position for a different wording of the same descriptions.
 
     The whole configuration, including the auto-complete source, can be exported to a file and imported again elsewhere - useful for sharing a ready-made setup with colleagues.
 version=1.5
@@ -28,47 +28,26 @@ deprecated=False
 hasProcessingProvider=no
 server=False
 
-** v1.5 (16.08.2026):
+** v1.5 (17.08.2026):
   - Added: the suggestion list now shows a title - the dataset/layer name when naming a field, the field name when picking its value.
-  - Added: Export Settings / Import Settings in the Settings dialog, saving and loading the whole configuration as a JSON file.
-  - Added: an imported configuration can locate its autocomplete lookup layer automatically when bundled inside the plugin folder, even after a reinstall to a different location.
-  - Added: a settings file bundled next to the plugin's own files is now imported automatically when the plugin activates, so a preconfigured plugin needs no setup at all after installing, even when reinstalling over a previous configuration.
-  - Improved: detailed tooltips throughout the Settings dialog, with concrete examples, for anyone configuring custom autocomplete for the first time.
-  - Improved: the new title above the suggestion list is shown larger than a group heading, for a clear visual hierarchy, without dominating the rest of the list.
+  - Added: optional Table description / Field description columns, shown in parentheses in those titles (e.g. "buildings (מבנים)") and, for fields, in Read mode too.
+  - Added: an optional Alternative value description column, giving the Read mode switch a third position alongside Edit and Read - values already described do not need reselecting, the alternative is picked up automatically.
+  - Added: Export Settings / Import Settings in the Settings dialog, saving and loading the whole configuration - including the autocomplete lookup layer - as a JSON file.
+  - Improved: detailed tooltips throughout the Settings dialog, with concrete examples.
+  - Improved: the suggestion list title is shown a little larger than a group heading, for a clear visual hierarchy.
   - Improved: the Settings window can now be resized freely, with its contents scrolling instead of forcing a very tall window.
+  - Improved: importing settings now reports clearly whether a missing lookup layer was not found or not accessible (e.g. a database needing credentials).
+  - Improved: a database connection's username and password are never written into an exported settings file.
   - Fixed: tooltips on settings parameters now also appear when hovering their name, not only their input control, including while disabled.
   - Fixed: importing settings that successfully restored the autocomplete layer no longer left a stale "layer is no longer in this project" warning on screen.
-  - Fixed: a bundled/imported configuration now loads its lookup layer into the project even if "Enable custom autocomplete source" was left unticked when it was exported.
-  - Fixed: the automatic bundled-settings import could silently fail to run after reinstalling the plugin over an existing configuration.
 
 ** v1.4 (12.08.2026):
-  - Added: Ctrl+Space now also suggests fields, functions and variables, with signatures and help.
-  - Added: typing parentheses shows the function's signature and description.
-  - Added: selecting a word now highlights its other occurrences, including while using Find.
-  - Added: autocomplete now works even without a configured lookup table.
-  - Added: suggestions now also appear automatically while typing, not only with Ctrl+Space.
-  - Added: a function helper now shows the function name and its arguments while typing inside it.
-  - Added: a setting for how many values are suggested when no lookup table is configured.
-  - Added: Enter / Shift+Enter in the Ctrl+H replace bar now replace one occurrence or all occurrences.
-  - Added: a test suite covering the editor, its sync with the core editor, autocomplete, the function helper and every other feature.
-  - Added: a "Run Tests" button in Settings, for development checkouts, showing a pass/fail summary and the full log.
-  - Improved: the suggestion list is now grouped exactly like the Expression Builder's own categories.
-  - Improved: functions in the suggestion list now show only their name, not their arguments.
-  - Improved: simplified suggestion rules - field names after ", values after ', everything else otherwise.
-  - Improved: the function helper now follows the caret and the window, and opens or closes automatically when moving in or out of a function call.
-  - Improved: the function helper now shows the current argument in color and no longer shows a description.
-  - Improved: word highlighting now always matches whole words only, with the selected word shown clearly and other matches shown in a lighter, but still clearly visible, color.
-  - Improved: the suggestion list and function helper are now positioned further from the text so they no longer overlap it.
-  - Improved: the function helper's current argument is now shown in blue instead of red.
-  - Fixed: a crash that could break autocomplete ("cannot import name _find_context_layer").
-  - Fixed: the suggestion list and function helper sometimes opened without pressing Ctrl+Space.
-  - Fixed: the function helper could get stuck on screen after switching to another window.
-  - Fixed: selecting a suggestion sometimes duplicated quote characters.
-  - Fixed: the plugin name showed as "RTL BiDi Editor" in the Log Messages panel.
-  - Fixed: pressing Escape while the suggestion list was open could close the whole window instead of just the list.
-  - Fixed: pressing Enter in the Ctrl+H replace field could replace all occurrences instead of just the current one.
-  - Fixed: shrinking the window could show duplicate scrollbars; only the RTL editor's own remain, positioned clear of the read-mode switch.
-  - Fixed: on Linux, the suggestion list could flash open and immediately disappear.
+  - Added: Ctrl+Space (and automatic suggestions while typing) for fields, functions, variables and values, with signatures and help - works even without a configured lookup table.
+  - Added: a function helper showing the name and arguments while typing inside a call, with the current argument highlighted, following the caret and the window.
+  - Added: whole-word occurrence highlighting, including while using Find; Enter/Shift+Enter in the Ctrl+H replace bar to replace one or all occurrences; a setting for how many values are suggested without a lookup table.
+  - Added: a full test suite, plus a "Run Tests" button in Settings for development checkouts.
+  - Improved: the suggestion list is grouped like the Expression Builder's own categories and shows functions by name only; the suggestion list and function helper sit clear of the text instead of overlapping it.
+  - Fixed: a crash that could break autocomplete, duplicated quotes on accepting a suggestion, duplicate scrollbars, a suggestion-list flash on Linux, the function helper getting stuck on screen or the suggestion list closing the whole window instead of itself, and Enter in the Ctrl+H replace field sometimes replacing every occurrence instead of just the current one.
 
 ** v1.3 (10.08.2026):
   - Improved: the suggestion list now shows values without their surrounding quotes.

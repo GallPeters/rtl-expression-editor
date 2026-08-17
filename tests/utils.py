@@ -42,7 +42,14 @@ def make_context_layer(field_names: Sequence[str] = ("NAME", "COUNTRY")) -> QgsV
 
 
 def make_lookup_layer() -> QgsVectorLayer:
-    """A lookup table using the same column roles the Settings dialog offers."""
+    """A lookup table using the same column roles the Settings dialog offers.
+
+    Includes the table/field/alternative description columns too, so a
+    single fixture covers both the plain lookup tests and the description
+    ones - COUNTRY/IL deliberately has no alt_description, to also exercise
+    "falls back to the primary description when this row has no alternative
+    of its own".
+    """
     return make_layer(
         "None",
         "lookup",
@@ -50,34 +57,46 @@ def make_lookup_layer() -> QgsVectorLayer:
             ("field_name", QVariant.String),
             ("value", QVariant.String),
             ("description", QVariant.String),
+            ("alt_description", QVariant.String),
             ("group_code", QVariant.String),
             ("group_description", QVariant.String),
             ("table", QVariant.String),
+            ("table_description", QVariant.String),
+            ("field_description", QVariant.String),
         ],
         [
             {
                 "field_name": "STATUS",
                 "value": "1",
                 "description": "Active",
+                "alt_description": "פעיל",
                 "group_code": "G1",
                 "group_description": "State",
                 "table": "context",
+                "table_description": "הקשר",
+                "field_description": "מצב",
             },
             {
                 "field_name": "STATUS",
                 "value": "2",
                 "description": "Inactive",
+                "alt_description": "לא פעיל",
                 "group_code": "G1",
                 "group_description": "State",
                 "table": "context",
+                "table_description": "הקשר",
+                "field_description": "מצב",
             },
             {
                 "field_name": "COUNTRY",
                 "value": "IL",
                 "description": "Israel",
+                "alt_description": "",
                 "group_code": "",
                 "group_description": "",
                 "table": "context",
+                "table_description": "הקשר",
+                "field_description": "מדינה",
             },
         ],
     )

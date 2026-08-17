@@ -815,6 +815,109 @@ class AutocompleteCache(QObject):
         self._memo[key] = [AutocompleteEntry(value=n) for n in names]
         return names
 
+    def lookup_table_description(self, table_candidates: Sequence[str]) -> str:
+        """The Table description column's value for this table context, if
+        configured and found - e.g. table 'buildings' described as 'מבנים'.
+        Used to enrich the fields suggestion list's title (see
+        ``CustomAutocompleteController._layer_display_name``). Empty string
+        when no such column is configured, or nothing matches.
+        """
+        usable, _ = Settings.autocomplete_is_usable()
+        f_table_desc = Settings.field("table_description")
+        f_table = Settings.field("table")
+        if not (usable and f_table_desc and f_table and table_candidates):
+            return ""
+        self._sync_layer_hooks()
+
+        key = ("\x00table-desc", "|".join(sorted(t.lower() for t in table_candidates)))
+        cached = self._memo.get(key)
+        if cached is not None:
+            return cached[0].value if cached else ""
+
+        layer = Settings.autocomplete_layer()
+        description = ""
+        try:
+            column = QgsExpression.quotedColumnRef(f_table)
+            ors = " OR ".join(
+                f"lower(trim({column})) = {QgsExpression.quotedString(t.lower())}"
+                for t in table_candidates
+            )
+            request = QgsFeatureRequest().setFilterExpression(ors)
+            request.setLimit(50)  # the first non-empty match is enough
+            try:
+                request.setFlags(QgsFeatureRequest.Flag.NoGeometry)
+            except Exception:
+                pass
+            for feature in layer.getFeatures(request):
+                value = self._as_text(feature, f_table_desc)
+                if value:
+                    description = value
+                    break
+        except Exception as exc:
+            _dbg(f"Table-description lookup failed: {exc}")
+            description = ""
+
+        # Cache a miss too (as an empty list), so a table with genuinely no
+        # description configured is not re-queried on every keystroke.
+        self._memo[key] = [AutocompleteEntry(value=description)] if description else []
+        return description
+
+    def lookup_field_description(self, field_name: str, table_candidates: Sequence[str]) -> str:
+        """The Field description column's value for this field, if
+        configured and found - e.g. field 'type' described as 'סוג'. Used to
+        enrich the values suggestion list's title, and read mode's
+        field-name annotation. Empty string when no such column is
+        configured, or nothing matches.
+        """
+        if not field_name:
+            return ""
+        usable, _ = Settings.autocomplete_is_usable()
+        f_field_desc = Settings.field("field_description")
+        f_names = Settings.field("field_names")
+        if not (usable and f_field_desc and f_names):
+            return ""
+        self._sync_layer_hooks()
+
+        needle = field_name.strip().lower()
+        key = (
+            f"\x00field-desc:{needle}",
+            "|".join(sorted(t.lower() for t in table_candidates)),
+        )
+        cached = self._memo.get(key)
+        if cached is not None:
+            return cached[0].value if cached else ""
+
+        layer = Settings.autocomplete_layer()
+        f_table = Settings.field("table")
+        description = ""
+        try:
+            column = QgsExpression.quotedColumnRef(f_names)
+            clauses = [f"lower(trim({column})) = {QgsExpression.quotedString(needle)}"]
+            if f_table and table_candidates:
+                tcolumn = QgsExpression.quotedColumnRef(f_table)
+                ors = " OR ".join(
+                    f"lower(trim({tcolumn})) = {QgsExpression.quotedString(t.lower())}"
+                    for t in table_candidates
+                )
+                clauses.append(f"({ors})")
+            request = QgsFeatureRequest().setFilterExpression(" AND ".join(clauses))
+            request.setLimit(50)
+            try:
+                request.setFlags(QgsFeatureRequest.Flag.NoGeometry)
+            except Exception:
+                pass
+            for feature in layer.getFeatures(request):
+                value = self._as_text(feature, f_field_desc)
+                if value:
+                    description = value
+                    break
+        except Exception as exc:
+            _dbg(f"Field-description lookup failed: {exc}")
+            description = ""
+
+        self._memo[key] = [AutocompleteEntry(value=description)] if description else []
+        return description
+
     def _query(self, field_name: str, table_candidates: Sequence[str]) -> List[AutocompleteEntry]:
         """Run up to four increasingly permissive passes until one finds rows.
 
@@ -1922,8 +2025,11 @@ class CustomAutocompleteController(QObject):
         if kind == "fields":
             # Naming a field: the title is WHICH dataset/layer its fields
             # belong to, so a user working across several layers is never in
-            # doubt about which one this list describes.
-            self._popup_title = self._layer_display_name(layer)
+            # doubt about which one this list describes. Enriched with the
+            # dataset's own Table description column, e.g. "buildings (מבנים)".
+            name = self._layer_display_name(layer)
+            description = cache().lookup_table_description(tables) if usable else ""
+            self._popup_title = f"{name} ({description})" if name and description else name
             return self._field_entries(layer, usable, tables)
         if kind == "values":
             # Typing a value: the title is WHICH field it belongs to. Set to
@@ -1933,7 +2039,9 @@ class CustomAutocompleteController(QObject):
             self._popup_title = ""
             entries = self._value_entries(text_before, layer, usable, tables)
             if entries:
-                self._popup_title = self._field_name
+                field = self._field_name
+                description = cache().lookup_field_description(field, tables) if usable else ""
+                self._popup_title = f"{field} ({description})" if field and description else field
             return entries
         if kind == "variables":
             self._popup_title = ""

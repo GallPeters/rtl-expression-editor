@@ -74,16 +74,6 @@ CONFIG_MARKER = "rtl_expression_editor_settings"
 #: forward-compatible) plugin version still applies whatever it recognises.
 CONFIG_FORMAT_VERSION = 1
 
-#: Filename Export Settings suggests by default, and the one auto-imported
-#: on plugin activation whenever it is found sitting next to the plugin's
-#: own modules with content not already applied to this profile - see
-#: Settings.apply_bundled_config_if_present(). Using the same name for both
-#: halves is what makes "export, then drop the file in the plugin folder
-#: before zipping it up" work with no extra step: a colleague who installs
-#: that zip gets it applied automatically, without ever opening the Settings
-#: dialog themselves.
-BUNDLED_CONFIG_FILENAME = "rtl_expression_editor_settings.json"
-
 
 class SettingsImportError(Exception):
     """The file as a whole could not be applied - wrong format, or not
@@ -274,6 +264,21 @@ class Settings:
         "description": "ac/field_description",
         "group_code": "ac/field_group_code",
         "group_description": "ac/field_group_description",
+        #: A human/localised description of a whole TABLE, e.g. table
+        #: "buildings" described as "מבנים" - shown in parentheses next to
+        #: the dataset name in the fields suggestion list's title.
+        "table_description": "ac/field_table_description",
+        #: A human/localised description of a FIELD NAME, e.g. field "type"
+        #: described as "סוג" - shown in parentheses next to the field name
+        #: in the values suggestion list's title, and next to the field
+        #: name itself in read mode.
+        "field_description": "ac/field_field_description",
+        #: An optional second description alongside the primary "description"
+        #: (now labelled "Value description column" in the dialog) for the
+        #: same value - a meta-description of it, e.g. a formal description
+        #: plus a colloquial one. Enables the read-mode switch's third,
+        #: alternative-description position - see rtl_readmode.py.
+        "alt_description": "ac/field_alt_description",
     }
 
     @classmethod
@@ -454,114 +459,29 @@ class Settings:
         BUS.changed.emit()
         return warnings
 
-    # -- bundled config, applied automatically on activation --------------- #
-
-    @classmethod
-    def _bundled_config_hash(cls) -> str:
-        """A fingerprint of the last bundled file this profile applied.
-
-        Tracking by CONTENT rather than a plain "have we ever done this"
-        flag is what makes re-installing the plugin (uninstall, then install
-        a new zip that bundles a different, freshly re-exported settings
-        file) actually pick up the new file: uninstalling a plugin removes
-        its files, but never touches QgsSettings, which is where all of this
-        is stored - a one-shot boolean flag would stay set from a previous
-        install and permanently block every later one on the same profile,
-        which is exactly the bug this replaced.
-        """
-        return cls._get_str("ac/bundled_config_hash", "")
-
-    @classmethod
-    def _set_bundled_config_hash(cls, value: str) -> None:
-        cls._set("ac/bundled_config_hash", value or "")
-
-    @classmethod
-    def apply_bundled_config_if_present(cls, plugin_dir: Optional[Path] = None) -> Optional[List[str]]:
-        """Auto-import a settings file bundled next to the plugin's own
-        modules, if one is there - the distribute-a-preconfigured-plugin
-        workflow finished: export, drop the file (named
-        ``BUNDLED_CONFIG_FILENAME``) and the data file it points to inside
-        the plugin folder, zip it up: a colleague who installs that zip gets
-        it applied with no Import Settings click of their own.
-
-        Applies unconditionally whenever the bundled file's own content is
-        new to this profile - the same overwrite-without-asking behaviour
-        Import Settings already has, just run automatically. Deliberately
-        does NOT check whether autocomplete is "already configured" before
-        applying: since setting it up manually is the normal first step
-        before ever exporting a bundled file in the first place, that check
-        made this a no-op for exactly the reinstall-to-verify workflow it
-        exists for.
-
-        What it does guard against is reapplying the SAME bundled file over
-        and over: every field the file mentions is written on every
-        successful run, and doing that on every single QGIS startup would
-        silently revert any later, unrelated change made through the
-        Settings dialog back to the bundled values. A hash of the file's
-        content (see ``_bundled_config_hash()``) is recorded after a
-        successful apply, and skips a later run only when that exact
-        content is unchanged - a differently-exported bundled file (a new
-        zip with updated settings) always gets applied again.
-
-        Returns the warnings from ``apply_dict()`` if a (new) file was found
-        and applied, or ``None`` if nothing was done.
-        """
-        import hashlib
-
-        from qgis.core import Qgis, QgsMessageLog
-
-        def _report(message: str, level=Qgis.MessageLevel.Info) -> None:
-            try:
-                QgsMessageLog.logMessage(message, "RTL Expression Editor", level)
-            except Exception:
-                pass
-
-        base_dir = plugin_dir or Path(__file__).resolve().parent
-        candidate = base_dir / BUNDLED_CONFIG_FILENAME
-        try:
-            raw = candidate.read_bytes()
-        except Exception:
-            # The common case - a normal install has no such file - stays
-            # completely silent rather than logging on every startup.
-            return None
-
-        digest = hashlib.sha256(raw).hexdigest()
-        if digest == cls._bundled_config_hash():
-            _report(f"Bundled settings file found ({candidate}) but already imported; skipping.")
-            return None
-
-        try:
-            data = json.loads(raw.decode("utf-8"))
-            warnings = cls.apply_dict(data, plugin_dir=base_dir)
-        except Exception as exc:
-            _report(
-                f"Could not auto-import bundled settings ({candidate}): {exc}",
-                Qgis.MessageLevel.Warning,
-            )
-            return None  # hash not recorded - a later, fixed file gets a retry
-
-        cls._set_bundled_config_hash(digest)
-        _report(f"Bundled settings imported automatically from {candidate}.", Qgis.MessageLevel.Success)
-        for warning in warnings:
-            _report(f"Bundled settings: {warning}", Qgis.MessageLevel.Warning)
-        return warnings
-
 
 def _describe_layer_source(layer) -> dict:
     """Capture a layer's source portably, for ``Settings.export_dict()``.
 
-    File-based sources (Shapefile, GeoPackage, CSV, ...) get their path
-    recorded twice: as an absolute path (works if the importing machine
-    happens to have the same layout), and - when the file lives inside this
-    plugin's own directory - relative to that directory, which is what makes
-    "bundle the data file inside the plugin zip" actually work regardless of
-    where the plugin ends up installed. A database connection or an in-memory
-    layer has no such file to point at; only the raw values are recorded, on
-    a best-effort basis, since there is nothing portable to make relative.
+    ``kind`` says how ``_resolve_layer_from_description()`` should treat the
+    rest of the description:
+
+    * ``"file"`` - a filesystem path (Shapefile, GeoPackage, CSV, ...),
+      recorded both as an absolute path and, when the file lives inside this
+      plugin's own directory, relative to that directory - the latter is
+      what makes "bundle the data file inside the plugin zip" work regardless
+      of where the plugin ends up installed.
+    * ``"connection"`` - a database connection string or similar, which has
+      no file to bundle at all. Its username and password are deliberately
+      **never** recorded here - this description can end up in a shared,
+      zipped-up settings file, and credentials do not belong there. Every
+      colleague reconnecting to the same database still needs their own
+      valid login, exactly as if they had added the layer themselves.
     """
     info: Dict[str, Optional[str]] = {
         "name": "",
         "provider": "",
+        "kind": "file",
         "path_relative_to_plugin": None,
         "path_absolute": None,
         "uri_suffix": "",
@@ -588,9 +508,24 @@ def _describe_layer_source(layer) -> dict:
 
     # A real filesystem path never contains these - a memory layer's source
     # is a query string ("Point?crs=...&field=...") and a database URI is
-    # "key=value ..." pairs, neither of which is anything to make relative.
+    # "key=value ..." pairs, neither of which is a path to make relative.
     looks_like_path = bool(path_part) and not any(ch in path_part for ch in "?=&")
     if not looks_like_path:
+        info["kind"] = "connection"
+        try:
+            from qgis.core import QgsDataSourceUri
+
+            uri = QgsDataSourceUri(source)
+            if uri.username() or uri.password():
+                uri.setUsername("")
+                uri.setPassword("")
+                info["path_absolute"] = uri.uri()
+                return info
+        except Exception:
+            pass
+        # Not a recognisable credentialed URI (a memory layer's parameter
+        # string, or a connection form QgsDataSourceUri does not parse) -
+        # nothing sensitive to strip, kept as a best-effort reference.
         info["path_absolute"] = source or None
         return info
 
@@ -617,22 +552,61 @@ def _resolve_layer_from_description(info, plugin_dir: Optional[Path] = None) -> 
     a failed import from leaving the plugin's autocomplete pointed at
     nothing in a way that looks configured but silently is not.
 
-    Resolution order: reuse an already-loaded layer with a matching source
-    first (so importing the same file twice, or onto a project that already
-    has the layer, never adds a duplicate); otherwise load it fresh, trying
-    the plugin-relative path before the absolute one, since a plugin-relative
-    path is the one still valid after the plugin is reinstalled somewhere
-    else - the absolute path mainly helps re-importing on the same machine.
+    The warning distinguishes two genuinely different problems, so it is
+    clear which one to fix:
+
+    * **not found** - a file-based layer whose path does not exist at all
+      (never copied over, or copied somewhere else).
+    * **not accessible** - the path exists but the layer still failed to
+      load (permissions, a corrupted or unsupported file), or a database
+      connection could not be established (an unreachable server, or -
+      since credentials are deliberately never exported, see
+      ``_describe_layer_source()`` - missing login details that only the
+      original machine had configured).
     """
     if not isinstance(info, dict):
         return "", "The autocomplete layer description was malformed; not configured."
 
     name = str(info.get("name") or "lookup table")
     provider = str(info.get("provider") or "ogr")
+    kind = str(info.get("kind") or "file")
+    suffix = str(info.get("uri_suffix") or "")
+    project = QgsProject.instance()
+
+    if kind == "connection":
+        source = str(info.get("path_absolute") or "")
+        if not source:
+            return (
+                "",
+                f"Autocomplete layer '{name}' has no usable connection information "
+                "recorded; please reconfigure it manually in Settings.",
+            )
+        full_uri = source + suffix
+        for existing in project.mapLayers().values():
+            try:
+                if (existing.source() or "").strip() == full_uri.strip():
+                    return existing.id(), ""
+            except Exception:
+                continue
+        try:
+            from qgis.core import QgsVectorLayer
+
+            layer = QgsVectorLayer(full_uri, name, provider)
+        except Exception:
+            layer = None
+        if layer is not None and layer.isValid():
+            project.addMapLayer(layer)
+            return layer.id(), ""
+        return (
+            "",
+            f"Autocomplete layer '{name}' is not accessible - the connection could not "
+            "be established (unreachable server, or missing credentials that were never "
+            "included in the exported file). Reconnect it manually in Settings.",
+        )
+
+    # kind == "file" (also the default for an older export with no "kind").
     relative = info.get("path_relative_to_plugin")
     absolute = info.get("path_absolute")
-    suffix = str(info.get("uri_suffix") or "")
-
     base_dir = plugin_dir or Path(__file__).resolve().parent
     candidates: List[Path] = []
     if relative:
@@ -649,12 +623,9 @@ def _resolve_layer_from_description(info, plugin_dir: Optional[Path] = None) -> 
     if not candidates:
         return (
             "",
-            f"Autocomplete layer '{name}' has no usable path recorded (it was likely a "
-            "database or in-memory layer, which cannot be bundled); please configure it "
-            "manually.",
+            f"Autocomplete layer '{name}' has no usable path recorded; please "
+            "configure it manually in Settings.",
         )
-
-    project = QgsProject.instance()
 
     # 1. An already-loaded layer with the same source file wins outright.
     for path in candidates:
@@ -666,13 +637,23 @@ def _resolve_layer_from_description(info, plugin_dir: Optional[Path] = None) -> 
             except Exception:
                 continue
 
-    # 2. Load fresh from whichever candidate actually exists on disk.
+    existing_paths = []
     for path in candidates:
         try:
-            if not path.exists():
-                continue
+            if path.exists():
+                existing_paths.append(path)
         except Exception:
             continue
+
+    if not existing_paths:
+        tried = ", ".join(str(p) for p in candidates)
+        return (
+            "",
+            f"Autocomplete layer '{name}' could not be found (tried: {tried}). "
+            "Reselect it manually in Settings.",
+        )
+
+    for path in existing_paths:
         try:
             from qgis.core import QgsVectorLayer
 
@@ -683,11 +664,11 @@ def _resolve_layer_from_description(info, plugin_dir: Optional[Path] = None) -> 
         except Exception:
             continue
 
-    tried = ", ".join(str(p) for p in candidates)
     return (
         "",
-        f"Autocomplete layer '{name}' could not be found (tried: {tried}). "
-        "Autocomplete is left unconfigured until it is reselected in Settings.",
+        f"Autocomplete layer '{name}' exists at {existing_paths[0]} but is not "
+        "accessible - it could not be opened (check permissions or the file format). "
+        "Reselect it manually in Settings.",
     )
 
 
@@ -807,8 +788,11 @@ class SettingsDialog(QDialog):
                 ("field_names", "Field names column", False),
                 ("value", "Values column", False),
                 (None, None, None),  # separator: Optional
-                ("description", "Descriptions column", True),
+                ("description", "Value description column", True),
+                ("alt_description", "Alternative value description column", True),
                 ("table", "Table names column", True),
+                ("table_description", "Table description column", True),
+                ("field_description", "Field description column", True),
                 ("group_code", "Group codes column", True),
                 ("group_description", "Group descriptions column", True),
             ]
@@ -864,10 +848,36 @@ class SettingsDialog(QDialog):
             self.field_combos["description"].setToolTip(
                 "The column shown beside each value in the suggestion list, "
                 "e.g. value '1' with description 'Active' is offered as "
-                "'1 (Active)'.\n\n"
+                "'1 (Active)'. Also used in Read mode, in place of the code.\n\n"
                 "Only the value itself - never the description - is ever "
                 "inserted into the expression. Leave empty to show plain "
                 "values with no description."
+            )
+            self.field_combos["alt_description"].setToolTip(
+                "A second, alternative description for the same value - a "
+                "meta-description of the primary one above, e.g. a formal "
+                "wording alongside a colloquial one.\n\n"
+                "Setting this adds a third position to the editor's mode "
+                "switch: Edit mode, Read mode (the column above) and "
+                "Alternative read mode (this column). Values you have already "
+                "picked a description for do not need reselecting - the "
+                "alternative is looked up automatically, and updates on its "
+                "own if this column's data changes later."
+            )
+            self.field_combos["table_description"].setToolTip(
+                "A human/localised description of a whole TABLE, e.g. table "
+                "'buildings' described as 'מבנים'.\n\n"
+                "Shown in parentheses next to the dataset name at the top of "
+                "the suggestion list while naming a field (after typing "
+                "\"), e.g. 'buildings (מבנים)'."
+            )
+            self.field_combos["field_description"].setToolTip(
+                "A human/localised description of a FIELD NAME, e.g. field "
+                "'type' described as 'סוג'.\n\n"
+                "Shown in parentheses next to the field name at the top of "
+                "the suggestion list while typing its value (after typing '), "
+                "e.g. 'type (סוג)', and next to the field name itself in "
+                "Read mode."
             )
 
             self.cmb_layer.layerChanged.connect(self._on_layer_changed)
@@ -925,21 +935,23 @@ class SettingsDialog(QDialog):
             "lookup layer and its column mapping - to a JSON file.\n\n"
             "If the lookup layer's file lives inside this plugin's own "
             "install folder, the file it is saved to also records a path "
-            "relative to that folder. Distribute the exported file together "
-            "with that data file (e.g. both copied into the plugin's folder "
-            "before zipping it up) and 'Import Settings' will locate it "
-            "automatically on another machine, wherever the plugin ends up "
-            "installed."
+            "relative to that folder, so it still resolves after being "
+            "moved to a different plugin install - distribute it together "
+            "with that data file. A database connection is recorded with no "
+            "username or password (never written into a file that might be "
+            "shared) - each colleague still needs their own valid login for it."
         )
         self.btn_export.clicked.connect(self._export_settings)
         self.btn_import = QPushButton("Import Settings...", io_group)
         self.btn_import.setToolTip(
-            "Load a configuration previously saved with 'Export Settings'.\n\n"
-            "If its autocomplete lookup layer was bundled next to the "
-            "plugin, it is located and loaded automatically - no need to "
-            "pick it again. If it cannot be found, every other setting is "
-            "still applied and you are told exactly what to reconfigure by "
-            "hand."
+            "Load a configuration previously saved with 'Export Settings', "
+            "including reconnecting its autocomplete lookup layer if "
+            "possible - reusing it if already in the project, otherwise "
+            "loading it fresh from the path recorded in the file.\n\n"
+            "If the layer cannot be found or reached, every other setting is "
+            "still applied and you are told clearly why - not found (no "
+            "such path) or not accessible (found but could not be opened, "
+            "or a database connection failed)."
         )
         self.btn_import.clicked.connect(self._import_settings)
         io_buttons_row.addWidget(self.btn_export)
@@ -1046,21 +1058,27 @@ class SettingsDialog(QDialog):
 
         note = ""
         layer_info = data.get("autocomplete_layer")
-        if layer_info and layer_info.get("path_relative_to_plugin"):
+        if layer_info and layer_info.get("kind") == "connection":
+            note = (
+                "\n\nNote: the lookup layer is a database connection, not a "
+                "bundled file - its username and password were NOT included. "
+                "Whoever imports this still needs their own valid connection "
+                "to that same database."
+            )
+        elif layer_info and layer_info.get("path_relative_to_plugin"):
             note = (
                 "\n\nTo share this with a bundled lookup layer, copy the data "
                 "file into the plugin folder alongside this export before "
                 "zipping it up - the relative path recorded inside it will "
-                "then resolve correctly after installation, wherever that "
-                "turns out to be."
+                "then resolve correctly wherever the plugin ends up installed."
             )
         elif layer_info:
             note = (
                 "\n\nNote: the lookup layer's file is outside this plugin's "
                 "own folder, so only its absolute path was recorded - this "
-                "will only resolve automatically on a machine with the same "
-                "file layout. Move the data file inside the plugin folder "
-                "and re-export to make it fully portable."
+                "will only resolve on a machine with the same file layout. "
+                "Move the data file inside the plugin folder and re-export "
+                "to make it fully portable."
             )
         QMessageBox.information(self, "Export Settings", f"Settings exported to:\n{path}{note}")
 
