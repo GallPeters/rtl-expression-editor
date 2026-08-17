@@ -778,6 +778,52 @@ def occurrence_index(text_before: str, field: str, code: str) -> int:
     return count
 
 
+#: Left-to-Right Mark (U+200E) - zero-width, no glyph of its own, but a
+#: "strong LTR" character as far as the Unicode Bidi Algorithm is concerned.
+#: See force_ltr_paragraphs() for why read mode needs it. Spelled as an
+#: escape, not pasted as a literal invisible character, so it survives
+#: editors/diffs/encodings that might otherwise silently mangle it.
+_LRM = "‎"
+
+
+def force_ltr_paragraphs(text: str) -> str:
+    """Pin every paragraph (line) of read-mode preview text to an overall
+    left-to-right layout, regardless of which script its first character
+    happens to be - without changing a single visible character.
+
+    Qt determines a QTextDocument paragraph's bidi base direction from its
+    own first STRONG character (see RtlOverlayEditor's own comment on this -
+    it is exactly what lets a typed expression like ``"F_CODE" = 'בית כנסת'``
+    render correctly: the first strong character is the ``F`` of the field
+    name, so the paragraph resolves as left-to-right and the embedded Hebrew
+    literal is simply an RTL "island" within it, in its correct place).
+
+    A read-mode substitution can replace the FIELD NAME itself - normally
+    the very first token of the expression - with an RTL (e.g. Hebrew)
+    description. That silently makes an RTL character the paragraph's
+    FIRST strong character instead, flipping the WHOLE line's base
+    direction to RTL. Once that happens, the Unicode Bidi Algorithm does
+    not just render that one word right-to-left (correct, expected) - it
+    also visually mirrors the LTR/neutral structure around it: an
+    operator's position, and the order of a comma-separated list, both
+    end up reversed relative to the expression's own source order, even
+    though every individual word (English or Hebrew) is still spelled
+    correctly within itself.
+
+    Inserting a Left-to-Right Mark as the first character of every
+    paragraph anchors its base direction to LTR - matching how the
+    expression is actually written and edited in QGIS - regardless of what
+    script the first substituted token happens to be in. Every RTL run
+    (a Hebrew description) still renders correctly right-to-left WITHIN
+    itself; only the overall left-to-right ordering of the expression's own
+    structure is pinned, exactly matching the original, unsubstituted text's
+    layout.
+    """
+    if not text:
+        return text
+    return _LRM + text.replace("\n", "\n" + _LRM)
+
+
 def substitute_descriptions(
     text: str,
     mapping: Dict[str, Dict[str, List[str]]],
@@ -1134,6 +1180,12 @@ class ReadModeController(QObject):
             alt_mapping=alt_values,
             field_descriptions=field_descriptions,
         )
+        # A substituted field or value can now start with an RTL (e.g.
+        # Hebrew) description where the original expression had an LTR
+        # token - see force_ltr_paragraphs() for why that alone would
+        # otherwise flip the whole line's bidi base direction and visually
+        # mirror its structure, not just that one word.
+        preview = force_ltr_paragraphs(preview)
 
         self._active = True
         self._set_text_silently(preview)

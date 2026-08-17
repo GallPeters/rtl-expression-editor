@@ -130,6 +130,60 @@ class SubstituteDescriptionsTests(unittest.TestCase):
             rm.ChoiceMemory.invalidate()
 
 
+class ForceLtrParagraphsTests(unittest.TestCase):
+    """force_ltr_paragraphs() - pinning a read-mode preview's overall
+    layout to left-to-right regardless of which script its first
+    substituted token happens to be in.
+
+    Qt derives a paragraph's bidi base direction from its own first STRONG
+    character. A field description in Hebrew replacing what was originally
+    the expression's first (LTR) token would otherwise become that first
+    strong character and flip the WHOLE line's layout to right-to-left -
+    not just that one word (which should read right-to-left - it is
+    Hebrew), but the surrounding operator/parenthesis/list structure too,
+    silently reordering it relative to the original expression's own
+    left-to-right sequence. See RtlOverlayEditor's own comment on Qt's
+    per-paragraph bidi resolution for the mechanism this works around.
+    """
+
+    def test_prepends_the_left_to_right_mark(self):
+        result = rm.force_ltr_paragraphs("ישות = בית כנסת")
+        self.assertEqual(result[0], rm._LRM)
+        self.assertEqual(result[1:], "ישות = בית כנסת")
+
+    def test_every_line_of_a_multi_line_expression_gets_its_own_mark(self):
+        result = rm.force_ltr_paragraphs("ישות = בית כנסת\nמדינה = ישראל")
+        lines = result.split("\n")
+        self.assertEqual(len(lines), 2)
+        for line in lines:
+            self.assertEqual(line[0], rm._LRM)
+
+    def test_empty_text_is_left_alone(self):
+        self.assertEqual(rm.force_ltr_paragraphs(""), "")
+
+    def test_does_not_alter_any_visible_character(self):
+        original = "\"F_CODE\" IN (2300, 2301)"
+        result = rm.force_ltr_paragraphs(original)
+        self.assertEqual(result.replace(rm._LRM, ""), original)
+
+    def test_applied_after_substitution_the_fields_own_order_is_preserved(self):
+        """The end-to-end scenario reported: a Hebrew field description
+        replacing the field name must not cause the value description (or
+        a whole IN-list) to visually reorder relative to it."""
+        mapping = {"f_code": {"2300": ["בית כנסת"], "2301": ["מבנה חקלאי"]}}
+        expr = "\"F_CODE\" IN (2300, 2301)"
+        substituted = rm.substitute_descriptions(
+            expr, mapping, field_descriptions={"f_code": "ישות"}
+        )
+        # Logical order must already be field-desc, then IN, then the list
+        # in its original order - force_ltr_paragraphs() only pins how that
+        # order is laid out visually, it must never change it.
+        self.assertEqual(substituted, "ישות IN (בית כנסת, מבנה חקלאי)")
+
+        preview = rm.force_ltr_paragraphs(substituted)
+        self.assertEqual(preview, rm._LRM + "ישות IN (בית כנסת, מבנה חקלאי)")
+
+
 class OccurrenceIndexTests(unittest.TestCase):
     """occurrence_index(text_before, ...) counts matches WITHIN whatever
     slice it is given - callers pass the text up to (not including) the
@@ -633,6 +687,22 @@ class ReadModeControllerModeCountTests(unittest.TestCase):
 
             self.assertEqual(switch.mode(), 2)
             self.assertIn("פעיל", editor.toPlainText())
+        finally:
+            controller.teardown()
+
+    def test_read_mode_preview_is_pinned_left_to_right_when_a_field_description_leads(self):
+        """End-to-end: a Hebrew field description replacing what was
+        originally the expression's first (LTR) token must not flip the
+        whole line's bidi layout - see force_ltr_paragraphs()."""
+        Settings.set_field("field_description", "field_description")
+        editor = self._make_editor("\"STATUS\" = '1'")
+        controller = rm.ReadModeController(editor)
+        try:
+            controller._switch.setMode(1)  # edit -> read
+            text = editor.toPlainText()
+            self.assertEqual(text[0], rm._LRM)
+            self.assertIn("מצב", text)  # STATUS's own field description
+            self.assertIn("Active", text)
         finally:
             controller.teardown()
 

@@ -41,6 +41,7 @@ server=False
   - Improved: a database connection's username and password are never written into an exported settings file.
   - Fixed: tooltips on settings parameters now also appear when hovering their name, not only their input control, including while disabled.
   - Fixed: importing settings that successfully restored the autocomplete layer no longer left a stale "layer is no longer in this project" warning on screen.
+  - Fixed: a Hebrew field or value description replacing the start of an expression in Read mode could visually reverse the whole expression's left-to-right structure (operator position, list order) even though each word itself was still spelled correctly.
 
 ** v1.4 (12.08.2026):
   - Added: Ctrl+Space (and automatic suggestions while typing) for fields, functions, variables and values, with signatures and help - works even without a configured lookup table.
