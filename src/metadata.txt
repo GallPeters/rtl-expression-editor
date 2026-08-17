@@ -30,9 +30,10 @@ server=False
 
 ** v1.5 (17.08.2026):
   - Added: the suggestion list now shows a title - the dataset/layer name when naming a field, the field name when picking its value.
-  - Added: optional Table description / Field description columns, shown in parentheses in those titles (e.g. "buildings (מבנים)") and, for fields, in Read mode too.
-  - Added: an optional Alternative value description column, giving the Read mode switch a third position alongside Edit and Read - values already described do not need reselecting, the alternative is picked up automatically.
+  - Added: optional Table description / Field description columns, shown in parentheses next to each field name and beside that title, and, for fields, replacing the field name outright in Read mode.
+  - Added: an optional Alternative value description column, giving the Read mode switch a third position alongside Edit and Read - values already described do not need reselecting, the alternative is picked up automatically and travels safely inside the project for colleagues on any version.
   - Added: Export Settings / Import Settings in the Settings dialog, saving and loading the whole configuration - including the autocomplete lookup layer - as a JSON file.
+  - Improved: the Edit/Read mode switch is now a real slider - drag it, or click anywhere on it to jump straight to that mode, rather than only stepping forward one click at a time.
   - Improved: detailed tooltips throughout the Settings dialog, with concrete examples.
   - Improved: the suggestion list title is shown a little larger than a group heading, for a clear visual hierarchy.
   - Improved: the Settings window can now be resized freely, with its contents scrolling instead of forcing a very tall window.

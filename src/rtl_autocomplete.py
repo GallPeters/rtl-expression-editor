@@ -815,6 +815,62 @@ class AutocompleteCache(QObject):
         self._memo[key] = [AutocompleteEntry(value=n) for n in names]
         return names
 
+    def lookup_field_descriptions(self, table_candidates: Sequence[str]) -> Dict[str, str]:
+        """``field name (lowercased) -> its Field description column value``,
+        for every field with one configured in this table context.
+
+        Built in one query pass (unlike ``lookup_field_description()``,
+        which looks up a single field) so the fields suggestion list can
+        show every row's own description at once, e.g. "type (סוג)",
+        without one query per field. Empty when no Field description column
+        is configured.
+        """
+        usable, _ = Settings.autocomplete_is_usable()
+        f_field_desc = Settings.field("field_description")
+        f_names = Settings.field("field_names")
+        if not (usable and f_field_desc and f_names):
+            return {}
+        self._sync_layer_hooks()
+
+        key = ("\x00field-descriptions", "|".join(sorted(t.lower() for t in table_candidates)))
+        cached = self._memo.get(key)
+        if cached is not None:
+            return {entry.value: entry.description for entry in cached}
+
+        layer = Settings.autocomplete_layer()
+        f_table = Settings.field("table")
+        descriptions: Dict[str, str] = {}
+        try:
+            request = QgsFeatureRequest()
+            if f_table and table_candidates:
+                column = QgsExpression.quotedColumnRef(f_table)
+                ors = " OR ".join(
+                    f"lower(trim({column})) = {QgsExpression.quotedString(t.lower())}"
+                    for t in table_candidates
+                )
+                request.setFilterExpression(ors)
+            request.setLimit(QUERY_LIMIT)
+            try:
+                request.setFlags(QgsFeatureRequest.Flag.NoGeometry)
+            except Exception:
+                pass
+            for feature in layer.getFeatures(request):
+                field = self._as_text(feature, f_names).lower()
+                if not field or field in descriptions:
+                    continue
+                description = self._as_text(feature, f_field_desc)
+                if description:
+                    descriptions[field] = description
+        except Exception as exc:
+            _dbg(f"Field-descriptions lookup failed: {exc}")
+            return {}
+
+        self._memo[key] = [
+            AutocompleteEntry(value=field, description=description)
+            for field, description in descriptions.items()
+        ]
+        return descriptions
+
     def lookup_table_description(self, table_candidates: Sequence[str]) -> str:
         """The Table description column's value for this table context, if
         configured and found - e.g. table 'buildings' described as 'מבנים'.
@@ -2072,11 +2128,18 @@ class CustomAutocompleteController(QObject):
 
     @staticmethod
     def _field_entries(layer, usable: bool, tables: Sequence[str]) -> List[AutocompleteEntry]:
-        """Field names: the configured lookup table if set, else the layer's."""
+        """Field names: the configured lookup table if set, else the layer's.
+
+        Each entry's own Field description, when configured, is shown next
+        to its name, e.g. "type (סוג)" - the same enrichment already used for
+        the list's title, just per-row here.
+        """
         names: List[str] = []
+        descriptions: Dict[str, str] = {}
         if usable:
             try:
                 names = cache().lookup_field_names(tables)
+                descriptions = cache().lookup_field_descriptions(tables)
             except Exception as exc:
                 _dbg(f"Field-name lookup failed: {exc}")
         if not names:
@@ -2085,7 +2148,11 @@ class CustomAutocompleteController(QObject):
             AutocompleteEntry(
                 value=f'"{name}"',
                 group_code=GROUP_FIELDS,
-                display_text=name,
+                display_text=(
+                    f"{name} ({descriptions[name.lower()]})"
+                    if name.lower() in descriptions
+                    else name
+                ),
                 insert_text=f'"{name}"',
             )
             for name in names

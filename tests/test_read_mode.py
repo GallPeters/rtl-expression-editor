@@ -75,12 +75,14 @@ class SubstituteDescriptionsTests(unittest.TestCase):
                 project.removeEntry("rtl_bidi_editor", "value_choices")
             rm.ChoiceMemory.invalidate()
 
-    def test_field_names_are_annotated_with_their_configured_description(self):
+    def test_field_names_are_replaced_by_their_configured_description(self):
+        """Like a value's code, the field name disappears entirely in
+        favour of its description - no quotes, no parentheses."""
         expr = "\"TYPE\" = '1'"
         result = rm.substitute_descriptions(
             expr, {}, field_descriptions={"type": "סוג"}
         )
-        self.assertEqual(result, "\"TYPE\" (סוג) = '1'")
+        self.assertEqual(result, "סוג = '1'")
 
     def test_a_field_with_no_configured_description_is_left_untouched(self):
         expr = "\"TYPE\" = '1'"
@@ -313,29 +315,210 @@ class AlternativeDescriptionAutomaticEnrichmentTests(unittest.TestCase):
         self.assertEqual(alt_values["status"]["1"]["Enabled"], "מאופשר")
 
 
+class ChoiceMemoryAltDescriptionPersistenceTests(unittest.TestCase):
+    """Requirement: a value/description pair a colleague already selected
+    with v1.4 must never be deleted or altered by v1.5 - only enriched with
+    an automatically-added alternative description, stored as a SIBLING
+    entry inside the very same project property (see
+    ChoiceMemory._ALT_SUFFIX), so that:
+
+    * v1.4 (with no notion of an alternative at all) keeps reading exactly
+      the same primary description it always did, unaware the extra entry
+      even exists;
+    * v1.4 saving the project again later (e.g. after making some other,
+      unrelated new choice) does not drop the alternative - its own
+      remember() merges into the whole stored dict rather than replacing
+      it, so an entry it does not understand simply survives untouched;
+    * a v1.5 install opening the same project later - or the same install,
+      right after entering Alternative Read mode - has the alternative
+      available with nothing to reselect.
+    """
+
+    SCOPE = "rtl_bidi_editor"
+    KEY = "value_choices"
+
+    def setUp(self):
+        reset_plugin_settings()
+        self.layer = make_lookup_layer()
+        QgsProject.instance().addMapLayer(self.layer)
+        Settings.set_layer_id(self.layer.id())
+        Settings.set_field("field_names", "field_name")
+        Settings.set_field("value", "value")
+        Settings.set_field("description", "description")
+        Settings.set_field("table", "table")
+        rm.DescriptionResolver.invalidate()
+
+        self.project = QgsProject.instance()
+        self.original_choices, self.existed = self.project.readEntry(self.SCOPE, self.KEY, "")
+
+    def tearDown(self):
+        if self.existed:
+            self.project.writeEntry(self.SCOPE, self.KEY, self.original_choices)
+        else:
+            self.project.removeEntry(self.SCOPE, self.KEY)
+        rm.ChoiceMemory.invalidate()
+        reset_plugin_settings()
+        QgsProject.instance().removeMapLayer(self.layer.id())
+        rm.DescriptionResolver.invalidate()
+
+    def _v14_style_load(self):
+        """Mirrors exactly what v1.4's own ChoiceMemory._load() does - a
+        plain, blind ``str(v)`` over every value in the stored dict, with no
+        awareness that some keys might carry an alternative description."""
+        import json
+
+        raw, ok = self.project.readEntry(self.SCOPE, self.KEY, "")
+        if not (ok and raw):
+            return {}
+        parsed = json.loads(raw)
+        return {str(k): str(v) for k, v in parsed.items()}
+
+    def _enter_alt_mode_for_status_1(self):
+        """Stands in for the user actually switching to Alternative Read
+        mode - the trigger that resolves (and persists) the alternative."""
+        values, alt_values, _field_desc = rm.DescriptionResolver.mapping(["context"])
+        return rm._pick_label(
+            values["status"]["1"], "context", "status", "1", 0, "ctx", mode="alt",
+            alt_for_code=alt_values.get("status", {}).get("1", {}),
+        )
+
+    def test_a_v14_style_choice_survives_untouched_after_alt_is_persisted(self):
+        # A colleague on v1.4 picked "Active" for STATUS/1 from the popup -
+        # the ordinary remember() call, unchanged since v1.4.
+        rm.ChoiceMemory.remember("context", "status", "1", "Active", 0, "ctx")
+        self.assertEqual(rm.ChoiceMemory.recall("context", "status", "1", 0, "ctx"), "Active")
+
+        # The same project opened with v1.5, which now has an
+        # alt_description column configured - entering Alternative Read
+        # mode is what triggers the automatic persistence.
+        Settings.set_field("alt_description", "alt_description")
+        rm.DescriptionResolver.invalidate()
+        label = self._enter_alt_mode_for_status_1()
+        self.assertEqual(label, "פעיל")
+
+        # The primary choice is completely unaffected...
+        self.assertEqual(rm.ChoiceMemory.recall("context", "status", "1", 0, "ctx"), "Active")
+        # ...and the alternative is now persisted too.
+        self.assertEqual(rm.ChoiceMemory.recall_alt("context", "status", "1", 0, "ctx"), "פעיל")
+
+    def test_a_v14_install_reading_the_project_sees_only_the_plain_primary_description(self):
+        """The critical backward-compatibility guarantee: whatever v1.4's
+        own (unmodified) loading code would produce for the primary key must
+        still be the plain description text - never a Python dict repr or
+        anything else that would corrupt its own read mode."""
+        rm.ChoiceMemory.remember("context", "status", "1", "Active", 0, "ctx")
+        Settings.set_field("alt_description", "alt_description")
+        rm.DescriptionResolver.invalidate()
+        self._enter_alt_mode_for_status_1()
+
+        v14_view = self._v14_style_load()
+        primary_key = rm.ChoiceMemory._key("context", "status", "1", 0, "ctx")
+        self.assertEqual(v14_view[primary_key], "Active")
+        self.assertIsInstance(v14_view[primary_key], str)
+
+    def test_a_v14_install_re_saving_the_project_does_not_drop_the_alternative(self):
+        """v1.4's remember() loads the WHOLE dict, adds/updates its own key
+        and writes the WHOLE dict back - so an entry it does not understand
+        (the alternative) must still be there afterwards, unmodified by
+        having passed through v1.4's own code."""
+        rm.ChoiceMemory.remember("context", "status", "1", "Active", 0, "ctx")
+        Settings.set_field("alt_description", "alt_description")
+        rm.DescriptionResolver.invalidate()
+        self._enter_alt_mode_for_status_1()
+        self.assertEqual(rm.ChoiceMemory.recall_alt("context", "status", "1", 0, "ctx"), "פעיל")
+
+        # Simulate v1.4 making an unrelated new choice elsewhere and saving.
+        rm.ChoiceMemory.remember("context", "country", "IL", "Israel", 0, "ctx")
+
+        self.assertEqual(rm.ChoiceMemory.recall("context", "status", "1", 0, "ctx"), "Active")
+        self.assertEqual(rm.ChoiceMemory.recall_alt("context", "status", "1", 0, "ctx"), "פעיל")
+        self.assertEqual(rm.ChoiceMemory.recall("context", "country", "IL", 0, "ctx"), "Israel")
+
+    def test_no_alternative_is_persisted_for_a_value_that_was_never_actually_chosen(self):
+        """Only ever enriches an EXISTING remembered pair - never invents
+        one for a code the user simply typed by hand or never picked from
+        the suggestion list."""
+        Settings.set_field("alt_description", "alt_description")
+        rm.DescriptionResolver.invalidate()
+        self._enter_alt_mode_for_status_1()  # no remember() call beforehand
+        self.assertEqual(rm.ChoiceMemory.recall_alt("context", "status", "1", 0, "ctx"), "")
+
+
 class SlideSwitchTests(unittest.TestCase):
-    """The mode-cycling widget itself: 2 or 3 positions, one click always
-    advancing to the next, wrapping back to the first after the last."""
+    """The mode-cycling widget itself: a genuine slider, not a click-to-
+    advance toggle - tapping anywhere on the track jumps to the nearest
+    position (including directly to the far end, skipping the middle one),
+    and dragging follows the mouse live, snapping to the nearest position on
+    release.
+
+    Widget geometry is fixed at 38x18 (see SlideSwitch.__init__), so x=2 is
+    solidly within the leftmost (edit) zone, x=36 the rightmost, and x=19
+    the middle one for a 3-position switch - real synthetic QMouseEvents via
+    QTest, not switch.click(), since a real slider is driven by mouse
+    position, not a plain "clicked" signal.
+    """
+
+    @staticmethod
+    def _tap(switch, x: int) -> None:
+        from qgis.PyQt.QtCore import QPoint, Qt
+        from qgis.PyQt.QtTest import QTest
+
+        QTest.mouseClick(switch, Qt.MouseButton.LeftButton, pos=QPoint(x, 9))
+
+    @staticmethod
+    def _drag(switch, from_x: int, to_x: int) -> None:
+        from qgis.PyQt.QtCore import QPoint, Qt
+        from qgis.PyQt.QtTest import QTest
+
+        QTest.mousePress(switch, Qt.MouseButton.LeftButton, pos=QPoint(from_x, 9))
+        QTest.mouseMove(switch, QPoint(to_x, 9))
+        QTest.mouseRelease(switch, Qt.MouseButton.LeftButton, pos=QPoint(to_x, 9))
 
     def test_defaults_to_two_modes_and_starts_at_edit(self):
         switch = rm.SlideSwitch()
         try:
             self.assertEqual(switch.mode(), 0)
-            switch.click()
-            self.assertEqual(switch.mode(), 1)
-            switch.click()
-            self.assertEqual(switch.mode(), 0)  # wraps back to edit
         finally:
             switch.deleteLater()
 
-    def test_three_modes_cycle_through_all_three_before_wrapping(self):
+    def test_tapping_the_right_edge_jumps_directly_to_the_last_mode(self):
+        """Not just a forward step: a single tap can go straight from edit
+        to alternative, skipping read entirely."""
         switch = rm.SlideSwitch(mode_count=3)
         try:
-            seen = [switch.mode()]
-            for _ in range(3):
-                switch.click()
-                seen.append(switch.mode())
-            self.assertEqual(seen, [0, 1, 2, 0])
+            self._tap(switch, 36)
+            self.assertEqual(switch.mode(), 2)
+        finally:
+            switch.deleteLater()
+
+    def test_tapping_the_left_edge_returns_directly_to_edit(self):
+        switch = rm.SlideSwitch(mode_count=3)
+        try:
+            switch.setMode(2)
+            self._tap(switch, 2)
+            self.assertEqual(switch.mode(), 0)
+        finally:
+            switch.deleteLater()
+
+    def test_dragging_back_and_forth_lands_on_the_nearest_mode_each_time(self):
+        switch = rm.SlideSwitch(mode_count=3)
+        try:
+            self._drag(switch, 2, 36)  # edit -> alternative, in one slide
+            self.assertEqual(switch.mode(), 2)
+            self._drag(switch, 36, 2)  # alternative -> edit
+            self.assertEqual(switch.mode(), 0)
+            self._drag(switch, 2, 19)  # edit -> read
+            self.assertEqual(switch.mode(), 1)
+        finally:
+            switch.deleteLater()
+
+    def test_two_modes_only_ever_land_on_edit_or_read(self):
+        switch = rm.SlideSwitch(mode_count=2)
+        try:
+            self._tap(switch, 36)
+            self.assertEqual(switch.mode(), 1)
+            self._tap(switch, 2)
+            self.assertEqual(switch.mode(), 0)
         finally:
             switch.deleteLater()
 
@@ -353,8 +536,8 @@ class SlideSwitchTests(unittest.TestCase):
         seen = []
         switch.modeChanged.connect(seen.append)
         try:
-            switch.click()
-            switch.click()
+            self._tap(switch, 19)
+            self._tap(switch, 36)
             self.assertEqual(seen, [1, 2])
         finally:
             switch.deleteLater()
@@ -414,17 +597,42 @@ class ReadModeControllerModeCountTests(unittest.TestCase):
         editor = self._make_editor(original)
         controller = rm.ReadModeController(editor)
         try:
-            controller._switch.click()  # edit -> read
+            from qgis.PyQt.QtCore import QPoint, Qt
+            from qgis.PyQt.QtTest import QTest
+
+            switch = controller._switch
+
+            QTest.mouseClick(switch, Qt.MouseButton.LeftButton, pos=QPoint(19, 9))  # edit -> read
             self.assertIn("Active", editor.toPlainText())
             self.assertTrue(editor.isReadOnly())
 
-            controller._switch.click()  # read -> alternative read
+            QTest.mouseClick(switch, Qt.MouseButton.LeftButton, pos=QPoint(36, 9))  # read -> alt
             self.assertIn("פעיל", editor.toPlainText())
             self.assertTrue(editor.isReadOnly())
 
-            controller._switch.click()  # alternative read -> edit
+            QTest.mouseClick(switch, Qt.MouseButton.LeftButton, pos=QPoint(2, 9))  # alt -> edit
             self.assertEqual(editor.toPlainText(), original)
             self.assertFalse(editor.isReadOnly())
+        finally:
+            controller.teardown()
+
+    def test_dragging_directly_from_edit_to_alternative_skips_read(self):
+        """The slider is not limited to a fixed forward step - a single
+        slide (or tap) from one end straight to the other must work."""
+        Settings.set_field("alt_description", "alt_description")
+        editor = self._make_editor("\"STATUS\" = '1'")
+        controller = rm.ReadModeController(editor)
+        try:
+            from qgis.PyQt.QtCore import QPoint, Qt
+            from qgis.PyQt.QtTest import QTest
+
+            switch = controller._switch
+            QTest.mousePress(switch, Qt.MouseButton.LeftButton, pos=QPoint(2, 9))
+            QTest.mouseMove(switch, QPoint(36, 9))
+            QTest.mouseRelease(switch, Qt.MouseButton.LeftButton, pos=QPoint(36, 9))
+
+            self.assertEqual(switch.mode(), 2)
+            self.assertIn("פעיל", editor.toPlainText())
         finally:
             controller.teardown()
 

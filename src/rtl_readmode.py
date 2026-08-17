@@ -77,15 +77,17 @@ class SlideSwitch(QAbstractButton):
     small and low-contrast: it lives inside the editor, so it must read as a
     control without competing with the text.
 
-    Cycles through ``mode_count`` positions (2: edit/read, or 3: edit/read/
-    alternative read - see ``ReadModeController``) rather than being a plain
-    boolean: clicking always advances to the next mode, wrapping back to the
-    first after the last, which needs no more than one click target no matter
-    how many modes there are.
+    Has ``mode_count`` positions (2: edit/read, or 3: edit/read/alternative
+    read - see ``ReadModeController``), and behaves like a genuine slider
+    rather than a click-to-advance toggle: pressing anywhere on the track
+    jumps the knob to the nearest position, and dragging follows the mouse
+    continuously, snapping to whichever position is nearest on release - so
+    edit -> read -> edit -> alternative (skipping read entirely) all work in
+    one motion each, not just a fixed forward cycle.
     """
 
     #: Emitted with the new mode index (0 = edit) whenever it changes, either
-    #: by a click or by ``setMode()``.
+    #: by a click/drag or by ``setMode()``.
     modeChanged = pyqtSignal(int)
 
     def __init__(self, parent=None, mode_count: int = 2):
@@ -93,16 +95,20 @@ class SlideSwitch(QAbstractButton):
         self.setCheckable(False)
         self._mode_count = max(2, min(3, int(mode_count)))
         self._mode = 0
+        #: True between mousePressEvent and mouseReleaseEvent - while true,
+        #: paintEvent renders the knob at the live drag position instead of
+        #: snapped to ``_mode``.
+        self._dragging = False
+        self._drag_fraction = 0.0
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFixedSize(38, 18)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # never steal caret focus
-        self.clicked.connect(self._advance)
         self._update_tooltip()
 
     def _update_tooltip(self) -> None:
         current = _MODE_LABELS[self._mode]
         self.setToolTip(
-            f"{current}. Click to switch to the next mode.\n"
+            f"{current}. Click or drag to switch modes.\n"
             "The saved expression always keeps the original codes."
         )
 
@@ -132,8 +138,60 @@ class SlideSwitch(QAbstractButton):
             self._update_tooltip()
         self.update()
 
-    def _advance(self) -> None:
-        self.setMode((self._mode + 1) % self._mode_count)
+    # -- position <-> mode mapping ------------------------------------------ #
+
+    def _fraction_for_mode(self, mode: int) -> float:
+        return mode / (self._mode_count - 1) if self._mode_count > 1 else 0.0
+
+    def _mode_for_fraction(self, fraction: float) -> int:
+        if self._mode_count <= 1:
+            return 0
+        fraction = max(0.0, min(1.0, fraction))
+        return int(round(fraction * (self._mode_count - 1)))
+
+    def _fraction_for_x(self, x: float) -> float:
+        """Where along the track ``x`` (widget-local) falls, as 0..1."""
+        rect = QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0)
+        knob_d = rect.height() - 4.0
+        travel = rect.width() - knob_d - 4.0
+        if travel <= 0:
+            return 0.0
+        fraction = (x - rect.left() - 2.0 - knob_d / 2.0) / travel
+        return max(0.0, min(1.0, fraction))
+
+    @staticmethod
+    def _event_x(event) -> float:
+        """The event's widget-local X - PyQt6's QPointF-based position(),
+        falling back to the PyQt5 QPoint-based x() on older bindings."""
+        try:
+            return event.position().x()
+        except AttributeError:
+            return float(event.x())
+
+    # -- mouse-driven sliding ------------------------------------------------ #
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 (Qt override)
+        super().mousePressEvent(event)
+        self._dragging = True
+        self._drag_fraction = self._fraction_for_x(self._event_x(event))
+        self.update()
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802 (Qt override)
+        super().mouseMoveEvent(event)
+        if not self._dragging:
+            return
+        self._drag_fraction = self._fraction_for_x(self._event_x(event))
+        self.update()
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802 (Qt override)
+        super().mouseReleaseEvent(event)
+        if not self._dragging:
+            return
+        self._dragging = False
+        # Snaps to the nearest position, whether this was a quick tap (jump
+        # straight to wherever was clicked) or a drag (follow, then settle).
+        self.setMode(self._mode_for_fraction(self._drag_fraction))
+        self.update()
 
     def paintEvent(self, _event) -> None:  # noqa: N802 (Qt override)
         painter = QPainter(self)
@@ -142,7 +200,14 @@ class SlideSwitch(QAbstractButton):
         rect = QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0)
         radius = rect.height() / 2.0
 
-        track = _MODE_COLORS[min(self._mode, len(_MODE_COLORS) - 1)]
+        if self._dragging:
+            fraction = max(0.0, min(1.0, self._drag_fraction))
+            preview_mode = self._mode_for_fraction(fraction)
+        else:
+            fraction = self._fraction_for_mode(self._mode)
+            preview_mode = self._mode
+
+        track = _MODE_COLORS[min(preview_mode, len(_MODE_COLORS) - 1)]
         if not self.isEnabled():
             track = QColor("#d0d0d0")
 
@@ -152,7 +217,6 @@ class SlideSwitch(QAbstractButton):
 
         knob_d = rect.height() - 4.0
         travel = rect.width() - knob_d - 4.0
-        fraction = self._mode / (self._mode_count - 1) if self._mode_count > 1 else 0.0
         knob_x = rect.left() + 2.0 + fraction * travel
         painter.setBrush(QColor("#ffffff"))
         painter.setPen(Qt.PenStyle.NoPen)
@@ -411,6 +475,26 @@ class ChoiceMemory:
     SCOPE = "rtl_bidi_editor"
     KEY = "value_choices"
 
+    #: Appended to an occurrence's ordinary key to store its alternative
+    #: description alongside the already-remembered primary one, in the
+    #: SAME JSON blob under the SAME project entry - see remember_alt().
+    #:
+    #: This is deliberately NOT a nested structure (e.g.
+    #: {key: {"description": ..., "alt": ...}}) - _key() is what an older
+    #: install (v1.4, with no notion of an alternative description at all)
+    #: still reconstructs when it calls recall(), and that older code's
+    #: _load() blindly does ``str(v) for v in parsed.values()``. A nested
+    #: value would stringify into Python's dict repr instead of the plain
+    #: description text, breaking that install's own read mode. Keeping the
+    #: alternative under its own SIBLING key - a plain string like every
+    #: other entry - means an older install simply never looks for it (it
+    #: only ever reconstructs the un-suffixed key) while still carrying it
+    #: through untouched the next time it loads-merges-and-rewrites the
+    #: whole dict (as remember() always does): the alternative "waits" in
+    #: the project file for whichever install next understands it, without
+    #: ever disturbing the primary description any install already reads.
+    _ALT_SUFFIX = "\x1f\x02alt"
+
     _cache: Optional[Dict[str, str]] = None
     _hooked = False
 
@@ -507,6 +591,63 @@ class ChoiceMemory:
         mean "the user did not pick this one", so read mode shows every meaning.
         """
         return cls._load().get(cls._key(table, field, code, occurrence, context), "")
+
+    @classmethod
+    def remember_alt(
+        cls,
+        table: str,
+        field: str,
+        code: str,
+        occurrence: int,
+        context: str,
+        alt_description: str,
+    ) -> None:
+        """Persist an occurrence's alternative description alongside its
+        already-remembered primary one (see ``_ALT_SUFFIX``).
+
+        Called automatically by ``_pick_label()`` the first time alternative
+        mode actually renders a value the user already picked a (primary)
+        description for - so an already-selected value/description pair
+        never needs reselecting once an alternative-description column is
+        configured, and the alternative becomes part of the saved project
+        the next time it is saved, for any colleague's install to pick up.
+
+        A no-op without a primary choice already recorded for the same
+        occurrence: there is nothing to attach an alternative to otherwise -
+        this only ever enriches an existing pair, never invents one.
+        """
+        if not alt_description:
+            return
+        cls._ensure_hook()
+        data = cls._load()
+        primary_key = cls._key(table, field, code, occurrence, context)
+        if primary_key not in data:
+            return
+        alt_key = primary_key + cls._ALT_SUFFIX
+        if data.get(alt_key) == alt_description:
+            return
+        data[alt_key] = alt_description
+        try:
+            import json
+
+            from qgis.core import QgsProject
+
+            QgsProject.instance().writeEntry(cls.SCOPE, cls.KEY, json.dumps(data, ensure_ascii=False))
+        except Exception as exc:
+            _log(f"Could not persist alternative description: {exc}")
+
+    @classmethod
+    def recall_alt(
+        cls, table: str, field: str, code: str, occurrence: int = 0, context: str = ""
+    ) -> str:
+        """The persisted alternative description for this occurrence, or ""
+        if none has been recorded yet. Rendering itself always uses the
+        live lookup-table value (see ``_pick_label``) rather than this -
+        the persisted copy exists for portability across installs, not as a
+        competing source of truth.
+        """
+        key = cls._key(table, field, code, occurrence, context) + cls._ALT_SUFFIX
+        return cls._load().get(key, "")
 
     @classmethod
     def invalidate(cls) -> None:
@@ -657,9 +798,11 @@ def substitute_descriptions(
 
     ``mode="alt"`` renders each value's alternative description instead of its
     primary one - see ``_pick_label``. ``field_descriptions``, when given,
-    additionally annotates each quoted field reference itself, e.g. ``"TYPE"``
-    becomes ``"TYPE" (description)`` - independent of ``mode``, since a field's
-    own description is not a primary/alternative pair, just one label.
+    additionally replaces each quoted field reference itself with its own
+    description, e.g. ``"TYPE"`` becomes ``type's description`` - the same
+    relationship a value has to its description, not an annotation alongside
+    it - independent of ``mode``, since a field's own description is not a
+    primary/alternative pair, just one label.
     """
     field_descriptions = field_descriptions or {}
     if not mapping and not field_descriptions:
@@ -676,9 +819,13 @@ def substitute_descriptions(
             current_field = field.strip().lower()
             field_desc = field_descriptions.get(current_field)
             if field_desc:
+                # Replaces the whole "FIELDNAME", quotes included - exactly
+                # like a value's code disappears in favour of its
+                # description, not shown alongside it. No parentheses:
+                # this is the field's name AS the read-mode text, the same
+                # relationship a value has to its description.
                 out.append(text[last_end:match.start()])
-                out.append(match.group(0))  # the original "FIELDNAME", unchanged
-                out.append(f" ({field_desc})")
+                out.append(field_desc)
                 last_end = match.end()
             continue
 
@@ -759,30 +906,47 @@ def _pick_label(
     alternative-description column even existed "just work" once one is
     added: the remembered value is always the PRIMARY description text (see
     ChoiceMemory), and the alternative is looked up fresh, by that same text,
-    every time - never stored alongside the choice itself. Nothing needs
-    migrating; the very next read of alternative mode already reflects it.
+    every time - never stored alongside the choice itself for RENDERING.
+    Nothing needs migrating; the very next read of alternative mode already
+    reflects it. It is, however, additionally persisted (see
+    ChoiceMemory.remember_alt()) the moment it is resolved for a
+    already-remembered occurrence - not to decide what is shown, only so the
+    alternative travels with the project file itself from then on, for a
+    colleague on a different install (or version) of the plugin.
     """
     alt_for_code = alt_for_code or {}
 
-    def _render(description: str) -> str:
+    def _render(description: str, persist: bool) -> str:
         rendered = normalize_code(description)
         if mode != "alt":
             return rendered
         alt = alt_for_code.get(description, "")
-        return normalize_code(alt) if alt else rendered
+        if not alt:
+            return rendered
+        if persist:
+            try:
+                ChoiceMemory.remember_alt(table, field, code, occurrence, context, alt)
+            except Exception:
+                pass
+        return normalize_code(alt)
 
-    if len(candidates) == 1:
-        return _render(candidates[0])
-
+    # Checked BEFORE the single-candidate shortcut, not just for an
+    # ambiguous code: a value the user picked from the popup is remembered
+    # regardless of whether it was ambiguous at the time, and only a
+    # genuinely remembered occurrence is eligible for the automatic
+    # alternative-description persistence above.
     remembered = ChoiceMemory.recall(table, field, code, occurrence, context)
     if remembered and remembered in candidates:
-        return _render(remembered)
+        return _render(remembered, persist=True)
+
+    if len(candidates) == 1:
+        return _render(candidates[0], persist=False)
 
     if mode == "alt":
         # dict.fromkeys(): de-duplicated, order-preserving - two distinct
         # primary descriptions can share one alternative, or both fall back
         # to their own (different) primary text.
-        return " / ".join(dict.fromkeys(_render(candidate) for candidate in candidates))
+        return " / ".join(dict.fromkeys(_render(candidate, persist=False) for candidate in candidates))
     return " / ".join(normalize_code(candidate) for candidate in candidates)
 
 

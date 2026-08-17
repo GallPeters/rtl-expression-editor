@@ -311,6 +311,25 @@ class PopupTitleDescriptionEnrichmentTests(unittest.TestCase):
         self.controller.trigger()
         self.assertEqual(self.controller._popup_title, "context")
 
+    def test_each_field_in_the_fields_list_shows_its_own_description(self):
+        """Not just the list's title - each row's own configured Field
+        description too, e.g. "STATUS (מצב)" next to "COUNTRY (מדינה)"."""
+        self._set_text_and_cursor('"', 1)
+        self.controller.trigger()
+        displayed = {entry.display_text for entry in self.controller._entries}
+        self.assertIn("STATUS (מצב)", displayed)
+        self.assertIn("COUNTRY (מדינה)", displayed)
+
+    def test_a_field_with_no_configured_description_shows_its_bare_name(self):
+        Settings.set_field("field_description", "")
+        ac.cache().invalidate()
+
+        self._set_text_and_cursor('"', 1)
+        self.controller.trigger()
+        displayed = {entry.display_text for entry in self.controller._entries}
+        self.assertIn("STATUS", displayed)
+        self.assertNotIn("STATUS (מצב)", displayed)
+
 
 class AutocompletePopupTitleRenderingTests(unittest.TestCase):
     """AutocompletePopup.populate()'s title row - inserted above every group,
