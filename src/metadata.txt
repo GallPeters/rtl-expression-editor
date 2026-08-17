@@ -29,19 +29,11 @@ hasProcessingProvider=no
 server=False
 
 ** v1.5 (17.08.2026):
-  - Added: the suggestion list now shows a title - the dataset/layer name when naming a field, the field name when picking its value.
-  - Added: optional Table description / Field description columns, shown in parentheses next to each field name and beside that title, and, for fields, replacing the field name outright in Read mode.
-  - Added: an optional Alternative value description column, giving the Read mode switch a third position alongside Edit and Read - values already described do not need reselecting, the alternative is picked up automatically and travels safely inside the project for colleagues on any version.
-  - Added: Export Settings / Import Settings in the Settings dialog, saving and loading the whole configuration - including the autocomplete lookup layer - as a JSON file.
-  - Improved: the Edit/Read mode switch is now a real slider - drag it, or click anywhere on it to jump straight to that mode, rather than only stepping forward one click at a time.
-  - Improved: detailed tooltips throughout the Settings dialog, with concrete examples.
-  - Improved: the suggestion list title is shown a little larger than a group heading, for a clear visual hierarchy.
-  - Improved: the Settings window can now be resized freely, with its contents scrolling instead of forcing a very tall window.
-  - Improved: importing settings now reports clearly whether a missing lookup layer was not found or not accessible (e.g. a database needing credentials).
-  - Improved: a database connection's username and password are never written into an exported settings file.
-  - Fixed: tooltips on settings parameters now also appear when hovering their name, not only their input control, including while disabled.
-  - Fixed: importing settings that successfully restored the autocomplete layer no longer left a stale "layer is no longer in this project" warning on screen.
-  - Fixed: a Hebrew field or value description in Read mode could still visually reverse the expression's left-to-right structure - an operator's position, or the order of an IN (...) list - whenever two Hebrew descriptions sat right next to each other; each is now bidi-isolated individually, not just the line as a whole.
+  - Added: the suggestion list now shows a title - the dataset name when naming a field, the field name when picking its value - enriched with optional Table description / Field description columns, which also replace field names outright in Read mode.
+  - Added: an optional Alternative value description column, giving Read mode a third switch position - already-described values pick it up automatically, with nothing to reselect.
+  - Added: Export Settings / Import Settings, saving and loading the whole configuration - including the autocomplete lookup layer - as a JSON file, never including a database connection's own credentials.
+  - Improved: the Edit/Read switch is now a real slider; the Settings window is resizable, with detailed tooltips throughout and clearer import errors (not found vs. not accessible).
+  - Fixed: a Hebrew field or value description in Read mode could visually reverse the expression's own left-to-right structure; a few tooltip, resizing and stale-warning issues in the Settings dialog.
 
 ** v1.4 (12.08.2026):
   - Added: Ctrl+Space (and automatic suggestions while typing) for fields, functions, variables and values, with signatures and help - works even without a configured lookup table.
