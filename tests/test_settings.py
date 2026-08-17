@@ -111,7 +111,27 @@ class RunTestsButtonTests(unittest.TestCase):
             with mock.patch.object(settings_module, "__file__", fake_file):
                 found = SettingsDialog._tests_directory()
 
-        self.assertEqual(found, nested_tests)
+            # Compare canonical ("real") paths, not the raw strings:
+            # _tests_directory() derives its result from
+            # Path(__file__).resolve(), so on Windows it comes back in
+            # the OS's canonical long-name form - but on some setups (an
+            # older Windows 11 build, or independently, any temp directory
+            # whose name contains a space) tempfile.TemporaryDirectory()
+            # itself can hand back an 8.3 short-name alias instead (e.g.
+            # "RTL_EX~1" for "rtl_expression_editor"), which is the exact
+            # same directory on disk but a different string - resolving
+            # both sides here is what makes the comparison robust to that,
+            # rather than flakily failing on a spelling difference alone.
+            #
+            # Both sides must be resolved HERE, while the temporary
+            # directory still exists: Path.resolve() can only canonicalise
+            # a short-name alias by asking the OS to look the path up on
+            # disk, and silently falls back to plain string normalisation
+            # once the path no longer exists - which would just reproduce
+            # this same flaky mismatch outside the "with" block instead of
+            # fixing it.
+            self.assertIsNotNone(found)
+            self.assertEqual(found.resolve(), nested_tests.resolve())
 
     def test_button_is_created_when_tests_directory_is_found(self):
         from _rtl_plugin.rtl_settings import SettingsDialog
