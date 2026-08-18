@@ -33,6 +33,7 @@ server=False
   - Fixed: a Hebrew field or value description in Read mode could visually reverse the expression's own left-to-right structure - an operator's position, or the order of an IN (...) list.
   - Fixed: editing an expression's value/description choices no longer only ever accumulates entries in the project file - accepting the dialog (OK) now rewrites them to exactly match the edited expression, dropping anything no longer needed and correcting any choice an edit had shifted onto the wrong occurrence.
   - Fixed: removing a layer from the project now also removes its remembered value/description choices, instead of leaving them behind indefinitely.
+  - Added: a "Clear & Scan" button in Settings that removes remembered choices no longer used by a layer filter, and warns - without deleting - about any that no longer match the configured lookup table (e.g. a database-backed table whose values changed).
 
 ** v1.5 (17.08.2026):
   - Added: the suggestion list now shows a title - the dataset name when naming a field, the field name when picking its value - enriched with optional Table description / Field description columns, which also replace field names outright in Read mode.

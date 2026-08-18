@@ -957,6 +957,25 @@ class SettingsDialog(QDialog):
         io_buttons_row.addWidget(self.btn_export)
         io_buttons_row.addWidget(self.btn_import)
         io_layout.addLayout(io_buttons_row)
+
+        self.btn_clear_scan = QPushButton("Clear && Scan...", io_group)
+        self.btn_clear_scan.setToolTip(
+            "Clean up this project's remembered value/description choices for "
+            "the current autocomplete source.\n\n"
+            "Removes any choice that no longer corresponds to a layer filter "
+            "still using it (or whose layer has been removed from the project "
+            "entirely), then checks everything left against the currently "
+            "configured lookup table and reports anything that no longer "
+            "matches - e.g. a database-backed table whose values or "
+            "descriptions changed since a choice was made.\n\n"
+            "Only ever removes what it can prove is no longer needed - a "
+            "choice it cannot independently verify (a data-defined override, "
+            "a Field Calculator run, ...) is left untouched and only checked, "
+            "never deleted."
+        )
+        self.btn_clear_scan.clicked.connect(self._clear_and_scan)
+        io_layout.addWidget(self.btn_clear_scan)
+
         content_layout.addWidget(io_group)
 
         # -- Developer -------------------------------------------------------
@@ -1118,6 +1137,70 @@ class SettingsDialog(QDialog):
             )
         else:
             QMessageBox.information(self, "Import Settings", "Settings imported successfully.")
+
+    def _clear_and_scan(self) -> None:
+        """Clean up and verify this project's remembered value/description
+        choices - see ``ChoiceMemory.clear_and_scan()`` for exactly what it
+        does and, just as importantly, does not touch.
+
+        Imported locally, not at module level: ``rtl_readmode`` imports
+        ``Settings``/``BUS`` from this module, so importing back from it up
+        here would be a circular import - see the same pattern in
+        ``rtl_autocomplete.accept_current()``.
+        """
+        try:
+            from .rtl_readmode import ChoiceMemory
+        except Exception as exc:
+            QMessageBox.warning(self, "Clear & Scan", f"This feature is unavailable:\n{exc}")
+            return
+
+        self.btn_clear_scan.setEnabled(False)
+        QApplication.processEvents()
+        try:
+            deleted, total, failures = ChoiceMemory.clear_and_scan()
+        except Exception as exc:
+            QMessageBox.warning(self, "Clear & Scan", f"Clear & Scan failed:\n{exc}")
+            return
+        finally:
+            self.btn_clear_scan.setEnabled(True)
+
+        self._show_clear_scan_results(deleted, total, failures)
+
+    def _show_clear_scan_results(self, deleted: int, total: int, failures: List[str]) -> None:
+        """A small dialog: a coloured summary, then every mismatch found -
+        mirrors ``_show_test_results()``'s layout."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Clear & Scan Results")
+        dialog.resize(760, 500)
+        layout = QVBoxLayout(dialog)
+
+        summary = f"{deleted}/{total} old entries removed."
+        if failures:
+            color = "#b7791f"
+            summary += f" {len(failures)} remaining entries no longer match the lookup table."
+        else:
+            color = "#2e7d32"
+            summary += " Everything else still matches the lookup table."
+
+        lbl_summary = QLabel(summary, dialog)
+        lbl_summary.setStyleSheet(f"font-weight: bold; color: {color};")
+        lbl_summary.setWordWrap(True)
+        layout.addWidget(lbl_summary)
+
+        log_view = QPlainTextEdit(dialog)
+        log_view.setReadOnly(True)
+        log_view.setPlainText("\n".join(failures) if failures else "No mismatches found.")
+        log_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        layout.addWidget(log_view)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, dialog)
+        buttons.rejected.connect(dialog.reject)
+        close_button = buttons.button(QDialogButtonBox.StandardButton.Close)
+        if close_button is not None:
+            close_button.clicked.connect(dialog.accept)
+        layout.addWidget(buttons)
+
+        dialog.exec()
 
     # ------------------------------------------------------------------ #
     # Developer: run the test suite

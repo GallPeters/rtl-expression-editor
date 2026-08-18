@@ -717,6 +717,166 @@ class ChoiceMemory:
         return len(to_remove)
 
     @classmethod
+    def _parse_key(cls, key: str) -> Optional[Tuple[str, str, str, str, int]]:
+        """The inverse of ``_key()``: ``(context, table, field, code,
+        occurrence)``, or ``None`` for anything that is not a plain primary
+        key - an alternative-description shadow entry, or something not in
+        this shape at all."""
+        if key.endswith(cls._ALT_SUFFIX):
+            return None
+        context, sep, rest = key.partition("\x1e")
+        if not sep:
+            return None
+        parts = rest.split("\x1f")
+        if len(parts) != 4:
+            return None
+        table, field, code, occurrence_text = parts
+        try:
+            occurrence = int(occurrence_text)
+        except ValueError:
+            return None
+        return context, table, field, code, occurrence
+
+    @classmethod
+    def _delete_conceptual_entry(
+        cls, data: Dict[str, str], context: str, table: str, field: str, code: str, occurrence: int
+    ) -> None:
+        """Remove one occurrence's primary AND alternative keys from an
+        already-loaded ``data`` dict, in place - the batch counterpart to
+        ``forget()``, which reads/writes the project once per call and
+        would be wasteful called once per entry from ``clear_and_scan()``."""
+        primary_key = cls._key(table, field, code, occurrence, context)
+        data.pop(primary_key, None)
+        data.pop(primary_key + cls._ALT_SUFFIX, None)
+
+    #: The window's own objectName - not its (possibly translated)
+    #: windowTitle - that identifies a layer-FILTER expression context (the
+    #: one place clear_and_scan() can independently re-check without a live
+    #: dialog open, since a layer's current filter text is always just
+    #: layer.subsetString()). objectNames are set in code, so this does not
+    #: vary by the user's QGIS locale the way windowTitle would. Best-effort
+    #: across QGIS versions - an unrecognised context is simply never
+    #: treated as verifiable, never incorrectly treated as unused.
+    _LAYER_FILTER_CONTEXT_MARKERS = ("QgsQueryBuilderBase", "QgsQueryBuilder", "QgsQueryBuilderDialog")
+
+    @classmethod
+    def clear_and_scan(cls) -> Tuple[int, int, List[str]]:
+        """The Settings dialog's Clear & Scan action.
+
+        Two independent passes over every remembered choice in the project:
+
+        1. DELETE anything provably no longer relevant:
+
+           * the layer it belonged to is no longer in the project at all, or
+           * it is a layer FILTER choice specifically (the one context this
+             can re-derive without a live dialog - see
+             ``_LAYER_FILTER_CONTEXT_MARKERS``) and that exact occurrence no
+             longer exists in the layer's current filter text.
+
+           Anything else - a data-defined override, a Field Calculator run,
+           or any other expression slot this cannot independently
+           re-examine - is left alone. Only DEMONSTRATED absence is ever
+           acted on; an unverifiable context is never guessed at and never
+           deleted just because it could not be confirmed.
+
+        2. For everything NOT deleted, compare its field/code/description
+           (and alternative description, if one was recorded) against what
+           the configured lookup layer says RIGHT NOW, and report anything
+           that no longer matches as a warning, without touching it - this
+           is what surfaces a database-backed lookup table having changed
+           since a choice was made, which nothing else in the plugin would
+           ever notice on its own.
+
+        Returns ``(deleted_count, total_count, failures)``. Counts are of
+        whole choices - a primary entry plus its optional alternative
+        counts as one - not raw JSON keys.
+        """
+        cls._ensure_hook()
+        data = cls._load()
+
+        from qgis.core import QgsProject
+
+        project = QgsProject.instance()
+
+        entries: List[Tuple[str, str, str, str, int]] = []
+        seen = set()
+        for key in list(data):
+            parsed = cls._parse_key(key)
+            if parsed is not None and parsed not in seen:
+                seen.add(parsed)
+                entries.append(parsed)
+
+        total = len(entries)
+        deleted = 0
+        failures: List[str] = []
+        mapping_cache: Dict[str, ReadModeMapping] = {}
+
+        def _mapping_for(table_name: str) -> ReadModeMapping:
+            cache_key = table_name.lower()
+            if cache_key not in mapping_cache:
+                mapping_cache[cache_key] = DescriptionResolver.mapping([table_name] if table_name else [])
+            return mapping_cache[cache_key]
+
+        for context, table, field, code, occurrence in entries:
+            layer_id = context.rsplit("|", 1)[-1] if context else ""
+            layer = project.mapLayer(layer_id) if layer_id else None
+
+            if layer_id and layer is None:
+                # The layer itself is gone - nothing could ever use this again.
+                cls._delete_conceptual_entry(data, context, table, field, code, occurrence)
+                deleted += 1
+                continue
+
+            if layer is not None and context.split("|", 1)[0] in cls._LAYER_FILTER_CONTEXT_MARKERS:
+                live_matches = _scan_value_literals(layer.subsetString() or "")
+                still_present = any(
+                    f == field and c == code and occ == occurrence
+                    for f, c, _start, _end, occ in live_matches
+                )
+                if not still_present:
+                    cls._delete_conceptual_entry(data, context, table, field, code, occurrence)
+                    deleted += 1
+                    continue
+
+            # Kept - either confirmed still in use, or simply unverifiable
+            # from here - either way, check it against the lookup table.
+            primary_key = cls._key(table, field, code, occurrence, context)
+            description = data.get(primary_key, "")
+            values, alt_values, _field_descriptions = _mapping_for(table)
+            field_key = field.lower()
+            table_label = f"table \"{table}\"" if table else "the configured lookup table"
+
+            field_values = values.get(field_key)
+            if field_values is None:
+                failures.append(f'field "{field}" no longer exists in {table_label}')
+            elif code not in field_values:
+                failures.append(f'value {code} no longer exists for field "{field}" in {table_label}')
+            elif description and description not in field_values[code]:
+                failures.append(
+                    f'description "{description}" no longer describes value {code} '
+                    f'(field "{field}" in {table_label})'
+                )
+
+            alt_description = data.get(primary_key + cls._ALT_SUFFIX, "")
+            if alt_description:
+                current_alt = alt_values.get(field_key, {}).get(code, {}).get(description, "")
+                if current_alt != alt_description:
+                    failures.append(
+                        f'alternative description "{alt_description}" no longer matches '
+                        f'value {code} (description "{description}", field "{field}" in {table_label})'
+                    )
+
+        if deleted:
+            try:
+                import json
+
+                QgsProject.instance().writeEntry(cls.SCOPE, cls.KEY, json.dumps(data, ensure_ascii=False))
+            except Exception as exc:
+                _log(f"Could not write back after Clear & Scan: {exc}")
+
+        return deleted, total, failures
+
+    @classmethod
     def invalidate(cls) -> None:
         cls._cache = None
 

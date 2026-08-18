@@ -1112,5 +1112,154 @@ class ReadModeControllerModeCountTests(unittest.TestCase):
             controller.teardown()
 
 
+class ChoiceMemoryClearAndScanTests(unittest.TestCase):
+    """ChoiceMemory.clear_and_scan() - the Settings dialog's Clear & Scan
+    action: deletes only what it can PROVE is no longer needed (the layer
+    is gone, or a layer-filter occurrence no longer exists in the live
+    filter text), and warns about - without ever touching - anything left
+    whose field/code/description no longer matches what the currently
+    configured lookup table actually says."""
+
+    def setUp(self):
+        reset_plugin_settings()
+        self.context_layer = make_context_layer(("STATUS", "COUNTRY"))
+        self.lookup_layer = make_lookup_layer()
+        QgsProject.instance().addMapLayers([self.context_layer, self.lookup_layer])
+
+        Settings.set_autocomplete_enabled(True)
+        Settings.set_layer_id(self.lookup_layer.id())
+        Settings.set_field("field_names", "field_name")
+        Settings.set_field("value", "value")
+        Settings.set_field("description", "description")
+        Settings.set_field("alt_description", "alt_description")
+        Settings.set_field("table", "table")
+        rm.DescriptionResolver.invalidate()
+
+        self.project = QgsProject.instance()
+        self.original, self.existed = self.project.readEntry("rtl_bidi_editor", "value_choices", "")
+
+        # A recognised layer-filter context - its "in use" status can be
+        # re-derived from the layer's own live subsetString().
+        self.filter_context = f"QgsQueryBuilderBase|Query Builder|QgisApp|{self.context_layer.id()}"
+        # Stands in for a data-defined override / Field Calculator context -
+        # the layer exists, but this plugin has no way to independently
+        # re-derive whether it is still "in use" without a live dialog open.
+        self.override_context = f"SomeOverrideDialog|Symbol Properties|QgisApp|{self.context_layer.id()}"
+
+    def tearDown(self):
+        if self.existed:
+            self.project.writeEntry("rtl_bidi_editor", "value_choices", self.original)
+        else:
+            self.project.removeEntry("rtl_bidi_editor", "value_choices")
+        rm.ChoiceMemory.invalidate()
+        rm.DescriptionResolver.invalidate()
+        QgsProject.instance().removeMapLayers([self.context_layer.id(), self.lookup_layer.id()])
+        reset_plugin_settings()
+
+    def test_a_fully_valid_in_use_entry_is_never_touched(self):
+        self.context_layer.setSubsetString('"STATUS" = 1')
+        rm.ChoiceMemory.remember("context", "status", "1", "Active", 0, self.filter_context)
+        rm.ChoiceMemory.remember_alt("context", "status", "1", 0, self.filter_context, "פעיל")
+
+        deleted, total, failures = rm.ChoiceMemory.clear_and_scan()
+
+        self.assertEqual(deleted, 0)
+        self.assertEqual(total, 1)
+        self.assertEqual(failures, [])
+        self.assertEqual(rm.ChoiceMemory.recall("context", "status", "1", 0, self.filter_context), "Active")
+        self.assertEqual(rm.ChoiceMemory.recall_alt("context", "status", "1", 0, self.filter_context), "פעיל")
+
+    def test_removes_an_entry_whose_layer_no_longer_exists(self):
+        ghost_context = "QgsQueryBuilderBase|Query Builder|QgisApp|no-such-layer-id"
+        rm.ChoiceMemory.remember("context", "status", "1", "Active", 0, ghost_context)
+
+        deleted, total, failures = rm.ChoiceMemory.clear_and_scan()
+
+        self.assertEqual(deleted, 1)
+        self.assertEqual(total, 1)
+        self.assertEqual(failures, [])
+        self.assertEqual(rm.ChoiceMemory.recall("context", "status", "1", 0, ghost_context), "")
+
+    def test_removes_a_layer_filter_entry_no_longer_in_the_live_filter(self):
+        self.context_layer.setSubsetString("")  # cleared since the choice was made
+        rm.ChoiceMemory.remember("context", "status", "1", "Active", 0, self.filter_context)
+
+        deleted, total, failures = rm.ChoiceMemory.clear_and_scan()
+
+        self.assertEqual(deleted, 1)
+        self.assertEqual(total, 1)
+        self.assertEqual(failures, [])
+        self.assertEqual(rm.ChoiceMemory.recall("context", "status", "1", 0, self.filter_context), "")
+
+    def test_keeps_a_layer_filter_entry_still_present_in_the_live_filter(self):
+        self.context_layer.setSubsetString('"STATUS" = 1')
+        rm.ChoiceMemory.remember("context", "status", "1", "Active", 0, self.filter_context)
+
+        deleted, total, failures = rm.ChoiceMemory.clear_and_scan()
+
+        self.assertEqual(deleted, 0)
+        self.assertEqual(failures, [])
+        self.assertEqual(rm.ChoiceMemory.recall("context", "status", "1", 0, self.filter_context), "Active")
+
+    def test_an_unverifiable_context_is_never_deleted(self):
+        rm.ChoiceMemory.remember("context", "status", "1", "Active", 0, self.override_context)
+
+        deleted, _total, failures = rm.ChoiceMemory.clear_and_scan()
+
+        self.assertEqual(deleted, 0)
+        self.assertEqual(failures, [])
+        self.assertEqual(rm.ChoiceMemory.recall("context", "status", "1", 0, self.override_context), "Active")
+
+    def test_reports_a_field_that_no_longer_exists_in_the_lookup_table(self):
+        rm.ChoiceMemory.remember("context", "gone_field", "1", "Active", 0, self.override_context)
+
+        deleted, _total, failures = rm.ChoiceMemory.clear_and_scan()
+
+        self.assertEqual(deleted, 0)  # reported, never deleted
+        self.assertEqual(len(failures), 1)
+        self.assertIn("gone_field", failures[0])
+        self.assertIn("no longer exists", failures[0])
+
+    def test_reports_a_value_that_no_longer_exists_for_the_field(self):
+        rm.ChoiceMemory.remember("context", "status", "999", "Whatever", 0, self.override_context)
+
+        deleted, _total, failures = rm.ChoiceMemory.clear_and_scan()
+
+        self.assertEqual(deleted, 0)
+        self.assertEqual(len(failures), 1)
+        self.assertIn("999", failures[0])
+        self.assertIn("status", failures[0])
+
+    def test_reports_a_description_that_no_longer_matches(self):
+        rm.ChoiceMemory.remember("context", "status", "1", "Some Old Text", 0, self.override_context)
+
+        deleted, _total, failures = rm.ChoiceMemory.clear_and_scan()
+
+        self.assertEqual(deleted, 0)
+        self.assertEqual(len(failures), 1)
+        self.assertIn("Some Old Text", failures[0])
+
+    def test_reports_an_alternative_description_that_no_longer_matches(self):
+        rm.ChoiceMemory.remember("context", "status", "1", "Active", 0, self.override_context)
+        rm.ChoiceMemory.remember_alt("context", "status", "1", 0, self.override_context, "Some Old Alt")
+
+        deleted, _total, failures = rm.ChoiceMemory.clear_and_scan()
+
+        self.assertEqual(deleted, 0)
+        self.assertEqual(len(failures), 1)
+        self.assertIn("Some Old Alt", failures[0])
+
+    def test_deleted_and_total_counts_are_reported_correctly(self):
+        ghost_context = "QgsQueryBuilderBase|Query Builder|QgisApp|no-such-layer-id"
+        rm.ChoiceMemory.remember("context", "status", "1", "Active", 0, ghost_context)
+        rm.ChoiceMemory.remember("context", "status", "2", "Inactive", 0, self.override_context)
+
+        deleted, total, failures = rm.ChoiceMemory.clear_and_scan()
+
+        self.assertEqual(deleted, 1)
+        self.assertEqual(total, 2)
+        self.assertEqual(failures, [])  # the surviving entry still matches the lookup table
+
+
 if __name__ == "__main__":
     unittest.main()
