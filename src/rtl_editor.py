@@ -1486,12 +1486,50 @@ class RtlOverlayEditor(QPlainTextEdit):
                     # A fresh document should not start with a pending undo.
                     self.document().clearUndoRedoStacks()
             self._pull_cursor_from_sci()
+            # A full document replace resets every QTextBlock's visibility -
+            # if the text still starts with a hidden expression-identity
+            # comment (see hide_expression_identity_line()), keep it hidden.
+            self.hide_expression_identity_line()
         except RuntimeError:
             self._detached = True
         except Exception as exc:
             _log(f"Text pull failed: {exc}", Qgis.MessageLevel.Warning)
         finally:
             self._syncing = False
+
+    def hide_expression_identity_line(self) -> None:
+        """If the document's first line is one of this plugin's own hidden
+        expression-identity comments (see ``rtl_readmode.make_eid_comment``
+        / ``CustomAutocompleteController._ensure_eid``), collapse that one
+        ``QTextBlock`` so it is not rendered at all.
+
+        The text itself is completely untouched - still exactly what gets
+        pushed to Scintilla and saved - only its on-screen rendering is
+        suppressed, the same mechanism a code editor uses for folding a
+        collapsed region. Safe to call at any time; a no-op whenever the
+        first line is not one of these (including reverting a previously
+        hidden line back to visible, e.g. after an undo removes the
+        comment and leaves some other line first).
+        """
+        try:
+            from .rtl_readmode import extract_eid
+        except Exception:
+            return
+        try:
+            document = self.document()
+            first_block = document.firstBlock()
+            if not first_block.isValid():
+                return
+            is_id_line = bool(extract_eid(first_block.text()))
+            if first_block.isVisible() == (not is_id_line):
+                return  # already in the right state
+            first_block.setVisible(not is_id_line)
+            document.markContentsDirty(first_block.position(), first_block.length())
+            self.viewport().update()
+        except RuntimeError:
+            self._detached = True
+        except Exception as exc:
+            _log(f"Could not hide expression id line: {exc}", Qgis.MessageLevel.Info)
 
     def _pull_cursor_from_sci(self) -> None:
         """Mirror Scintilla's caret/selection into the overlay.

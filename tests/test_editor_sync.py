@@ -125,5 +125,57 @@ class CodeEditorWatcherTests(unittest.TestCase):
             dialog.close()
 
 
+class HideExpressionIdentityLineTests(unittest.TestCase):
+    """RtlOverlayEditor.hide_expression_identity_line() - collapses the
+    hidden expression-identity comment's own QTextBlock so it is not
+    rendered, without touching the underlying text at all - still exactly
+    what gets pushed to Scintilla and saved (see
+    CustomAutocompleteController._ensure_eid())."""
+
+    def setUp(self):
+        self.sci = QgsCodeEditorExpression()
+        self.dialog = host_in_dialog(self.sci)
+        self.dialog.show()
+        QApplication.processEvents()
+        self.overlay = ed.RtlOverlayEditor(self.sci)
+
+    def tearDown(self):
+        self.overlay.detach()
+        self.dialog.close()
+
+    def test_the_id_comments_own_block_is_hidden(self):
+        from _rtl_plugin.rtl_readmode import make_eid_comment
+
+        text = make_eid_comment("0123456789abcdef") + '"F_ATT" = 610'
+        self.overlay.setPlainText(text)
+        QApplication.processEvents()
+        self.overlay.hide_expression_identity_line()
+
+        self.assertFalse(self.overlay.document().firstBlock().isVisible())
+        # The text itself is completely untouched - still exactly what is
+        # pushed to Scintilla and saved.
+        self.assertEqual(self.overlay.toPlainText(), text)
+        self.assertEqual(self.sci.text(), text)
+
+    def test_plain_text_with_no_id_comment_is_left_fully_visible(self):
+        self.overlay.setPlainText('"F_ATT" = 610')
+        QApplication.processEvents()
+        self.overlay.hide_expression_identity_line()
+
+        self.assertTrue(self.overlay.document().firstBlock().isVisible())
+
+    def test_reapplies_automatically_after_a_full_resync_from_scintilla(self):
+        """A full document replace (any Scintilla -> overlay push) resets
+        every QTextBlock's own visibility - _pull_text_from_sci() must
+        re-hide the id line every time, not just once at attach."""
+        from _rtl_plugin.rtl_readmode import make_eid_comment
+
+        text = make_eid_comment("0123456789abcdef") + '"F_ATT" = 610'
+        self.sci.setText(text)
+        QApplication.processEvents()
+
+        self.assertFalse(self.overlay.document().firstBlock().isVisible())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -958,23 +958,45 @@ class SettingsDialog(QDialog):
         io_buttons_row.addWidget(self.btn_import)
         io_layout.addLayout(io_buttons_row)
 
+        scan_buttons_row = QHBoxLayout()
         self.btn_clear_scan = QPushButton("Clear && Scan...", io_group)
         self.btn_clear_scan.setToolTip(
             "Clean up this project's remembered value/description choices for "
             "the current autocomplete source.\n\n"
-            "Removes any choice that no longer corresponds to a layer filter "
-            "still using it (or whose layer has been removed from the project "
-            "entirely), then checks everything left against the currently "
-            "configured lookup table and reports anything that no longer "
-            "matches - e.g. a database-backed table whose values or "
-            "descriptions changed since a choice was made.\n\n"
-            "Only ever removes what it can prove is no longer needed - a "
-            "choice it cannot independently verify (a data-defined override, "
-            "a Field Calculator run, ...) is left untouched and only checked, "
-            "never deleted."
+            "Every choice made from now on is tagged with its own hidden id, "
+            "invisible while editing, that travels with its expression - so a "
+            "choice is removed the moment no expression anywhere in the "
+            "project still carries that id, precisely, no matter what kind "
+            "of expression it was (a filter, a data-defined override, a "
+            "labeling rule, ...).\n\n"
+            "A choice made before this existed has no such id - for those, "
+            "this falls back to the older check instead: removed if its "
+            "layer is gone, or (for a layer filter specifically) if that "
+            "exact value no longer appears in the filter text; otherwise "
+            "left untouched rather than guessed at.\n\n"
+            "Either way, everything left is then checked against the "
+            "currently configured lookup table, and anything that no longer "
+            "matches is reported - e.g. a database-backed table whose "
+            "values or descriptions changed since a choice was made."
         )
         self.btn_clear_scan.clicked.connect(self._clear_and_scan)
-        io_layout.addWidget(self.btn_clear_scan)
+        scan_buttons_row.addWidget(self.btn_clear_scan)
+
+        self.btn_reset_legacy = QPushButton("Reset Legacy Entries...", io_group)
+        self.btn_reset_legacy.setToolTip(
+            "Deletes every remembered choice made before this version - the "
+            "ones with no hidden id, which Clear & Scan can only check with "
+            "the older, less precise method (see its own tooltip).\n\n"
+            "A one-time, explicit reset: use it once, after upgrading a "
+            "project with a lot of pre-existing choices, so everything made "
+            "from then on is tracked precisely by Clear & Scan instead. Not "
+            "run automatically by Clear & Scan itself, since a choice "
+            "missing an id only means it predates this feature - never that "
+            "it is no longer needed."
+        )
+        self.btn_reset_legacy.clicked.connect(self._reset_legacy_entries)
+        scan_buttons_row.addWidget(self.btn_reset_legacy)
+        io_layout.addLayout(scan_buttons_row)
 
         content_layout.addWidget(io_group)
 
@@ -1154,6 +1176,21 @@ class SettingsDialog(QDialog):
             QMessageBox.warning(self, "Clear & Scan", f"This feature is unavailable:\n{exc}")
             return
 
+        confirmed = QMessageBox.question(
+            self,
+            "Clear & Scan",
+            "This checks every remembered value/description choice against "
+            "the project and the current lookup table.\n\n"
+            "Choices tagged with a hidden id (made from now on) are checked "
+            "by saving the project first, so the check reflects what is on "
+            "screen right now - this will save the project if it has unsaved "
+            "changes.\n\nContinue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if confirmed != QMessageBox.StandardButton.Yes:
+            return
+
         self.btn_clear_scan.setEnabled(False)
         QApplication.processEvents()
         try:
@@ -1165,6 +1202,50 @@ class SettingsDialog(QDialog):
             self.btn_clear_scan.setEnabled(True)
 
         self._show_clear_scan_results(deleted, total, failures)
+
+    def _reset_legacy_entries(self) -> None:
+        """Delete every remembered choice with no hidden id at all - a
+        deliberate, one-time reset. See
+        ``ChoiceMemory.reset_legacy_entries()`` for exactly what this does
+        and, just as importantly, why Clear & Scan never does it on its
+        own."""
+        try:
+            from .rtl_readmode import ChoiceMemory
+        except Exception as exc:
+            QMessageBox.warning(self, "Reset Legacy Entries", f"This feature is unavailable:\n{exc}")
+            return
+
+        confirmed = QMessageBox.question(
+            self,
+            "Reset Legacy Entries",
+            "This permanently deletes every remembered value/description "
+            "choice made before this version - anything with no hidden "
+            "tracking id. There is no undo.\n\n"
+            "Only do this once, deliberately - e.g. right after upgrading a "
+            "project with a lot of pre-existing choices - so everything "
+            "made from then on is tracked precisely by Clear & Scan "
+            "instead.\n\nContinue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirmed != QMessageBox.StandardButton.Yes:
+            return
+
+        self.btn_reset_legacy.setEnabled(False)
+        QApplication.processEvents()
+        try:
+            deleted, total = ChoiceMemory.reset_legacy_entries()
+        except Exception as exc:
+            QMessageBox.warning(self, "Reset Legacy Entries", f"Reset failed:\n{exc}")
+            return
+        finally:
+            self.btn_reset_legacy.setEnabled(True)
+
+        QMessageBox.information(
+            self,
+            "Reset Legacy Entries",
+            f"{deleted}/{total} legacy entries removed.",
+        )
 
     def _show_clear_scan_results(self, deleted: int, total: int, failures: List[str]) -> None:
         """A small dialog: a coloured summary, then every mismatch found -

@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 from qgis.core import QgsProject
+from qgis.PyQt.QtWidgets import QMessageBox
 
 from _rtl_plugin.rtl_settings import Settings, SettingsImportError
 
@@ -184,8 +185,8 @@ class ClearScanButtonTests(unittest.TestCase):
             dialog.deleteLater()
 
     def test_clicking_it_runs_clear_and_scan_and_shows_the_results(self):
-        """Exercises _clear_and_scan()'s own control flow - disable/run/
-        re-enable, handing the result to _show_clear_scan_results() -
+        """Exercises _clear_and_scan()'s own control flow - confirm/disable/
+        run/re-enable, handing the result to _show_clear_scan_results() -
         without needing a real project full of choices to scan."""
         from unittest import mock
 
@@ -194,6 +195,9 @@ class ClearScanButtonTests(unittest.TestCase):
         dialog = SettingsDialog()
         try:
             with mock.patch(
+                "_rtl_plugin.rtl_settings.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ), mock.patch(
                 "_rtl_plugin.rtl_readmode.ChoiceMemory.clear_and_scan", return_value=(3, 10, ["oops"])
             ) as mocked_scan, mock.patch.object(SettingsDialog, "_show_clear_scan_results") as mocked_show:
                 dialog._clear_and_scan()
@@ -201,6 +205,23 @@ class ClearScanButtonTests(unittest.TestCase):
             mocked_scan.assert_called_once()
             mocked_show.assert_called_once_with(3, 10, ["oops"])
             self.assertTrue(dialog.btn_clear_scan.isEnabled())
+        finally:
+            dialog.deleteLater()
+
+    def test_declining_the_confirmation_runs_nothing(self):
+        from unittest import mock
+
+        from _rtl_plugin.rtl_settings import SettingsDialog
+
+        dialog = SettingsDialog()
+        try:
+            with mock.patch(
+                "_rtl_plugin.rtl_settings.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.No,
+            ), mock.patch("_rtl_plugin.rtl_readmode.ChoiceMemory.clear_and_scan") as mocked_scan:
+                dialog._clear_and_scan()
+
+            mocked_scan.assert_not_called()
         finally:
             dialog.deleteLater()
 
@@ -212,12 +233,91 @@ class ClearScanButtonTests(unittest.TestCase):
         dialog = SettingsDialog()
         try:
             with mock.patch(
+                "_rtl_plugin.rtl_settings.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ), mock.patch(
                 "_rtl_plugin.rtl_readmode.ChoiceMemory.clear_and_scan", side_effect=RuntimeError("boom")
             ), mock.patch("_rtl_plugin.rtl_settings.QMessageBox.warning") as mocked_warning:
                 dialog._clear_and_scan()  # must not raise
 
             mocked_warning.assert_called_once()
             self.assertTrue(dialog.btn_clear_scan.isEnabled())
+        finally:
+            dialog.deleteLater()
+
+
+class ResetLegacyEntriesButtonTests(unittest.TestCase):
+    """The Settings dialog's "Reset Legacy Entries" button - a deliberate,
+    confirmation-gated, one-time action, distinct from Clear & Scan."""
+
+    def test_button_is_created(self):
+        from _rtl_plugin.rtl_settings import SettingsDialog
+
+        dialog = SettingsDialog()
+        try:
+            self.assertTrue(hasattr(dialog, "btn_reset_legacy"))
+            self.assertEqual(dialog.btn_reset_legacy.text(), "Reset Legacy Entries...")
+        finally:
+            dialog.deleteLater()
+
+    def test_clicking_it_confirms_then_runs_reset_and_reports_the_count(self):
+        from unittest import mock
+
+        from _rtl_plugin.rtl_settings import SettingsDialog
+
+        dialog = SettingsDialog()
+        try:
+            with mock.patch(
+                "_rtl_plugin.rtl_settings.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ), mock.patch(
+                "_rtl_plugin.rtl_readmode.ChoiceMemory.reset_legacy_entries", return_value=(7, 12)
+            ) as mocked_reset, mock.patch(
+                "_rtl_plugin.rtl_settings.QMessageBox.information"
+            ) as mocked_info:
+                dialog._reset_legacy_entries()
+
+            mocked_reset.assert_called_once()
+            mocked_info.assert_called_once()
+            self.assertIn("7/12", mocked_info.call_args[0][2])
+            self.assertTrue(dialog.btn_reset_legacy.isEnabled())
+        finally:
+            dialog.deleteLater()
+
+    def test_declining_the_confirmation_runs_nothing(self):
+        from unittest import mock
+
+        from _rtl_plugin.rtl_settings import SettingsDialog
+
+        dialog = SettingsDialog()
+        try:
+            with mock.patch(
+                "_rtl_plugin.rtl_settings.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.No,
+            ), mock.patch("_rtl_plugin.rtl_readmode.ChoiceMemory.reset_legacy_entries") as mocked_reset:
+                dialog._reset_legacy_entries()
+
+            mocked_reset.assert_not_called()
+        finally:
+            dialog.deleteLater()
+
+    def test_a_failure_in_reset_itself_is_reported_not_raised(self):
+        from unittest import mock
+
+        from _rtl_plugin.rtl_settings import SettingsDialog
+
+        dialog = SettingsDialog()
+        try:
+            with mock.patch(
+                "_rtl_plugin.rtl_settings.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ), mock.patch(
+                "_rtl_plugin.rtl_readmode.ChoiceMemory.reset_legacy_entries", side_effect=RuntimeError("boom")
+            ), mock.patch("_rtl_plugin.rtl_settings.QMessageBox.warning") as mocked_warning:
+                dialog._reset_legacy_entries()  # must not raise
+
+            mocked_warning.assert_called_once()
+            self.assertTrue(dialog.btn_reset_legacy.isEnabled())
         finally:
             dialog.deleteLater()
 

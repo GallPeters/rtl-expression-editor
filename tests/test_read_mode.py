@@ -2,7 +2,11 @@
 """Read mode: code/description substitution, ambiguous-code handling, and the
 mapping built from a configured lookup layer."""
 
+import shutil
+import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 
 from qgis.core import QgsProject
 from qgis.PyQt.QtWidgets import QPlainTextEdit
@@ -1259,6 +1263,292 @@ class ChoiceMemoryClearAndScanTests(unittest.TestCase):
         self.assertEqual(deleted, 1)
         self.assertEqual(total, 2)
         self.assertEqual(failures, [])  # the surviving entry still matches the lookup table
+
+    # -- expression-identity (eid) based verification ----------------------- #
+    # This is the precise path: an entry tagged with an id is deleted only
+    # when no expression anywhere in the (mocked) saved project text still
+    # carries that exact id - regardless of what KIND of expression it
+    # is, unlike the legacy layer-filter-only check above.
+
+    def test_an_eid_bearing_entry_is_deleted_when_its_marker_is_not_found(self):
+        eid = "deadbeefcafebabe"
+        rm.ChoiceMemory.remember(
+            "context", "status", "1", "Active", 0, self.override_context, eid=eid
+        )
+
+        with mock.patch(
+            "_rtl_plugin.rtl_readmode._read_project_text_for_scan", return_value="nothing relevant here"
+        ):
+            deleted, total, failures = rm.ChoiceMemory.clear_and_scan()
+
+        self.assertEqual(deleted, 1)
+        self.assertEqual(total, 1)
+        self.assertEqual(failures, [])
+        self.assertEqual(rm.ChoiceMemory.recall("context", "status", "1", 0, self.override_context), "")
+
+    def test_an_eid_bearing_entry_is_kept_when_its_marker_is_found(self):
+        eid = "deadbeefcafebabe"
+        rm.ChoiceMemory.remember(
+            "context", "status", "1", "Active", 0, self.override_context, eid=eid
+        )
+        project_text = f"...some xml... {rm.make_eid_comment(eid)} ...more xml..."
+
+        with mock.patch("_rtl_plugin.rtl_readmode._read_project_text_for_scan", return_value=project_text):
+            deleted, total, failures = rm.ChoiceMemory.clear_and_scan()
+
+        self.assertEqual(deleted, 0)
+        self.assertEqual(failures, [])
+        self.assertEqual(
+            rm.ChoiceMemory.recall("context", "status", "1", 0, self.override_context), "Active"
+        )
+
+    def test_an_eid_bearing_entry_is_kept_when_the_project_cannot_be_read(self):
+        """Never saved, or the save/read failed - cannot verify this run,
+        so nothing is deleted, matching every other "cannot verify"
+        fallback in this design."""
+        eid = "deadbeefcafebabe"
+        rm.ChoiceMemory.remember(
+            "context", "status", "1", "Active", 0, self.override_context, eid=eid
+        )
+
+        with mock.patch("_rtl_plugin.rtl_readmode._read_project_text_for_scan", return_value=None):
+            deleted, total, failures = rm.ChoiceMemory.clear_and_scan()
+
+        self.assertEqual(deleted, 0)
+        self.assertEqual(
+            rm.ChoiceMemory.recall("context", "status", "1", 0, self.override_context), "Active"
+        )
+
+    def test_eid_bearing_entries_are_still_validated_against_the_lookup_table(self):
+        eid = "deadbeefcafebabe"
+        rm.ChoiceMemory.remember(
+            "context", "status", "999", "Whatever", 0, self.override_context, eid=eid
+        )
+        project_text = rm.make_eid_comment(eid)
+
+        with mock.patch("_rtl_plugin.rtl_readmode._read_project_text_for_scan", return_value=project_text):
+            deleted, _total, failures = rm.ChoiceMemory.clear_and_scan()
+
+        self.assertEqual(deleted, 0)
+        self.assertEqual(len(failures), 1)
+        self.assertIn("999", failures[0])
+
+    def test_legacy_and_eid_bearing_entries_are_handled_independently_in_one_run(self):
+        ghost_context = "QgsQueryBuilderBase|Query Builder|QgisApp|no-such-layer-id"
+        rm.ChoiceMemory.remember("context", "status", "1", "Active", 0, ghost_context)  # legacy, dead layer
+        eid = "deadbeefcafebabe"
+        rm.ChoiceMemory.remember(
+            "context", "status", "2", "Inactive", 0, self.override_context, eid=eid
+        )  # id-bearing, not found
+
+        with mock.patch(
+            "_rtl_plugin.rtl_readmode._read_project_text_for_scan", return_value="nothing relevant"
+        ):
+            deleted, total, failures = rm.ChoiceMemory.clear_and_scan()
+
+        self.assertEqual(deleted, 2)
+        self.assertEqual(total, 2)
+        self.assertEqual(failures, [])
+
+
+class ExpressionIdentityTests(unittest.TestCase):
+    """new_eid() / make_eid_comment() / extract_eid() - the hidden id
+    comment mechanism clear_and_scan() uses to precisely track one
+    specific expression instance, wherever it lives."""
+
+    def test_new_eid_is_a_16_character_hex_string(self):
+        eid = rm.new_eid()
+        self.assertEqual(len(eid), 16)
+        int(eid, 16)  # raises ValueError if this is not valid hex
+
+    def test_two_calls_produce_different_ids(self):
+        self.assertNotEqual(rm.new_eid(), rm.new_eid())
+
+    def test_make_eid_comment_round_trips_through_extract_eid(self):
+        eid = rm.new_eid()
+        comment = rm.make_eid_comment(eid)
+        self.assertEqual(rm.extract_eid(comment + '"F_ATT" = 610'), eid)
+
+    def test_extract_eid_of_plain_text_is_empty(self):
+        self.assertEqual(rm.extract_eid('"F_ATT" = 610'), "")
+
+    def test_extract_eid_ignores_an_unrelated_comment(self):
+        self.assertEqual(rm.extract_eid("/* my own comment */\n\"F_ATT\" = 610"), "")
+
+    def test_the_comment_contains_no_xml_special_characters(self):
+        """It must round-trip through a saved project's XML verbatim, with
+        no escaping mismatch to worry about - see _read_project_text_for_scan()."""
+        comment = rm.make_eid_comment(rm.new_eid())
+        for special in ("<", ">", "&", '"', "'"):
+            self.assertNotIn(special, comment)
+
+
+class ChoiceMemoryEidStorageTests(unittest.TestCase):
+    """ChoiceMemory.remember()/recall_eid() - the sibling-key storage for
+    an occurrence's expression-identity id, the same non-destructive
+    pattern already used for the alternative description."""
+
+    def setUp(self):
+        self.project = QgsProject.instance()
+        self.original, self.existed = self.project.readEntry("rtl_bidi_editor", "value_choices", "")
+
+    def tearDown(self):
+        if self.existed:
+            self.project.writeEntry("rtl_bidi_editor", "value_choices", self.original)
+        else:
+            self.project.removeEntry("rtl_bidi_editor", "value_choices")
+        rm.ChoiceMemory.invalidate()
+
+    def test_remember_with_an_eid_makes_it_recallable(self):
+        rm.ChoiceMemory.remember("t", "f", "1", "Active", 0, "ctx", eid="abc123")
+        self.assertEqual(rm.ChoiceMemory.recall_eid("t", "f", "1", 0, "ctx"), "abc123")
+        self.assertEqual(rm.ChoiceMemory.recall("t", "f", "1", 0, "ctx"), "Active")
+
+    def test_remember_without_an_eid_leaves_it_unset(self):
+        rm.ChoiceMemory.remember("t", "f", "1", "Active", 0, "ctx")
+        self.assertEqual(rm.ChoiceMemory.recall_eid("t", "f", "1", 0, "ctx"), "")
+
+    def test_forget_removes_the_eid_too(self):
+        rm.ChoiceMemory.remember("t", "f", "1", "Active", 0, "ctx", eid="abc123")
+        rm.ChoiceMemory.forget("t", "f", "1", 0, "ctx")
+        self.assertEqual(rm.ChoiceMemory.recall("t", "f", "1", 0, "ctx"), "")
+        self.assertEqual(rm.ChoiceMemory.recall_eid("t", "f", "1", 0, "ctx"), "")
+
+    def test_adding_an_eid_to_an_already_remembered_choice_does_not_need_a_description_change(self):
+        # Regression: remember()'s "nothing changed, skip the write" guard
+        # used to look only at the description, which would silently skip
+        # writing a NEW eid onto an already-remembered, unchanged choice.
+        rm.ChoiceMemory.remember("t", "f", "1", "Active", 0, "ctx")
+        rm.ChoiceMemory.remember("t", "f", "1", "Active", 0, "ctx", eid="abc123")
+        self.assertEqual(rm.ChoiceMemory.recall_eid("t", "f", "1", 0, "ctx"), "abc123")
+
+
+class ResetLegacyEntriesTests(unittest.TestCase):
+    """ChoiceMemory.reset_legacy_entries() - the deliberate, one-time
+    action that deletes every choice with no expression-identity id."""
+
+    def setUp(self):
+        self.project = QgsProject.instance()
+        self.original, self.existed = self.project.readEntry("rtl_bidi_editor", "value_choices", "")
+
+    def tearDown(self):
+        if self.existed:
+            self.project.writeEntry("rtl_bidi_editor", "value_choices", self.original)
+        else:
+            self.project.removeEntry("rtl_bidi_editor", "value_choices")
+        rm.ChoiceMemory.invalidate()
+
+    def test_deletes_only_entries_without_an_eid(self):
+        rm.ChoiceMemory.remember("t", "f", "1", "Active", 0, "ctx")  # legacy
+        rm.ChoiceMemory.remember("t", "f", "2", "Inactive", 0, "ctx", eid="abc123")  # has an id
+
+        deleted, total = rm.ChoiceMemory.reset_legacy_entries()
+
+        self.assertEqual(deleted, 1)
+        self.assertEqual(total, 2)
+        self.assertEqual(rm.ChoiceMemory.recall("t", "f", "1", 0, "ctx"), "")
+        self.assertEqual(rm.ChoiceMemory.recall("t", "f", "2", 0, "ctx"), "Inactive")
+
+    def test_a_project_with_only_id_bearing_entries_deletes_nothing(self):
+        rm.ChoiceMemory.remember("t", "f", "1", "Active", 0, "ctx", eid="abc123")
+
+        deleted, total = rm.ChoiceMemory.reset_legacy_entries()
+
+        self.assertEqual(deleted, 0)
+        self.assertEqual(total, 1)
+        self.assertEqual(rm.ChoiceMemory.recall("t", "f", "1", 0, "ctx"), "Active")
+
+    def test_an_id_bearing_entrys_alternative_is_untouched(self):
+        rm.ChoiceMemory.remember("t", "f", "1", "Active", 0, "ctx", eid="abc123")
+        rm.ChoiceMemory.remember_alt("t", "f", "1", 0, "ctx", "פעיל")
+
+        rm.ChoiceMemory.reset_legacy_entries()
+
+        self.assertEqual(rm.ChoiceMemory.recall_alt("t", "f", "1", 0, "ctx"), "פעיל")
+
+
+class DescribeContextTests(unittest.TestCase):
+    """_describe_context()/_humanize_dd_button_name() - the human-readable
+    location shown in a Clear & Scan failure message. Never the id itself
+    - see ChoiceMemory.clear_and_scan()'s own docstring."""
+
+    def test_humanizes_a_data_defined_button_name(self):
+        self.assertEqual(rm._humanize_dd_button_name("mFillColorDDBtn"), "Fill Color")
+
+    def test_falls_back_to_the_raw_name_when_nothing_to_strip(self):
+        self.assertEqual(rm._humanize_dd_button_name("Whatever"), "Whatever")
+
+    def test_describes_a_layer_and_a_dd_button_slot(self):
+        layer = make_context_layer(("STATUS",))
+        QgsProject.instance().addMapLayer(layer)
+        try:
+            context = f"SomeDialog|Symbol Properties|Chain>mFillColorDDBtn|{layer.id()}"
+            self.assertEqual(rm._describe_context(context), f'layer "{layer.name()}", Fill Color')
+        finally:
+            QgsProject.instance().removeMapLayer(layer.id())
+
+    def test_falls_back_to_the_window_title_without_a_dd_button(self):
+        layer = make_context_layer(("STATUS",))
+        QgsProject.instance().addMapLayer(layer)
+        try:
+            context = f"QgsQueryBuilderBase|Query Builder|QgisApp|{layer.id()}"
+            self.assertEqual(rm._describe_context(context), f'layer "{layer.name()}", Query Builder')
+        finally:
+            QgsProject.instance().removeMapLayer(layer.id())
+
+    def test_empty_context_is_handled_gracefully(self):
+        self.assertEqual(rm._describe_context(""), "an unknown location")
+
+
+class ProjectTextScanIntegrationTests(unittest.TestCase):
+    """A real, non-mocked round trip: save the project to an actual temp
+    file and confirm _read_project_text_for_scan() can find a live eid
+    comment inside it for real - the mechanism clear_and_scan()'s eid path
+    relies on, exercised end to end rather than through a mock."""
+
+    def setUp(self):
+        self.project = QgsProject.instance()
+        self.original, self.existed = self.project.readEntry("rtl_bidi_editor", "value_choices", "")
+        self._tmp_dir = tempfile.mkdtemp()
+        self._original_filename = self.project.fileName()
+
+    def tearDown(self):
+        if self.existed:
+            self.project.writeEntry("rtl_bidi_editor", "value_choices", self.original)
+        else:
+            self.project.removeEntry("rtl_bidi_editor", "value_choices")
+        rm.ChoiceMemory.invalidate()
+        self.project.setFileName(self._original_filename or "")
+        shutil.rmtree(self._tmp_dir, ignore_errors=True)
+
+    def test_a_saved_projects_text_contains_a_live_eid_comment(self):
+        """Uses a data-defined symbol property, not a layer filter - the
+        real target of this mechanism (see CustomAutocompleteController.
+        _ensure_eid() for why a layer filter is deliberately excluded)."""
+        from qgis.core import QgsProperty, QgsSymbolLayer
+
+        path = str(Path(self._tmp_dir) / "scan_test.qgs")
+        self.project.setFileName(path)
+        eid = rm.new_eid()
+
+        layer = make_context_layer(("STATUS",))
+        self.project.addMapLayer(layer)
+        try:
+            symbol_layer = layer.renderer().symbol().symbolLayer(0)
+            expr = rm.make_eid_comment(eid) + "'red'"
+            symbol_layer.setDataDefinedProperty(
+                QgsSymbolLayer.Property.PropertyFillColor, QgsProperty.fromExpression(expr)
+            )
+
+            text = rm._read_project_text_for_scan()
+            self.assertIsNotNone(text)
+            self.assertIn(f"rtl-eid:{eid}", text)
+        finally:
+            self.project.removeMapLayer(layer.id())
+
+    def test_returns_none_when_the_project_has_never_been_saved(self):
+        self.project.setFileName("")
+        self.assertIsNone(rm._read_project_text_for_scan())
 
 
 if __name__ == "__main__":

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import difflib
 import re
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from qgis.PyQt.QtCore import QEvent, QObject, QPointF, QRectF, Qt, pyqtSignal
@@ -458,6 +459,145 @@ class DescriptionResolver:
         return str(raw).strip()
 
 
+#: Marks the plugin's own hidden expression-identity comment, distinguishing
+#: it from any comment the user might have written themselves. Block-comment
+#: syntax ("/* */"), not "--": it works inside a single-line expression
+#: without needing to run to the end of the line, and is accepted both by
+#: QGIS's own expression grammar and by the SQL dialects most providers
+#: evaluate a layer filter as. Contains no character XML needs to escape
+#: ("<", ">", "&", quotes), so it round-trips through a saved project file
+#: verbatim - no encoding mismatch to worry about when searching for it.
+_EID_TAG = "rtl-eid"
+_EID_COMMENT_RE = re.compile(r"^/\*" + re.escape(_EID_TAG) + r":([0-9a-f]{16})\*/[ \t]*\n?")
+
+
+def new_eid() -> str:
+    """A short, effectively-unique id for one expression instance."""
+    import uuid
+
+    return uuid.uuid4().hex[:16]
+
+
+def make_eid_comment(eid: str) -> str:
+    """The literal text inserted as an expression's first line."""
+    return f"/*{_EID_TAG}:{eid}*/\n"
+
+
+def extract_eid(text: str) -> str:
+    """The expression-identity id at the very start of ``text``, or "" if
+    it does not start with one of this plugin's own id comments."""
+    match = _EID_COMMENT_RE.match(text)
+    return match.group(1) if match else ""
+
+
+def _eid_marker(eid: str) -> str:
+    """What to search a saved project's text for - see
+    ``_read_project_text_for_scan()``."""
+    return f"{_EID_TAG}:{eid}"
+
+
+def _read_project_text_for_scan() -> Optional[str]:
+    """The current project's saved file content, as plain text.
+
+    Used only to check whether a specific expression-identity comment (see
+    ``make_eid_comment()``) still appears anywhere in the project - never
+    to parse or rely on any particular structure, which is what keeps this
+    unaffected by QGIS's internal XML schema changing between versions.
+
+    Saves the project first, so the text reflects the CURRENT, on-screen
+    state rather than whatever was last on disk before this call.
+
+    Returns ``None`` when there is nothing usable to read - the project has
+    never been saved to a file yet, or writing/reading it failed - callers
+    MUST treat that as "cannot verify right now", never as "not found".
+    """
+    try:
+        from qgis.core import QgsProject
+
+        project = QgsProject.instance()
+        path = project.fileName()
+        if not path:
+            return None
+        if not project.write():
+            return None
+        location = Path(path)
+        if location.suffix.lower() == ".qgz":
+            import zipfile
+
+            with zipfile.ZipFile(location) as archive:
+                for name in archive.namelist():
+                    if name.lower().endswith(".qgs"):
+                        return archive.read(name).decode("utf-8", errors="replace")
+            return None
+        return location.read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:
+        _log(f"Could not read the project file for Clear & Scan: {exc}", Qgis.MessageLevel.Warning)
+        return None
+
+
+def _humanize_dd_button_name(name: str) -> str:
+    """``"mFillColorDDBtn"`` -> ``"Fill Color"`` - strips the "m" Qt naming
+    convention prefix and the "DDBtn" (data-defined button) suffix, then
+    splits the remaining CamelCase into words. Best-effort, for a Clear &
+    Scan failure message only - never used to verify anything."""
+    core = name
+    if core.endswith("DDBtn"):
+        core = core[: -len("DDBtn")]
+    if len(core) > 1 and core[0] == "m" and core[1].isupper():
+        core = core[1:]
+    words = re.findall(r"[A-Z][a-z0-9]*|[A-Z]+(?![a-z])|[a-z0-9]+", core)
+    return " ".join(words) if words else name
+
+
+def _describe_context(context: str) -> str:
+    """A best-effort, human-readable description of where a remembered
+    choice came from, for Clear & Scan's failure messages only.
+
+    Built entirely from the context string already recorded live when the
+    choice was made (see ``expression_context_key()``) - this never tries
+    to re-derive or verify anything, just to make an existing opaque
+    identifier readable.
+    """
+    if not context:
+        return "an unknown location"
+    parts = context.split("|")
+
+    layer_label = ""
+    layer_id = parts[-1] if parts else ""
+    if layer_id:
+        try:
+            from qgis.core import QgsProject
+
+            layer = QgsProject.instance().mapLayer(layer_id)
+            if layer is not None:
+                layer_label = layer.name()
+        except Exception:
+            pass
+        if not layer_label:
+            layer_label = layer_id
+
+    # The most specific hint available: a data-defined override button's
+    # own object name, e.g. "mFillColorDDBtn" -> "Fill Color". Falls back
+    # to the window title (e.g. "Query Builder" for a layer filter, still
+    # meaningful on its own) when no such button is found in the chain.
+    slot_label = ""
+    for piece in parts[:-1]:
+        for chunk in piece.split(">"):
+            if chunk.endswith("DDBtn"):
+                slot_label = _humanize_dd_button_name(chunk)
+                break
+        if slot_label:
+            break
+    if not slot_label and len(parts) >= 2 and parts[1]:
+        slot_label = parts[1]
+
+    if layer_label and slot_label:
+        return f'layer "{layer_label}", {slot_label}'
+    if layer_label:
+        return f'layer "{layer_label}"'
+    return slot_label or "an unknown location"
+
+
 class ChoiceMemory:
     """Remembers which meaning the user picked for an ambiguous code.
 
@@ -495,6 +635,15 @@ class ChoiceMemory:
     #: the project file for whichever install next understands it, without
     #: ever disturbing the primary description any install already reads.
     _ALT_SUFFIX = "\x1f\x02alt"
+
+    #: Same sibling-key trick as _ALT_SUFFIX, this time carrying the
+    #: expression-identity id (see make_eid_comment()) an occurrence's own
+    #: expression was tagged with, when it was. An older install (or an
+    #: entry recorded before this existed) simply never has this sibling
+    #: key at all - that absence is exactly what clear_and_scan() uses to
+    #: tell "can be verified precisely" apart from "falls back to the
+    #: older, coarser check".
+    _EID_SUFFIX = "\x1f\x03eid"
 
     _cache: Optional[Dict[str, str]] = None
     _hooked = False
@@ -563,16 +712,29 @@ class ChoiceMemory:
         description: str,
         occurrence: int = 0,
         context: str = "",
+        eid: str = "",
     ) -> None:
-        """Record a choice for one occurrence and persist it into the project."""
+        """Record a choice for one occurrence and persist it into the project.
+
+        ``eid`` - the expression-identity id its expression was tagged with
+        (see ``make_eid_comment()``), when there is one - is stored as its
+        own sibling key (see ``_EID_SUFFIX``), the same non-destructive
+        pattern already used for the alternative description: an older
+        install simply never looks for it and carries it through untouched.
+        """
         if not (field and code and description):
             return
         cls._ensure_hook()
         data = cls._load()
         key = cls._key(table, field, code, occurrence, context)
-        if data.get(key) == description:
+        eid_key = key + cls._EID_SUFFIX
+        description_changed = data.get(key) != description
+        eid_changed = bool(eid) and data.get(eid_key) != eid
+        if not description_changed and not eid_changed:
             return
         data[key] = description
+        if eid:
+            data[eid_key] = eid
         try:
             import json
 
@@ -651,17 +813,27 @@ class ChoiceMemory:
         return cls._load().get(key, "")
 
     @classmethod
+    def recall_eid(
+        cls, table: str, field: str, code: str, occurrence: int = 0, context: str = ""
+    ) -> str:
+        """The expression-identity id this occurrence's expression was
+        tagged with, or "" if none was ever recorded (an entry from before
+        this existed, or one whose expression was never re-selected since).
+        """
+        key = cls._key(table, field, code, occurrence, context) + cls._EID_SUFFIX
+        return cls._load().get(key, "")
+
+    @classmethod
     def forget(cls, table: str, field: str, code: str, occurrence: int, context: str = "") -> None:
-        """Remove one occurrence's entries (primary and alternative)
-        entirely - used by ``reconcile_choices()`` to clear a slot before
-        rewriting it, and to drop one that no longer corresponds to
-        anything in the current expression at all."""
+        """Remove one occurrence's entries (primary, alternative and
+        expression-identity id) entirely - used by ``reconcile_choices()``
+        to clear a slot before rewriting it, and to drop one that no
+        longer corresponds to anything in the current expression at all."""
         cls._ensure_hook()
         data = cls._load()
         primary_key = cls._key(table, field, code, occurrence, context)
-        alt_key = primary_key + cls._ALT_SUFFIX
         changed = False
-        for key in (primary_key, alt_key):
+        for key in (primary_key, primary_key + cls._ALT_SUFFIX, primary_key + cls._EID_SUFFIX):
             if key in data:
                 del data[key]
                 changed = True
@@ -720,9 +892,9 @@ class ChoiceMemory:
     def _parse_key(cls, key: str) -> Optional[Tuple[str, str, str, str, int]]:
         """The inverse of ``_key()``: ``(context, table, field, code,
         occurrence)``, or ``None`` for anything that is not a plain primary
-        key - an alternative-description shadow entry, or something not in
-        this shape at all."""
-        if key.endswith(cls._ALT_SUFFIX):
+        key - an alternative-description or expression-identity shadow
+        entry, or something not in this shape at all."""
+        if key.endswith(cls._ALT_SUFFIX) or key.endswith(cls._EID_SUFFIX):
             return None
         context, sep, rest = key.partition("\x1e")
         if not sep:
@@ -741,13 +913,15 @@ class ChoiceMemory:
     def _delete_conceptual_entry(
         cls, data: Dict[str, str], context: str, table: str, field: str, code: str, occurrence: int
     ) -> None:
-        """Remove one occurrence's primary AND alternative keys from an
-        already-loaded ``data`` dict, in place - the batch counterpart to
-        ``forget()``, which reads/writes the project once per call and
-        would be wasteful called once per entry from ``clear_and_scan()``."""
+        """Remove one occurrence's primary, alternative and
+        expression-identity keys from an already-loaded ``data`` dict, in
+        place - the batch counterpart to ``forget()``, which reads/writes
+        the project once per call and would be wasteful called once per
+        entry from ``clear_and_scan()``."""
         primary_key = cls._key(table, field, code, occurrence, context)
         data.pop(primary_key, None)
         data.pop(primary_key + cls._ALT_SUFFIX, None)
+        data.pop(primary_key + cls._EID_SUFFIX, None)
 
     #: The window's own objectName - not its (possibly translated)
     #: windowTitle - that identifies a layer-FILTER expression context (the
@@ -765,19 +939,26 @@ class ChoiceMemory:
 
         Two independent passes over every remembered choice in the project:
 
-        1. DELETE anything provably no longer relevant:
+        1. DELETE anything provably no longer relevant. Two ways an entry
+           can be proven dead:
 
-           * the layer it belonged to is no longer in the project at all, or
-           * it is a layer FILTER choice specifically (the one context this
-             can re-derive without a live dialog - see
-             ``_LAYER_FILTER_CONTEXT_MARKERS``) and that exact occurrence no
-             longer exists in the layer's current filter text.
-
-           Anything else - a data-defined override, a Field Calculator run,
-           or any other expression slot this cannot independently
-           re-examine - is left alone. Only DEMONSTRATED absence is ever
-           acted on; an unverifiable context is never guessed at and never
-           deleted just because it could not be confirmed.
+           * **It carries an expression-identity id** (see
+             ``make_eid_comment()`` - every expression a choice is recorded
+             for is tagged with one, from now on) - deleted if no
+             expression anywhere in the saved project still carries that
+             exact id. This is precise regardless of what KIND of
+             expression it was - a filter, a data-defined override, a
+             labeling rule filter - because the id travels with the
+             expression itself, not with which dialog it happened to be
+             edited through.
+           * **It has no id at all** - an entry recorded before this
+             existed. Falls back to the older, coarser checks: the layer it
+             belonged to is no longer in the project at all, or it is a
+             layer FILTER choice specifically (the one context re-checkable
+             without an id - see ``_LAYER_FILTER_CONTEXT_MARKERS``) and that
+             exact occurrence no longer exists in the layer's current
+             filter text. Anything else without an id is left alone -
+             unverifiable is never treated as unused.
 
         2. For everything NOT deleted, compare its field/code/description
            (and alternative description, if one was recorded) against what
@@ -785,11 +966,13 @@ class ChoiceMemory:
            that no longer matches as a warning, without touching it - this
            is what surfaces a database-backed lookup table having changed
            since a choice was made, which nothing else in the plugin would
-           ever notice on its own.
+           ever notice on its own. Each failure names the layer and, where
+           known, which specific slot (e.g. "Fill Color") it came from -
+           never the id itself, which is purely internal bookkeeping.
 
         Returns ``(deleted_count, total_count, failures)``. Counts are of
-        whole choices - a primary entry plus its optional alternative
-        counts as one - not raw JSON keys.
+        whole choices - a primary entry plus its optional alternative and
+        id counts as one - not raw JSON keys.
         """
         cls._ensure_hook()
         data = cls._load()
@@ -810,6 +993,15 @@ class ChoiceMemory:
         deleted = 0
         failures: List[str] = []
         mapping_cache: Dict[str, ReadModeMapping] = {}
+        # Read (and save) once for the whole run, not once per entry - and
+        # only if at least one entry actually has an id to look for, so a
+        # project full of only legacy (no-id) entries never pays for a
+        # save it has no use for.
+        project_text = (
+            _read_project_text_for_scan()
+            if any(data.get(cls._key(t, f, c, o, ctx) + cls._EID_SUFFIX) for ctx, t, f, c, o in entries)
+            else None
+        )
 
         def _mapping_for(table_name: str) -> ReadModeMapping:
             cache_key = table_name.lower()
@@ -818,42 +1010,59 @@ class ChoiceMemory:
             return mapping_cache[cache_key]
 
         for context, table, field, code, occurrence in entries:
-            layer_id = context.rsplit("|", 1)[-1] if context else ""
-            layer = project.mapLayer(layer_id) if layer_id else None
+            primary_key = cls._key(table, field, code, occurrence, context)
+            eid = data.get(primary_key + cls._EID_SUFFIX, "")
 
-            if layer_id and layer is None:
-                # The layer itself is gone - nothing could ever use this again.
-                cls._delete_conceptual_entry(data, context, table, field, code, occurrence)
-                deleted += 1
-                continue
+            if eid:
+                # Precise path: does an expression carrying this exact id
+                # still exist anywhere in the saved project?
+                if project_text is not None and _eid_marker(eid) not in project_text:
+                    cls._delete_conceptual_entry(data, context, table, field, code, occurrence)
+                    deleted += 1
+                    continue
+                # project_text is None: never saved yet, or the save/read
+                # failed this run - cannot verify, so fall through to the
+                # lookup-table check below without deleting anything.
+            else:
+                # No id recorded - predates this feature. Same coarser
+                # checks Clear & Scan has always used.
+                layer_id = context.rsplit("|", 1)[-1] if context else ""
+                layer = project.mapLayer(layer_id) if layer_id else None
 
-            if layer is not None and context.split("|", 1)[0] in cls._LAYER_FILTER_CONTEXT_MARKERS:
-                live_matches = _scan_value_literals(layer.subsetString() or "")
-                still_present = any(
-                    f == field and c == code and occ == occurrence
-                    for f, c, _start, _end, occ in live_matches
-                )
-                if not still_present:
+                if layer_id and layer is None:
                     cls._delete_conceptual_entry(data, context, table, field, code, occurrence)
                     deleted += 1
                     continue
 
+                if layer is not None and context.split("|", 1)[0] in cls._LAYER_FILTER_CONTEXT_MARKERS:
+                    live_matches = _scan_value_literals(layer.subsetString() or "")
+                    still_present = any(
+                        f == field and c == code and occ == occurrence
+                        for f, c, _start, _end, occ in live_matches
+                    )
+                    if not still_present:
+                        cls._delete_conceptual_entry(data, context, table, field, code, occurrence)
+                        deleted += 1
+                        continue
+
             # Kept - either confirmed still in use, or simply unverifiable
             # from here - either way, check it against the lookup table.
-            primary_key = cls._key(table, field, code, occurrence, context)
             description = data.get(primary_key, "")
             values, alt_values, _field_descriptions = _mapping_for(table)
             field_key = field.lower()
             table_label = f"table \"{table}\"" if table else "the configured lookup table"
+            where = _describe_context(context)
 
             field_values = values.get(field_key)
             if field_values is None:
-                failures.append(f'field "{field}" no longer exists in {table_label}')
+                failures.append(f'{where}: field "{field}" no longer exists in {table_label}')
             elif code not in field_values:
-                failures.append(f'value {code} no longer exists for field "{field}" in {table_label}')
+                failures.append(
+                    f'{where}: value {code} no longer exists for field "{field}" in {table_label}'
+                )
             elif description and description not in field_values[code]:
                 failures.append(
-                    f'description "{description}" no longer describes value {code} '
+                    f'{where}: description "{description}" no longer describes value {code} '
                     f'(field "{field}" in {table_label})'
                 )
 
@@ -862,7 +1071,7 @@ class ChoiceMemory:
                 current_alt = alt_values.get(field_key, {}).get(code, {}).get(description, "")
                 if current_alt != alt_description:
                     failures.append(
-                        f'alternative description "{alt_description}" no longer matches '
+                        f'{where}: alternative description "{alt_description}" no longer matches '
                         f'value {code} (description "{description}", field "{field}" in {table_label})'
                     )
 
@@ -875,6 +1084,56 @@ class ChoiceMemory:
                 _log(f"Could not write back after Clear & Scan: {exc}")
 
         return deleted, total, failures
+
+    @classmethod
+    def reset_legacy_entries(cls) -> Tuple[int, int]:
+        """Delete every remembered choice that has no expression-identity
+        id at all - i.e. everything recorded before that existed.
+
+        A deliberate, one-time, explicit action - never something
+        ``clear_and_scan()`` does on its own, since an entry missing an id
+        only ever means "predates this feature", not "no longer needed";
+        treating those the same would silently delete still-valid choices
+        the very first time this ships (see ``clear_and_scan()``'s own
+        docstring). Meant to be run once, by choice, to start fresh - e.g.
+        right after upgrading a project that already has a lot of
+        pre-existing entries, so every choice from then on can be
+        precisely tracked.
+
+        Returns ``(deleted_count, total_count)`` - counts of whole
+        choices, not raw JSON keys.
+        """
+        cls._ensure_hook()
+        data = cls._load()
+
+        entries: List[Tuple[str, str, str, str, int]] = []
+        seen = set()
+        for key in list(data):
+            parsed = cls._parse_key(key)
+            if parsed is not None and parsed not in seen:
+                seen.add(parsed)
+                entries.append(parsed)
+
+        total = len(entries)
+        deleted = 0
+        for context, table, field, code, occurrence in entries:
+            primary_key = cls._key(table, field, code, occurrence, context)
+            if primary_key + cls._EID_SUFFIX in data:
+                continue  # has an id - not legacy, clear_and_scan() owns this one
+            cls._delete_conceptual_entry(data, context, table, field, code, occurrence)
+            deleted += 1
+
+        if deleted:
+            try:
+                import json
+
+                from qgis.core import QgsProject
+
+                QgsProject.instance().writeEntry(cls.SCOPE, cls.KEY, json.dumps(data, ensure_ascii=False))
+            except Exception as exc:
+                _log(f"Could not write back after resetting legacy entries: {exc}")
+
+        return deleted, total
 
     @classmethod
     def invalidate(cls) -> None:

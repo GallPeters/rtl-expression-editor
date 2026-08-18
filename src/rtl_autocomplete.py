@@ -2365,6 +2365,16 @@ class CustomAutocompleteController(QObject):
         if not value or self._editor is None:
             return
 
+        # A choice is about to be remembered for this expression (see
+        # below) - make sure it carries its own expression-identity id
+        # BEFORE any offset below is computed, so everything downstream
+        # already accounts for a newly inserted id comment's length. An
+        # expression nobody ever picks a described value from never gets
+        # tagged with an id it would have no use for.
+        eid = ""
+        if not self._field_mode and chosen_description:
+            eid = self._ensure_eid()
+
         # Replace the partial token, then insert.  This is a normal document
         # edit, so the existing overlay -> Scintilla synchronisation picks it up
         # through textChanged like any keystroke would.
@@ -2457,9 +2467,79 @@ class CustomAutocompleteController(QObject):
                     chosen_description,
                     index,
                     context,
+                    eid=eid,
                 )
             except Exception as exc:
                 _dbg(f"Could not remember choice: {exc}")
+
+    def _ensure_eid(self) -> str:
+        """The current document's expression-identity id, inserting one -
+        as a hidden first line, see ``RtlOverlayEditor.
+        hide_expression_identity_line()`` - if it does not have one yet.
+
+        Called only right before a choice is about to be remembered (see
+        ``accept_current()``), so an expression nobody ever picks a
+        described value from is never tagged with an id at all.
+
+        Never tags a layer FILTER's own expression, specifically: its text
+        can be evaluated as the provider's own native SQL rather than
+        QGIS's expression engine, and at least one mainstream provider
+        (OGR - Shapefile, GeoJSON, ...) rejects a leading comment outright,
+        confirmed directly: ``setSubsetString()`` simply returns ``False``
+        and silently leaves the filter unchanged. clear_and_scan() already
+        has a precise, comment-free way to verify a layer filter choice
+        (the layer's own ``subsetString()`` directly) - this only ever
+        tags everything else (data-defined overrides, rule-based renderer
+        or labeling filters, label expressions, ...), all evaluated by
+        QGIS's own expression engine, confirmed tolerant of both comment
+        styles.
+        """
+        editor = self._editor
+        if editor is None:
+            return ""
+        try:
+            from .rtl_readmode import (
+                ChoiceMemory,
+                expression_context_key,
+                extract_eid,
+                make_eid_comment,
+                new_eid,
+            )
+
+            sci = getattr(editor, "_sci", None)
+            context = expression_context_key(sci if sci is not None else editor)
+            if context.split("|", 1)[0] in ChoiceMemory._LAYER_FILTER_CONTEXT_MARKERS:
+                return ""
+
+            existing = extract_eid(editor.toPlainText())
+            if existing:
+                return existing
+
+            eid = new_eid()
+            comment = make_eid_comment(eid)
+            saved_cursor = editor.textCursor()
+            saved_position = saved_cursor.position()
+
+            insert_cursor = QTextCursor(editor.document())
+            insert_cursor.beginEditBlock()
+            insert_cursor.setPosition(0)
+            insert_cursor.insertText(comment)
+            insert_cursor.endEditBlock()
+
+            # The insertion shifted every later offset by the comment's own
+            # length - restore the caret's LOGICAL position, not its
+            # stale, pre-insertion numeric one.
+            restored = editor.textCursor()
+            restored.setPosition(saved_position + len(comment))
+            editor.setTextCursor(restored)
+
+            hide = getattr(editor, "hide_expression_identity_line", None)
+            if callable(hide):
+                hide()
+            return eid
+        except Exception as exc:
+            _dbg(f"Could not ensure expression id: {exc}")
+            return ""
 
     def _call_tip_soon(self) -> None:
         """Show the call tip after the document has settled."""
