@@ -706,6 +706,73 @@ class ReconcileChoicesTests(unittest.TestCase):
             rm.ChoiceMemory.recall(self.TABLE, "country", "IL", 0, self.CONTEXT), "Israel"
         )
 
+    def test_fresh_choices_made_during_the_same_session_are_never_touched(self):
+        """Regression: a brand-new filter built from scratch in one dialog
+        session (baseline is empty, since nothing existed before it was
+        opened) whose 3 values were picked from the popup DURING that same
+        session must not have those choices wiped the instant OK is
+        pressed, just because none of them existed in the (empty)
+        baseline. The old version cleared range(max(old_count, new_count))
+        unconditionally, which deleted exactly these."""
+        before = ""
+        after = "\"F_ATT\" = 'בית כנסת' OR \"F_ATT\" IN ('בית כנסת', 'בית כנסת')"
+        # Exactly what accept_current() already wrote live, once per
+        # occurrence, before OK is ever pressed.
+        for occ in range(3):
+            rm.ChoiceMemory.remember(self.TABLE, "f_att", "בית כנסת", "synagogue", occ, self.CONTEXT)
+
+        rm.reconcile_choices(self.CONTEXT, self.TABLE, before, after)
+
+        for occ in range(3):
+            self.assertEqual(
+                rm.ChoiceMemory.recall(self.TABLE, "f_att", "בית כנסת", occ, self.CONTEXT),
+                "synagogue",
+            )
+
+    def test_clearing_the_whole_expression_removes_every_one_of_its_entries(self):
+        rm.ChoiceMemory.remember(self.TABLE, "f_att", "בית כנסת", "synagogue", 0, self.CONTEXT)
+        rm.ChoiceMemory.remember(self.TABLE, "f_att", "בית כנסת", "synagogue", 1, self.CONTEXT)
+        rm.ChoiceMemory.remember(self.TABLE, "f_att", "בית כנסת", "synagogue", 2, self.CONTEXT)
+        before = "\"F_ATT\" = 'בית כנסת' OR \"F_ATT\" IN ('בית כנסת', 'בית כנסת')"
+        after = ""
+
+        rm.reconcile_choices(self.CONTEXT, self.TABLE, before, after)
+
+        for occ in range(3):
+            self.assertEqual(
+                rm.ChoiceMemory.recall(self.TABLE, "f_att", "בית כנסת", occ, self.CONTEXT), ""
+            )
+
+    def test_the_full_reported_sequence_build_clear_then_add_something_else(self):
+        """End to end: build a 3-occurrence filter (values chosen live),
+        accept it (all 3 must survive); clear the filter entirely, accept
+        again (all 3 must be gone); add an unrelated clause, accept again
+        (nothing resurrected, no crash)."""
+        f_att_before = ""
+        f_att_after = "\"F_ATT\" = 'בית כנסת' OR \"F_ATT\" IN ('בית כנסת', 'בית כנסת')"
+        for occ in range(3):
+            rm.ChoiceMemory.remember(self.TABLE, "f_att", "בית כנסת", "synagogue", occ, self.CONTEXT)
+        rm.reconcile_choices(self.CONTEXT, self.TABLE, f_att_before, f_att_after)
+        for occ in range(3):
+            self.assertEqual(
+                rm.ChoiceMemory.recall(self.TABLE, "f_att", "בית כנסת", occ, self.CONTEXT),
+                "synagogue",
+            )
+
+        cleared = ""
+        rm.reconcile_choices(self.CONTEXT, self.TABLE, f_att_after, cleared)
+        for occ in range(3):
+            self.assertEqual(
+                rm.ChoiceMemory.recall(self.TABLE, "f_att", "בית כנסת", occ, self.CONTEXT), ""
+            )
+
+        with_new_clause = "\"F_CODE\" = 2301"
+        rm.reconcile_choices(self.CONTEXT, self.TABLE, cleared, with_new_clause)
+        for occ in range(3):
+            self.assertEqual(
+                rm.ChoiceMemory.recall(self.TABLE, "f_att", "בית כנסת", occ, self.CONTEXT), ""
+            )
+
 
 class ChoiceReconcilerTests(unittest.TestCase):
     """ChoiceReconciler - the wiring that actually triggers

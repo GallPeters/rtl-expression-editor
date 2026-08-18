@@ -922,13 +922,12 @@ def reconcile_choices(context: str, table: str, before_text: str, after_text: st
     pairs = set(before_counts) | set(after_counts)
     for field, code in pairs:
         old_count = before_counts.get((field, code), 0)
-        new_count = after_counts.get((field, code), 0)
         pair_moves = moves.get((field, code), {})
 
-        # Read out whatever is currently recorded for every old occurrence
+        # Read out whatever is currently recorded for every OLD occurrence
         # BEFORE anything is deleted - forget() below would otherwise erase
         # a choice this same pass still needs to carry forward.
-        surviving: Dict[int, Tuple[str, str]] = {}
+        to_place: Dict[int, Tuple[str, str]] = {}
         for old_occurrence in range(old_count):
             description = ChoiceMemory.recall(table, field, code, old_occurrence, context)
             if not description:
@@ -937,15 +936,29 @@ def reconcile_choices(context: str, table: str, before_text: str, after_text: st
             if new_occurrence is None:
                 continue  # this literal did not survive - nothing to carry forward
             alt = ChoiceMemory.recall_alt(table, field, code, old_occurrence, context)
-            surviving[new_occurrence] = (description, alt)
+            to_place[new_occurrence] = (description, alt)
 
-        # Clear the whole occurrence range for this pair, then rewrite only
-        # what is still valid - simpler and safer than moving entries one
-        # at a time, which risks clobbering a value still waiting to move
-        # if two occurrences happen to swap slots.
-        for occurrence in range(max(old_count, new_count)):
-            ChoiceMemory.forget(table, field, code, occurrence, context)
-        for new_occurrence, (description, alt) in surviving.items():
+        # Clear only OLD occurrences that this pass actually owns: ones
+        # whose literal is gone entirely, or that survived but moved to a
+        # different occurrence number (so their old slot must be vacated
+        # before the move below rewrites it elsewhere). An occurrence that
+        # survived AND stayed at the same number needs neither.
+        #
+        # Deliberately NEVER touches an occurrence index that only exists
+        # in after_text (>= old_count with no entry in pair_moves) - that is
+        # a choice made fresh during THIS SAME editing session (recorded
+        # live as it was picked from the popup), not something this pass
+        # has any business erasing just because it did not exist in
+        # before_text. The previous version cleared range(max(old_count,
+        # new_count)) unconditionally, which wiped exactly those - deleting
+        # a value's remembered description the instant the surrounding
+        # dialog was accepted.
+        for old_occurrence in range(old_count):
+            if pair_moves.get(old_occurrence) == old_occurrence:
+                continue  # unchanged position - nothing to clear
+            ChoiceMemory.forget(table, field, code, old_occurrence, context)
+
+        for new_occurrence, (description, alt) in to_place.items():
             ChoiceMemory.remember(table, field, code, description, new_occurrence, context)
             if alt:
                 ChoiceMemory.remember_alt(table, field, code, new_occurrence, context, alt)
