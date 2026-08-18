@@ -115,8 +115,9 @@ except Exception:  # pragma: no cover
     CustomAutocompleteController = None
 
 try:
-    from .rtl_readmode import ChoiceReconciler, ReadModeController
+    from .rtl_readmode import ChoiceMemory, ChoiceReconciler, ReadModeController
 except Exception:  # pragma: no cover
+    ChoiceMemory = None
     ChoiceReconciler = None
     ReadModeController = None
 
@@ -2165,6 +2166,25 @@ class RtlBidiEditorPlugin:
         except Exception as exc:
             _log(f"Settings dialog failed: {exc}", Qgis.MessageLevel.Warning)
 
+    def _on_layers_will_be_removed(self, layer_ids) -> None:
+        """Purge remembered value/description choices for a layer that is
+        about to disappear from the project entirely.
+
+        reconcile_choices() (see ChoiceReconciler) only ever runs when a
+        specific expression's own dialog is accepted - it has no way to
+        notice a whole layer, and every expression slot on it, vanishing
+        outright. Without this, those choices would sit in the project
+        file forever with no layer left that could ever reconcile them
+        away.
+        """
+        if ChoiceMemory is None:
+            return
+        try:
+            for layer_id in layer_ids:
+                ChoiceMemory.purge_for_layer(layer_id)
+        except Exception as exc:
+            _log(f"Could not purge choices for a removed layer: {exc}", Qgis.MessageLevel.Warning)
+
     def apply_settings(self) -> None:
         """React to the master switch being toggled, without a restart.
 
@@ -2194,6 +2214,12 @@ class RtlBidiEditorPlugin:
             self._watcher.install()
             if SETTINGS_BUS is not None:
                 SETTINGS_BUS.changed.connect(self.apply_settings)
+            try:
+                from qgis.core import QgsProject
+
+                QgsProject.instance().layersWillBeRemoved.connect(self._on_layers_will_be_removed)
+            except Exception as exc:
+                _log(f"Layer-removal choice cleanup unavailable: {exc}", Qgis.MessageLevel.Info)
             _log("RTL Expression Editor active.", Qgis.MessageLevel.Success)
             _dbg(
                 f"watching editor classes {sorted(TARGET_EDITOR_CLASSES)}; "
@@ -2210,6 +2236,12 @@ class RtlBidiEditorPlugin:
                 SETTINGS_BUS.changed.disconnect(self.apply_settings)
             except Exception:
                 pass
+        try:
+            from qgis.core import QgsProject
+
+            QgsProject.instance().layersWillBeRemoved.disconnect(self._on_layers_will_be_removed)
+        except Exception:
+            pass
         self._remove_menu()
         if self._watcher is None:
             return

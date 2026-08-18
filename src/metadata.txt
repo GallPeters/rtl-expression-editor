@@ -12,7 +12,7 @@ about=QGIS's built-in editor (QScintilla) does not display right-to-left text co
     When a custom auto-complete source is configured, an optional Read Mode switch appears inside the editor. Read Mode shows the value descriptions instead of the stored codes, making a long expression far easier tounderstand, and never alters the expression itself. Where the same code has different meanings in different groups, the description you picked is saved in the project file and restored automatically, so Read Mode always shows the right one, for everyone who opens the project. An optional second, alternative description per value adds a third switch position for a different wording of the same descriptions.
 
     The whole configuration, including the auto-complete source, can be exported to a file and imported again elsewhere - useful for sharing a ready-made setup with colleagues.
-version=1.5
+version=1.6
 author=Jossef Kanter
 email=jossefkan@gmail.com
 
@@ -28,13 +28,18 @@ deprecated=False
 hasProcessingProvider=no
 server=False
 
+** v1.6 (18.08.2026):
+  - Improved: the Edit/Read mode switch is now a real slider - drag it, or tap anywhere on it to jump straight to that mode.
+  - Fixed: a Hebrew field or value description in Read mode could visually reverse the expression's own left-to-right structure - an operator's position, or the order of an IN (...) list.
+  - Fixed: editing an expression's value/description choices no longer only ever accumulates entries in the project file - accepting the dialog (OK) now rewrites them to exactly match the edited expression, dropping anything no longer needed and correcting any choice an edit had shifted onto the wrong occurrence.
+  - Fixed: removing a layer from the project now also removes its remembered value/description choices, instead of leaving them behind indefinitely.
+
 ** v1.5 (17.08.2026):
   - Added: the suggestion list now shows a title - the dataset name when naming a field, the field name when picking its value - enriched with optional Table description / Field description columns, which also replace field names outright in Read mode.
   - Added: an optional Alternative value description column, giving Read mode a third switch position - already-described values pick it up automatically, with nothing to reselect.
   - Added: Export Settings / Import Settings, saving and loading the whole configuration - including the autocomplete lookup layer - as a JSON file, never including a database connection's own credentials.
-  - Improved: the Edit/Read switch is now a real slider; the Settings window is resizable, with detailed tooltips throughout and clearer import errors (not found vs. not accessible).
-  - Fixed: a Hebrew field or value description in Read mode could visually reverse the expression's own left-to-right structure; a few tooltip, resizing and stale-warning issues in the Settings dialog.
-  - Fixed: editing an expression's value/description choices no longer only ever accumulates entries in the project file - accepting the dialog (OK) now rewrites them to exactly match the edited expression, dropping anything that no longer applies and correcting any choice an edit had shifted onto the wrong occurrence.
+  - Improved: the Settings window is resizable, with detailed tooltips throughout and clearer import errors (not found vs. not accessible).
+  - Fixed: a few tooltip and stale-warning display issues in the Settings dialog.
 
 ** v1.4 (12.08.2026):
   - Added: Ctrl+Space (and automatic suggestions while typing) for fields, functions, variables and values, with signatures and help - works even without a configured lookup table.

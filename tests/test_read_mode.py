@@ -610,6 +610,67 @@ class ChoiceMemoryForgetTests(unittest.TestCase):
         self.assertEqual(rm.ChoiceMemory.recall("t", "f", "1", 1, "ctx"), "Enabled")
 
 
+class ChoiceMemoryPurgeForLayerTests(unittest.TestCase):
+    """ChoiceMemory.purge_for_layer() - the complementary cleanup for a
+    layer removed from the project entirely, which reconcile_choices() has
+    no way to notice on its own (it only runs when a specific expression's
+    own dialog is accepted, not when the layer behind it disappears)."""
+
+    def setUp(self):
+        self.project = QgsProject.instance()
+        self.original, self.existed = self.project.readEntry("rtl_bidi_editor", "value_choices", "")
+
+    def tearDown(self):
+        if self.existed:
+            self.project.writeEntry("rtl_bidi_editor", "value_choices", self.original)
+        else:
+            self.project.removeEntry("rtl_bidi_editor", "value_choices")
+        rm.ChoiceMemory.invalidate()
+
+    def test_removes_every_entry_whose_context_references_the_layer(self):
+        # expression_context_key() always appends the layer's id as the
+        # last part of the context - mirrored here without needing a real
+        # widget/window, since purge_for_layer() only ever does a plain
+        # substring check.
+        context = "QgsQueryBuilderBase|Query Builder|QgisApp|layer-abc-123"
+        rm.ChoiceMemory.remember("t", "f_att", "610", "mosque", 0, context)
+        rm.ChoiceMemory.remember_alt("t", "f_att", "610", 0, context, "مسجد")
+        rm.ChoiceMemory.remember("t", "f_att", "610", "mosque", 1, context)
+
+        removed = rm.ChoiceMemory.purge_for_layer("layer-abc-123")
+
+        self.assertEqual(removed, 3)  # 2 primary entries + 1 alternative
+        self.assertEqual(rm.ChoiceMemory.recall("t", "f_att", "610", 0, context), "")
+        self.assertEqual(rm.ChoiceMemory.recall_alt("t", "f_att", "610", 0, context), "")
+        self.assertEqual(rm.ChoiceMemory.recall("t", "f_att", "610", 1, context), "")
+
+    def test_does_not_touch_a_different_layers_entries(self):
+        context_a = "QgsQueryBuilderBase|Query Builder|QgisApp|layer-abc-123"
+        context_b = "QgsQueryBuilderBase|Query Builder|QgisApp|layer-xyz-999"
+        rm.ChoiceMemory.remember("t", "f_att", "610", "mosque", 0, context_a)
+        rm.ChoiceMemory.remember("t", "f_att", "610", "greenhouse", 0, context_b)
+
+        rm.ChoiceMemory.purge_for_layer("layer-abc-123")
+
+        self.assertEqual(rm.ChoiceMemory.recall("t", "f_att", "610", 0, context_a), "")
+        self.assertEqual(rm.ChoiceMemory.recall("t", "f_att", "610", 0, context_b), "greenhouse")
+
+    def test_an_empty_or_unmatched_layer_id_is_a_harmless_no_op(self):
+        rm.ChoiceMemory.remember("t", "f", "1", "Active", 0, "ctx")
+        self.assertEqual(rm.ChoiceMemory.purge_for_layer(""), 0)
+        self.assertEqual(rm.ChoiceMemory.purge_for_layer("no-such-layer"), 0)
+        self.assertEqual(rm.ChoiceMemory.recall("t", "f", "1", 0, "ctx"), "Active")
+
+    def test_forget_does_not_disturb_a_different_occurrence(self):
+        rm.ChoiceMemory.remember("t", "f", "1", "Active", 0, "ctx")
+        rm.ChoiceMemory.remember("t", "f", "1", "Enabled", 1, "ctx")
+
+        rm.ChoiceMemory.forget("t", "f", "1", 0, "ctx")
+
+        self.assertEqual(rm.ChoiceMemory.recall("t", "f", "1", 0, "ctx"), "")
+        self.assertEqual(rm.ChoiceMemory.recall("t", "f", "1", 1, "ctx"), "Enabled")
+
+
 class ReconcileChoicesTests(unittest.TestCase):
     """reconcile_choices() - rewriting ChoiceMemory so it exactly matches
     the current expression instead of only ever accumulating entries, or

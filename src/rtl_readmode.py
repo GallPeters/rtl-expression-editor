@@ -677,6 +677,46 @@ class ChoiceMemory:
             _log(f"Could not forget a stale choice: {exc}")
 
     @classmethod
+    def purge_for_layer(cls, layer_id: str) -> int:
+        """Remove every entry whose context references ``layer_id`` -
+        called when a layer is removed from the project (see
+        ``RtlBidiEditorPlugin``'s ``layersWillBeRemoved`` hook), so its
+        remembered choices do not sit in the project file forever with no
+        layer left that could ever reconcile them away.
+
+        ``reconcile_choices()`` only ever runs when a specific expression's
+        own dialog is accepted - it has no way to notice a layer (and every
+        expression slot on it) disappearing entirely. This is the
+        complementary cleanup for that case, precise rather than a general
+        heuristic sweep: ``expression_context_key()`` always appends the
+        layer's id as the LAST part of the context before the field/value
+        portion (see its own docstring), so a substring check against a
+        known-real, just-removed layer id can only ever match an entry
+        that genuinely belongs to that layer - never a false positive from
+        guessing at an opaque context string's structure.
+
+        Returns how many keys were removed.
+        """
+        if not layer_id:
+            return 0
+        cls._ensure_hook()
+        data = cls._load()
+        to_remove = [key for key in data if layer_id in key]
+        if not to_remove:
+            return 0
+        for key in to_remove:
+            del data[key]
+        try:
+            import json
+
+            from qgis.core import QgsProject
+
+            QgsProject.instance().writeEntry(cls.SCOPE, cls.KEY, json.dumps(data, ensure_ascii=False))
+        except Exception as exc:
+            _log(f"Could not purge choices for a removed layer: {exc}")
+        return len(to_remove)
+
+    @classmethod
     def invalidate(cls) -> None:
         cls._cache = None
 
