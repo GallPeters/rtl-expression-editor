@@ -34,6 +34,7 @@ server=False
   - Added: Export Settings / Import Settings, saving and loading the whole configuration - including the autocomplete lookup layer - as a JSON file, never including a database connection's own credentials.
   - Improved: the Edit/Read switch is now a real slider; the Settings window is resizable, with detailed tooltips throughout and clearer import errors (not found vs. not accessible).
   - Fixed: a Hebrew field or value description in Read mode could visually reverse the expression's own left-to-right structure; a few tooltip, resizing and stale-warning issues in the Settings dialog.
+  - Fixed: editing an expression's value/description choices no longer only ever accumulates entries in the project file - accepting the dialog (OK) now rewrites them to exactly match the edited expression, dropping anything that no longer applies and correcting any choice an edit had shifted onto the wrong occurrence.
 
 ** v1.4 (12.08.2026):
   - Added: Ctrl+Space (and automatic suggestions while typing) for fields, functions, variables and values, with signatures and help - works even without a configured lookup table.

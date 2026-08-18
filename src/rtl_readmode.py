@@ -24,6 +24,7 @@ Three pieces:
 
 from __future__ import annotations
 
+import difflib
 import re
 from typing import Dict, List, Optional, Tuple
 
@@ -650,6 +651,32 @@ class ChoiceMemory:
         return cls._load().get(key, "")
 
     @classmethod
+    def forget(cls, table: str, field: str, code: str, occurrence: int, context: str = "") -> None:
+        """Remove one occurrence's entries (primary and alternative)
+        entirely - used by ``reconcile_choices()`` to clear a slot before
+        rewriting it, and to drop one that no longer corresponds to
+        anything in the current expression at all."""
+        cls._ensure_hook()
+        data = cls._load()
+        primary_key = cls._key(table, field, code, occurrence, context)
+        alt_key = primary_key + cls._ALT_SUFFIX
+        changed = False
+        for key in (primary_key, alt_key):
+            if key in data:
+                del data[key]
+                changed = True
+        if not changed:
+            return
+        try:
+            import json
+
+            from qgis.core import QgsProject
+
+            QgsProject.instance().writeEntry(cls.SCOPE, cls.KEY, json.dumps(data, ensure_ascii=False))
+        except Exception as exc:
+            _log(f"Could not forget a stale choice: {exc}")
+
+    @classmethod
     def invalidate(cls) -> None:
         cls._cache = None
 
@@ -776,6 +803,152 @@ def occurrence_index(text_before: str, field: str, code: str) -> int:
         if current_field == field and normalize_code(literal) == code:
             count += 1
     return count
+
+
+def _scan_value_literals(text: str) -> List[Tuple[str, str, int, int, int]]:
+    """Every value literal in ``text``, as ``(field, code, start, end,
+    occurrence)`` - the same field-attribution and occurrence-counting rule
+    ``substitute_descriptions()``/``occurrence_index()`` use, just also
+    keeping each literal's exact character span (quotes included), which is
+    what ``reconcile_choices()`` needs to line up two versions of the same
+    expression.
+    """
+    results: List[Tuple[str, str, int, int, int]] = []
+    current_field = ""
+    counters: Dict[Tuple[str, str], int] = {}
+    for match in _SCAN_RE.finditer(text):
+        field = match.group("field")
+        if field is not None:
+            current_field = field.strip().lower()
+            continue
+        literal = match.group("quoted")
+        if literal is None:
+            literal = match.group("bare")
+        if literal is None:
+            continue
+        code = normalize_code(literal)
+        if not current_field or not code:
+            continue
+        key = (current_field, code)
+        occurrence = counters.get(key, 0)
+        counters[key] = occurrence + 1
+        results.append((current_field, code, match.start(), match.end(), occurrence))
+    return results
+
+
+def _map_span(
+    blocks: List[Tuple[int, int, int]], start: int, end: int
+) -> Optional[Tuple[int, int]]:
+    """Where ``text_a[start:end]`` ends up in ``text_b``, if it survived
+    unchanged - i.e. it falls entirely within one of ``blocks`` (from
+    ``difflib.SequenceMatcher.get_matching_blocks()``). ``None`` if the span
+    was touched by an edit (a delete, insert or replace) at all.
+    """
+    for i, j, size in blocks:
+        if size and start >= i and end <= i + size:
+            offset = start - i
+            return (j + offset, j + offset + (end - start))
+    return None
+
+
+def reconcile_choices(context: str, table: str, before_text: str, after_text: str) -> None:
+    """Rewrite ``ChoiceMemory`` so its entries exactly match ``after_text``,
+    given what the same expression looked like before (``before_text``).
+
+    Two things happen, for every ``(field, code)`` pair either text
+    mentions:
+
+    * a remembered choice for a literal that SURVIVED the edit unchanged -
+      its exact characters are still there, just possibly at a different
+      occurrence index now (e.g. because another instance of the same
+      code was inserted earlier in the expression) - is MOVED to its new,
+      correct occurrence index, rather than left stranded under the old
+      one. Left stranded, it would either never be recalled again (a
+      silent, permanent loss of the user's choice) or - worse - end up
+      wrongly attributed to a *different* literal that now happens to
+      share that old occurrence number.
+    * anything left over after that - a choice for an occurrence that no
+      longer corresponds to any literal at all, because it (or the whole
+      clause it was in) was removed or replaced - is deleted outright,
+      instead of accumulating in the project file forever.
+
+    A CHARACTER-LEVEL diff (``difflib``, not a per-field/code diff, which
+    cannot tell two identical literals apart at all) is what identifies
+    survivors: longest-common-subsequence matching naturally uses each
+    literal's surrounding, unchanged context to decide which specific
+    occurrence in ``after_text`` a given occurrence in ``before_text``
+    corresponds to - the same way a text editor's own diff view lines up
+    unchanged lines around a small edit.
+
+    Meant to run once, when the surrounding dialog is accepted (OK) - see
+    ``ChoiceReconciler`` - comparing the expression as it stood when that
+    editing session began against its final, saved form. Since only the
+    NET difference between those two matters here, this is correct
+    regardless of how many separate edits happened in between.
+    """
+    if before_text == after_text:
+        return  # nothing could possibly have moved or disappeared
+
+    before_matches = _scan_value_literals(before_text)
+    after_matches = _scan_value_literals(after_text)
+    if not before_matches and not after_matches:
+        return
+
+    blocks = difflib.SequenceMatcher(None, before_text, after_text, autojunk=False).get_matching_blocks()
+    after_field_by_span = {(s, e): (f, c, occ) for f, c, s, e, occ in after_matches}
+
+    # (field, code) -> {old_occurrence: new_occurrence}, for literals whose
+    # exact characters survived the edit at all.
+    moves: Dict[Tuple[str, str], Dict[int, int]] = {}
+    for field, code, start, end, old_occurrence in before_matches:
+        target = _map_span(blocks, start, end)
+        if target is None:
+            continue
+        after_hit = after_field_by_span.get(target)
+        if after_hit is None:
+            continue
+        after_field, after_code, new_occurrence = after_hit
+        if after_field != field or after_code != code:
+            continue  # identical characters but a different parse - be conservative
+        moves.setdefault((field, code), {})[old_occurrence] = new_occurrence
+
+    before_counts: Dict[Tuple[str, str], int] = {}
+    for field, code, _s, _e, occurrence in before_matches:
+        before_counts[(field, code)] = max(before_counts.get((field, code), 0), occurrence + 1)
+    after_counts: Dict[Tuple[str, str], int] = {}
+    for field, code, _s, _e, occurrence in after_matches:
+        after_counts[(field, code)] = max(after_counts.get((field, code), 0), occurrence + 1)
+
+    pairs = set(before_counts) | set(after_counts)
+    for field, code in pairs:
+        old_count = before_counts.get((field, code), 0)
+        new_count = after_counts.get((field, code), 0)
+        pair_moves = moves.get((field, code), {})
+
+        # Read out whatever is currently recorded for every old occurrence
+        # BEFORE anything is deleted - forget() below would otherwise erase
+        # a choice this same pass still needs to carry forward.
+        surviving: Dict[int, Tuple[str, str]] = {}
+        for old_occurrence in range(old_count):
+            description = ChoiceMemory.recall(table, field, code, old_occurrence, context)
+            if not description:
+                continue
+            new_occurrence = pair_moves.get(old_occurrence)
+            if new_occurrence is None:
+                continue  # this literal did not survive - nothing to carry forward
+            alt = ChoiceMemory.recall_alt(table, field, code, old_occurrence, context)
+            surviving[new_occurrence] = (description, alt)
+
+        # Clear the whole occurrence range for this pair, then rewrite only
+        # what is still valid - simpler and safer than moving entries one
+        # at a time, which risks clobbering a value still waiting to move
+        # if two occurrences happen to swap slots.
+        for occurrence in range(max(old_count, new_count)):
+            ChoiceMemory.forget(table, field, code, occurrence, context)
+        for new_occurrence, (description, alt) in surviving.items():
+            ChoiceMemory.remember(table, field, code, description, new_occurrence, context)
+            if alt:
+                ChoiceMemory.remember_alt(table, field, code, new_occurrence, context, alt)
 
 
 #: Left-to-Right Mark (U+200E) - zero-width, no glyph of its own, but a
@@ -1288,4 +1461,86 @@ class ReadModeController(QObject):
             except Exception:
                 pass
             self._switch = None
+        self._editor = None
+
+
+# --------------------------------------------------------------------------- #
+# Choice reconciliation
+# --------------------------------------------------------------------------- #
+
+
+class ChoiceReconciler(QObject):
+    """Rewrites ``ChoiceMemory`` to exactly match the final expression, once,
+    when the surrounding dialog is accepted (OK - not Cancel, and not just
+    Scintilla's own live "Apply" preview) - see ``reconcile_choices()`` for
+    what that actually does and why it is needed.
+
+    Without this, ``ChoiceMemory`` only ever gains entries and never loses
+    or renumbers any: editing an expression so that a remembered value
+    ends up at a different occurrence index (inserting another instance of
+    the same code earlier in the expression, or removing one) leaves the
+    old entry behind, unused, while the literal that now holds that old
+    occurrence number gets that entry's description whether it matches or
+    not. Over time - a lot of back-and-forth editing - this both bloats
+    the project file with entries nothing recalls any more, and can show
+    the wrong description for a value that was never ambiguous in the
+    first place.
+
+    Captures the expression's text as it stood when this editor was first
+    attached - the baseline reconcile_choices() compares against once OK
+    is pressed. Only the NET difference between those two points matters,
+    so this is correct regardless of how many separate edits happened in
+    between.
+    """
+
+    def __init__(self, editor):
+        super().__init__(editor)
+        self._editor = editor
+        self._window = None
+        try:
+            sci = getattr(editor, "_sci", None)
+            baseline = sci.text() if sci is not None else editor.toPlainText()
+            self._baseline = baseline.replace("\r\n", "\n").replace("\r", "\n")
+        except Exception:
+            self._baseline = editor.toPlainText()
+
+        try:
+            window = editor.window()
+            # Not every dialog this plugin attaches to necessarily exposes
+            # QDialog.accepted (a degraded/unknown host window might not) -
+            # checked explicitly rather than assumed, so a window that
+            # lacks it simply never reconciles rather than raising.
+            if window is not None and hasattr(window, "accepted"):
+                window.accepted.connect(self._on_accepted)
+                self._window = window
+        except Exception as exc:
+            _log(f"Choice reconciliation unavailable: {exc}", Qgis.MessageLevel.Info)
+
+    def _on_accepted(self) -> None:
+        editor = self._editor
+        if editor is None:
+            return
+        try:
+            sci = getattr(editor, "_sci", None)
+            after_text = sci.text() if sci is not None else editor.toPlainText()
+            after_text = after_text.replace("\r\n", "\n").replace("\r", "\n")
+
+            from .rtl_autocomplete import resolve_table_candidates
+
+            probe = sci if sci is not None else editor
+            tables = resolve_table_candidates(probe)
+            table = tables[0] if tables else ""
+            context = expression_context_key(probe)
+            reconcile_choices(context, table, self._baseline, after_text)
+        except Exception as exc:
+            _log(f"Choice reconciliation failed: {exc}", Qgis.MessageLevel.Warning)
+
+    def teardown(self) -> None:
+        """Safe to call more than once."""
+        if self._window is not None:
+            try:
+                self._window.accepted.disconnect(self._on_accepted)
+            except Exception:
+                pass
+            self._window = None
         self._editor = None

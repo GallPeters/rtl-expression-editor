@@ -115,8 +115,9 @@ except Exception:  # pragma: no cover
     CustomAutocompleteController = None
 
 try:
-    from .rtl_readmode import ReadModeController
+    from .rtl_readmode import ChoiceReconciler, ReadModeController
 except Exception:  # pragma: no cover
+    ChoiceReconciler = None
     ReadModeController = None
 
 
@@ -1222,6 +1223,20 @@ class RtlOverlayEditor(QPlainTextEdit):
                     f"Custom autocomplete unavailable: {exc}", Qgis.MessageLevel.Info
                 )
 
+        # --- optional feature: remembered-choice reconciliation -----------
+        # Rewrites the project's ChoiceMemory entries to exactly match the
+        # expression once the surrounding dialog is accepted (OK), instead
+        # of letting them only ever accumulate - see ChoiceReconciler.
+        self._choice_reconciler = None
+        if ChoiceReconciler is not None:
+            try:
+                self._choice_reconciler = ChoiceReconciler(self)
+            except Exception as exc:
+                self._choice_reconciler = None
+                _log(
+                    f"Choice reconciliation unavailable: {exc}", Qgis.MessageLevel.Info
+                )
+
     # ------------------------------------------------------------------ #
     # Setup
     # ------------------------------------------------------------------ #
@@ -1694,6 +1709,13 @@ class RtlOverlayEditor(QPlainTextEdit):
             except Exception:
                 pass
             self._custom_autocomplete = None
+        reconciler = getattr(self, "_choice_reconciler", None)
+        if reconciler is not None:
+            try:
+                reconciler.teardown()
+            except Exception:
+                pass
+            self._choice_reconciler = None
         read_mode = getattr(self, "_read_mode", None)
         if read_mode is not None:
             try:

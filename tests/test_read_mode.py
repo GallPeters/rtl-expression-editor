@@ -10,7 +10,7 @@ from qgis.PyQt.QtWidgets import QPlainTextEdit
 from _rtl_plugin import rtl_readmode as rm
 from _rtl_plugin.rtl_settings import Settings
 
-from .utils import make_context_layer, make_lookup_layer, reset_plugin_settings
+from .utils import host_in_dialog, make_context_layer, make_lookup_layer, reset_plugin_settings
 
 
 def iso(text: str) -> str:
@@ -568,6 +568,211 @@ class ChoiceMemoryAltDescriptionPersistenceTests(unittest.TestCase):
         rm.DescriptionResolver.invalidate()
         self._enter_alt_mode_for_status_1()  # no remember() call beforehand
         self.assertEqual(rm.ChoiceMemory.recall_alt("context", "status", "1", 0, "ctx"), "")
+
+
+class ChoiceMemoryForgetTests(unittest.TestCase):
+    """ChoiceMemory.forget() - the low-level primitive reconcile_choices()
+    builds on: removes one occurrence's primary AND alternative entries."""
+
+    def setUp(self):
+        self.project = QgsProject.instance()
+        self.original, self.existed = self.project.readEntry("rtl_bidi_editor", "value_choices", "")
+
+    def tearDown(self):
+        if self.existed:
+            self.project.writeEntry("rtl_bidi_editor", "value_choices", self.original)
+        else:
+            self.project.removeEntry("rtl_bidi_editor", "value_choices")
+        rm.ChoiceMemory.invalidate()
+
+    def test_forget_removes_both_the_primary_and_alternative_entry(self):
+        rm.ChoiceMemory.remember("t", "f", "1", "Active", 0, "ctx")
+        rm.ChoiceMemory.remember_alt("t", "f", "1", 0, "ctx", "פעיל")
+        self.assertEqual(rm.ChoiceMemory.recall("t", "f", "1", 0, "ctx"), "Active")
+        self.assertEqual(rm.ChoiceMemory.recall_alt("t", "f", "1", 0, "ctx"), "פעיל")
+
+        rm.ChoiceMemory.forget("t", "f", "1", 0, "ctx")
+
+        self.assertEqual(rm.ChoiceMemory.recall("t", "f", "1", 0, "ctx"), "")
+        self.assertEqual(rm.ChoiceMemory.recall_alt("t", "f", "1", 0, "ctx"), "")
+
+    def test_forgetting_a_never_remembered_occurrence_is_a_harmless_no_op(self):
+        rm.ChoiceMemory.forget("t", "f", "1", 0, "ctx")  # must not raise
+        self.assertEqual(rm.ChoiceMemory.recall("t", "f", "1", 0, "ctx"), "")
+
+    def test_forget_does_not_disturb_a_different_occurrence(self):
+        rm.ChoiceMemory.remember("t", "f", "1", "Active", 0, "ctx")
+        rm.ChoiceMemory.remember("t", "f", "1", "Enabled", 1, "ctx")
+
+        rm.ChoiceMemory.forget("t", "f", "1", 0, "ctx")
+
+        self.assertEqual(rm.ChoiceMemory.recall("t", "f", "1", 0, "ctx"), "")
+        self.assertEqual(rm.ChoiceMemory.recall("t", "f", "1", 1, "ctx"), "Enabled")
+
+
+class ReconcileChoicesTests(unittest.TestCase):
+    """reconcile_choices() - rewriting ChoiceMemory so it exactly matches
+    the current expression instead of only ever accumulating entries, or
+    silently misattributing one occurrence's remembered choice to a
+    DIFFERENT literal once editing shifts which one holds a given
+    occurrence number.
+    """
+
+    CONTEXT = "ctx"
+    TABLE = "mytable"
+
+    def setUp(self):
+        self.project = QgsProject.instance()
+        self.original, self.existed = self.project.readEntry("rtl_bidi_editor", "value_choices", "")
+
+    def tearDown(self):
+        if self.existed:
+            self.project.writeEntry("rtl_bidi_editor", "value_choices", self.original)
+        else:
+            self.project.removeEntry("rtl_bidi_editor", "value_choices")
+        rm.ChoiceMemory.invalidate()
+
+    def _recall(self, code, occurrence):
+        return rm.ChoiceMemory.recall(self.TABLE, "code", code, occurrence, self.CONTEXT)
+
+    def test_identical_text_is_a_no_op(self):
+        rm.ChoiceMemory.remember(self.TABLE, "code", "610", "mosque", 0, self.CONTEXT)
+        text = "\"CODE\" = 610"
+        rm.reconcile_choices(self.CONTEXT, self.TABLE, text, text)
+        self.assertEqual(self._recall("610", 0), "mosque")
+
+    def test_an_earlier_insertion_moves_survivors_to_their_new_occurrence(self):
+        """The exact scenario reported: inserting a new occurrence of the
+        same field/code pair BEFORE existing ones must not leave the
+        existing ones' remembered choices stranded under their old,
+        now-wrong occurrence numbers."""
+        rm.ChoiceMemory.remember(self.TABLE, "code", "610", "mosque", 0, self.CONTEXT)
+        rm.ChoiceMemory.remember(self.TABLE, "code", "610", "greenhouse", 1, self.CONTEXT)
+
+        before = '"CODE" = 610 AND "OTHER" = 1 AND "CODE" = 610'
+        # A brand-new third occurrence inserted at the very start - both
+        # previously-existing ones are still present, unchanged, just later.
+        after = '"CODE" = 610 AND "CODE" = 610 AND "OTHER" = 1 AND "CODE" = 610'
+
+        rm.reconcile_choices(self.CONTEXT, self.TABLE, before, after)
+
+        self.assertEqual(self._recall("610", 0), "")  # the new occurrence - nothing chosen yet
+        self.assertEqual(self._recall("610", 1), "mosque")  # carried from old occurrence 0
+        self.assertEqual(self._recall("610", 2), "greenhouse")  # carried from old occurrence 1
+
+    def test_removing_a_clause_deletes_its_choice_and_shifts_the_survivor_down(self):
+        """The other half of the same scenario: removing the first of two
+        occurrences must not leave the survivor showing the REMOVED one's
+        description."""
+        rm.ChoiceMemory.remember(self.TABLE, "code", "610", "mosque", 0, self.CONTEXT)
+        rm.ChoiceMemory.remember(self.TABLE, "code", "610", "greenhouse", 1, self.CONTEXT)
+
+        before = '"CODE" = 610 AND "OTHER" = 1 AND "CODE" = 610'
+        after = '"OTHER" = 1 AND "CODE" = 610'  # the first "CODE" = 610 clause was deleted
+
+        rm.reconcile_choices(self.CONTEXT, self.TABLE, before, after)
+
+        self.assertEqual(self._recall("610", 0), "greenhouse")  # NOT "mosque" - that clause is gone
+        self.assertEqual(self._recall("610", 1), "")  # no stale leftover for a slot that no longer exists
+
+    def test_an_alternative_description_moves_along_with_its_primary(self):
+        rm.ChoiceMemory.remember(self.TABLE, "code", "610", "mosque", 0, self.CONTEXT)
+        rm.ChoiceMemory.remember_alt(self.TABLE, "code", "610", 0, self.CONTEXT, "مسجد")
+
+        before = '"CODE" = 610'
+        after = '"OTHER" = 1 AND "CODE" = 610'  # an unrelated clause inserted before it
+
+        rm.reconcile_choices(self.CONTEXT, self.TABLE, before, after)
+
+        self.assertEqual(self._recall("610", 0), "mosque")
+        self.assertEqual(rm.ChoiceMemory.recall_alt(self.TABLE, "code", "610", 0, self.CONTEXT), "مسجد")
+
+    def test_a_fully_removed_occurrence_with_no_survivor_at_all_is_deleted(self):
+        rm.ChoiceMemory.remember(self.TABLE, "code", "610", "mosque", 0, self.CONTEXT)
+
+        before = '"CODE" = 610'
+        after = '"OTHER" = 1'  # the only occurrence is gone entirely
+
+        rm.reconcile_choices(self.CONTEXT, self.TABLE, before, after)
+
+        self.assertEqual(self._recall("610", 0), "")
+
+    def test_unrelated_fields_are_left_alone(self):
+        rm.ChoiceMemory.remember(self.TABLE, "country", "IL", "Israel", 0, self.CONTEXT)
+        before = '"COUNTRY" = \'IL\''
+        after = '"COUNTRY" = \'IL\' AND "STATUS" = 1'
+        rm.reconcile_choices(self.CONTEXT, self.TABLE, before, after)
+        self.assertEqual(
+            rm.ChoiceMemory.recall(self.TABLE, "country", "IL", 0, self.CONTEXT), "Israel"
+        )
+
+
+class ChoiceReconcilerTests(unittest.TestCase):
+    """ChoiceReconciler - the wiring that actually triggers
+    reconcile_choices() once, when the surrounding dialog is accepted."""
+
+    def setUp(self):
+        reset_plugin_settings()
+        self.context_layer = make_context_layer(("CODE", "OTHER"))
+        QgsProject.instance().addMapLayer(self.context_layer)
+        self.project = QgsProject.instance()
+        self.original, self.existed = self.project.readEntry("rtl_bidi_editor", "value_choices", "")
+
+    def tearDown(self):
+        if self.existed:
+            self.project.writeEntry("rtl_bidi_editor", "value_choices", self.original)
+        else:
+            self.project.removeEntry("rtl_bidi_editor", "value_choices")
+        rm.ChoiceMemory.invalidate()
+        QgsProject.instance().removeMapLayer(self.context_layer.id())
+        reset_plugin_settings()
+
+    def _make_editor(self, text):
+        editor = QPlainTextEdit()
+        editor.layer = lambda: self.context_layer
+        editor.setPlainText(text)
+        dialog = host_in_dialog(editor)
+        return editor, dialog
+
+    def test_accepting_the_dialog_reconciles_using_the_attach_time_baseline(self):
+        editor, dialog = self._make_editor('"CODE" = 610 AND "OTHER" = 1 AND "CODE" = 610')
+
+        from _rtl_plugin.rtl_autocomplete import resolve_table_candidates
+
+        tables = resolve_table_candidates(editor)
+        table = tables[0] if tables else ""
+        context = rm.expression_context_key(editor)
+        rm.ChoiceMemory.remember(table, "code", "610", "mosque", 0, context)
+        rm.ChoiceMemory.remember(table, "code", "610", "greenhouse", 1, context)
+
+        reconciler = rm.ChoiceReconciler(editor)
+        try:
+            # Edited AFTER the reconciler captured its baseline, exactly as
+            # a user would inside the real dialog before pressing OK.
+            editor.setPlainText(
+                '"CODE" = 610 AND "CODE" = 610 AND "OTHER" = 1 AND "CODE" = 610'
+            )
+            dialog.accept()  # emits QDialog.accepted
+
+            self.assertEqual(
+                rm.ChoiceMemory.recall(table, "code", "610", 1, context), "mosque"
+            )
+            self.assertEqual(
+                rm.ChoiceMemory.recall(table, "code", "610", 2, context), "greenhouse"
+            )
+        finally:
+            reconciler.teardown()
+            dialog.deleteLater()
+
+    def test_teardown_disconnects_so_a_later_accept_does_not_reconcile_again(self):
+        editor, dialog = self._make_editor('"CODE" = 610')
+        reconciler = rm.ChoiceReconciler(editor)
+        reconciler.teardown()
+
+        # Should not raise even though the reconciler is torn down and its
+        # own editor reference is gone.
+        dialog.accept()
+        dialog.deleteLater()
 
 
 class SlideSwitchTests(unittest.TestCase):
