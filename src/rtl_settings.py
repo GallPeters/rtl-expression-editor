@@ -920,14 +920,6 @@ class SettingsDialog(QDialog):
         # -- Import / Export ------------------------------------------------ #
         io_group = QGroupBox("Import / Export Settings", self)
         io_layout = QVBoxLayout(io_group)
-        io_label = QLabel(
-            "Save this configuration to a file, or load one prepared by "
-            "someone else - useful for distributing a ready-made "
-            "autocomplete source to colleagues.",
-            io_group,
-        )
-        io_label.setWordWrap(True)
-        io_layout.addWidget(io_label)
         io_buttons_row = QHBoxLayout()
         self.btn_export = QPushButton("Export Settings...", io_group)
         self.btn_export.setToolTip(
@@ -1376,7 +1368,19 @@ class SettingsDialog(QDialog):
                     QApplication.processEvents()
 
             buffer = io.StringIO()
-            result = run_all.main(verbosity=2, stream=buffer, resultclass=_ResponsiveTestResult)
+            try:
+                result = run_all.main(verbosity=2, stream=buffer, resultclass=_ResponsiveTestResult)
+            except TypeError:
+                # An installed tests/run_all.py that predates the
+                # resultclass parameter - e.g. a stale copy of the plugin
+                # files on disk, or (since a QGIS session commonly outlives
+                # a single "Run Tests" click) a version of this module
+                # Python already had cached in sys.modules from earlier in
+                # the same session, before the plugin's own files were last
+                # updated. Falls back to a plain run rather than crashing
+                # outright; only the responsiveness during it is lost.
+                buffer = io.StringIO()
+                result = run_all.main(verbosity=2, stream=buffer)
             log_text = buffer.getvalue()
         except Exception as exc:
             # The full traceback, not just str(exc): a bare exception message

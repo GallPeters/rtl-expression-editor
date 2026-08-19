@@ -29,19 +29,10 @@ hasProcessingProvider=no
 server=False
 
 ** v1.5 (17.08.2026):
-  - Added: the suggestion list now shows a title - the dataset name when naming a field, the field name when picking its value - enriched with optional Table description / Field description columns, which also replace field names outright in Read mode.
-  - Added: an optional Alternative value description column, giving Read mode a third switch position - already-described values pick it up automatically, with nothing to reselect.
-  - Added: Export Settings / Import Settings, saving and loading the whole configuration - including the autocomplete lookup layer - as a JSON file, never including a database connection's own credentials.
-  - Added: a "Clear & Scan" button in Settings that removes remembered value/description choices no longer used anywhere (a data-defined override, a rule filter, a label expression, or a layer filter), and warns - without deleting - about any that no longer match the configured lookup table (e.g. a database-backed table whose values changed).
-  - Added: a "Reset Legacy Entries" button in Settings for a one-time cleanup of choices with no precise tracking id yet.
-  - Improved: the Edit/Read mode switch is now a real slider - drag it, or tap anywhere on it to jump straight to that mode.
-  - Improved: the Settings window is resizable, with detailed tooltips throughout and clearer import errors (not found vs. not accessible); Clear & Scan, Reset Legacy Entries and Run Tests now live together in their own "Maintenance" group.
-  - Improved: Run Tests keeps the window responsive throughout a run and never touches the currently open project, which is snapshotted and restored exactly regardless of what any test does.
-  - Fixed: a Hebrew field or value description in Read mode could visually reverse the expression's own left-to-right structure - an operator's position, or the order of an IN (...) list.
-  - Fixed: editing an expression's value/description choices no longer only ever accumulates entries in the project file - accepting the dialog (OK) now rewrites them to exactly match the edited expression, dropping anything no longer needed and correcting any choice an edit had shifted onto the wrong occurrence.
-  - Fixed: removing a layer from the project now also removes its remembered value/description choices, instead of leaving them behind indefinitely.
-  - Fixed: copying or cutting an expression - Select All, the context menu, or any other route - could carry the plugin's own hidden internal tracking id onto the clipboard along with the real text; only the real expression is ever copied or pasted now.
-  - Fixed: a few tooltip and stale-warning display issues in the Settings dialog.
+  - Added: suggestion-list titles with optional Table/Field description columns (also shown in Read mode); an optional Alternative value description, giving Read mode a third switch position; Export/Import Settings as a JSON file.
+  - Added: "Clear & Scan" and "Reset Legacy Entries" buttons in a new "Maintenance" group in Settings, alongside Run Tests, to clean up remembered value/description choices no longer in use.
+  - Improved: the Edit/Read mode switch is now a real slider; the Settings window is resizable with detailed tooltips; Run Tests stays responsive and never touches your open project.
+  - Fixed: a Hebrew description could reverse an expression's left-to-right layout in Read mode; remembered choices now stay in sync with edits and with layer removal instead of only accumulating; copying or cutting an expression could leak a hidden internal tracking id onto the clipboard.
 
 ** v1.4 (12.08.2026):
   - Added: Ctrl+Space (and automatic suggestions while typing) for fields, functions, variables and values, with signatures and help - works even without a configured lookup table.

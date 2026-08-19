@@ -169,6 +169,36 @@ class RunTestsButtonTests(unittest.TestCase):
         finally:
             dialog.deleteLater()
 
+    def test_falls_back_to_a_plain_run_when_resultclass_is_unsupported(self):
+        """A stale installed tests/run_all.py that predates the
+        ``resultclass`` parameter (or one Python already had cached in
+        sys.modules from earlier in the same QGIS session) must not crash
+        the button outright - see rtl_settings._run_tests()."""
+        from unittest import mock
+
+        from _rtl_plugin.rtl_settings import SettingsDialog
+
+        dialog = SettingsDialog()
+        fake_result = mock.Mock(wasSuccessful=lambda: True, testsRun=1, failures=[], errors=[])
+
+        def _fake_main(verbosity=2, stream=None, resultclass=None):
+            if resultclass is not None:
+                raise TypeError("main() got an unexpected keyword argument 'resultclass'")
+            return fake_result
+
+        try:
+            with mock.patch(
+                "tests.run_all.main", side_effect=_fake_main
+            ) as mocked_main, mock.patch.object(SettingsDialog, "_show_test_results") as mocked_show:
+                dialog._run_tests()
+
+            self.assertEqual(mocked_main.call_count, 2)
+            mocked_show.assert_called_once()
+            self.assertIs(mocked_show.call_args[0][0], fake_result)
+            self.assertTrue(dialog.btn_run_tests.isEnabled())
+        finally:
+            dialog.deleteLater()
+
 
 class ClearScanButtonTests(unittest.TestCase):
     """The Settings dialog's "Clear & Scan" button - always present, unlike
