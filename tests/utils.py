@@ -127,3 +127,42 @@ def reset_plugin_settings() -> None:
     Settings.set_layer_id("")
     for key in Settings.FIELD_KEYS:
         Settings.set_field(key, "")
+
+
+def reset_choice_memory():
+    """Snapshot the active project's remembered-choice entry, blank it, and
+    return a zero-argument callable that restores the exact original
+    snapshot - call it from ``tearDown``.
+
+    ``ChoiceMemory`` is keyed by (context, table, field, code, occurrence),
+    not by anything test-specific, so a test that only snapshots-and-restores
+    (the pattern this used to be, repeated across most of the classes in
+    ``test_read_mode.py``) still reads and counts whatever a REAL project
+    already has stored under the same project-scoped property - exactly the
+    situation whenever this suite runs from inside a live QGIS session via
+    the Settings dialog's "Run Tests" button, with the user's own actual
+    remembered choices already in the open project. That silently inflated
+    every ``total``/``deleted`` count and failure list by however many real
+    entries happened to be present, with no relation to what the test itself
+    added - blanking the entry here, on top of the same snapshot/restore, is
+    what makes a test see only what it put there itself, regardless of the
+    project it happens to run inside.
+    """
+    from qgis.core import QgsProject
+
+    from _rtl_plugin import rtl_readmode as rm
+
+    project = QgsProject.instance()
+    scope, key = rm.ChoiceMemory.SCOPE, rm.ChoiceMemory.KEY
+    original, existed = project.readEntry(scope, key, "")
+    project.removeEntry(scope, key)
+    rm.ChoiceMemory.invalidate()
+
+    def _restore() -> None:
+        if existed:
+            project.writeEntry(scope, key, original)
+        else:
+            project.removeEntry(scope, key)
+        rm.ChoiceMemory.invalidate()
+
+    return _restore

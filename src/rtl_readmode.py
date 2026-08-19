@@ -490,13 +490,30 @@ def extract_eid(text: str) -> str:
     return match.group(1) if match else ""
 
 
+def strip_eid_comment(text: str) -> str:
+    """``text`` with a leading expression-identity comment removed, if it
+    has one - unchanged otherwise.
+
+    The id line is a real, hidden-only-by-rendering part of the overlay's
+    own document (see ``RtlOverlayEditor.hide_expression_identity_line()``),
+    so a plain Select All + Copy - or Cut, or the right-click / Edit-menu
+    equivalents, or a drag-out - would otherwise carry it onto the
+    clipboard right along with the visible expression. This is what
+    ``rtl_editor``'s clipboard filter calls to make sure only the real,
+    user-visible expression ever leaves the editor that way, regardless of
+    which of those the user actually used.
+    """
+    match = _EID_COMMENT_RE.match(text)
+    return text[match.end():] if match else text
+
+
 def _eid_marker(eid: str) -> str:
     """What to search a saved project's text for - see
     ``_read_project_text_for_scan()``."""
     return f"{_EID_TAG}:{eid}"
 
 
-def _read_project_text_for_scan() -> Optional[str]:
+def _read_project_text_for_scan(project=None) -> Optional[str]:
     """The current project's saved file content, as plain text.
 
     Used only to check whether a specific expression-identity comment (see
@@ -507,14 +524,23 @@ def _read_project_text_for_scan() -> Optional[str]:
     Saves the project first, so the text reflects the CURRENT, on-screen
     state rather than whatever was last on disk before this call.
 
+    ``project`` defaults to ``QgsProject.instance()`` - the real, active
+    project - which is exactly what ``clear_and_scan()`` needs. It is
+    accepted as a parameter purely so a test can pass an independent,
+    throwaway ``QgsProject()`` instead: this function's own save-and-reread
+    round trip is otherwise impossible to test for real without pointing
+    the actual live singleton at a temporary file, which would disturb
+    whatever real project a user has open in the same session.
+
     Returns ``None`` when there is nothing usable to read - the project has
     never been saved to a file yet, or writing/reading it failed - callers
     MUST treat that as "cannot verify right now", never as "not found".
     """
     try:
-        from qgis.core import QgsProject
+        if project is None:
+            from qgis.core import QgsProject
 
-        project = QgsProject.instance()
+            project = QgsProject.instance()
         path = project.fileName()
         if not path:
             return None
@@ -1425,10 +1451,16 @@ def reconcile_choices(context: str, table: str, before_text: str, after_text: st
 
 #: Left-to-Right Mark (U+200E) - zero-width, no glyph of its own, but a
 #: "strong LTR" character as far as the Unicode Bidi Algorithm is concerned.
-#: See force_ltr_paragraphs() for why read mode needs it. Spelled as an
-#: escape, not pasted as a literal invisible character, so it survives
-#: editors/diffs/encodings that might otherwise silently mangle it.
-_LRM = "‎"
+#: See force_ltr_paragraphs() for why read mode needs it. Built with chr()
+#: rather than pasted as a literal invisible character: besides surviving
+#: editors/diffs/encodings that might otherwise silently mangle it, a
+#: bidirectional control character sitting directly in the source text trips
+#: automated security scanners (it is the same character class abused by
+#: "Trojan Source" attacks to hide code behind reordered rendering) - QGIS's
+#: own plugin repository rejected v1.5 over exactly this for _FSI/_PDI below.
+#: chr() produces the identical runtime character with no such literal ever
+#: appearing in the .py file itself.
+_LRM = chr(0x200E)
 
 
 def force_ltr_paragraphs(text: str) -> str:
@@ -1474,8 +1506,13 @@ def force_ltr_paragraphs(text: str) -> str:
 #: unknown or mixed inside surrounding text, without letting its direction
 #: leak out and affect its neighbours. See _isolate() for why a single
 #: paragraph-level LRM (force_ltr_paragraphs) is not enough on its own.
-_FSI = "⁨"
-_PDI = "⁩"
+#: Built with chr(), not pasted as literal invisible characters - see _LRM's
+#: own comment above; these two are the exact characters the QGIS plugin
+#: repository's security scanner flagged in v1.5 ("contains bidirectional
+#: control characters"), since a directional-isolate/override sitting
+#: directly in source text is the same trick "Trojan Source" attacks use.
+_FSI = chr(0x2068)
+_PDI = chr(0x2069)
 
 
 def _isolate(label: str) -> str:

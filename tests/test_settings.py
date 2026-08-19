@@ -322,6 +322,50 @@ class ResetLegacyEntriesButtonTests(unittest.TestCase):
             dialog.deleteLater()
 
 
+class MaintenanceGroupTests(unittest.TestCase):
+    """Clear & Scan, Reset Legacy Entries and (when a dev checkout's tests/
+    folder is found) Run Tests live together in their own "Maintenance"
+    group - separate from Import / Export Settings, which only ever saves
+    or loads a configuration rather than inspecting or cleaning up the
+    plugin's own stored state."""
+
+    def test_clear_scan_and_reset_legacy_share_a_maintenance_group(self):
+        from qgis.PyQt.QtWidgets import QGroupBox
+
+        from _rtl_plugin.rtl_settings import SettingsDialog
+
+        dialog = SettingsDialog()
+        try:
+            scan_group = dialog.btn_clear_scan.parentWidget()
+            legacy_group = dialog.btn_reset_legacy.parentWidget()
+            self.assertIsInstance(scan_group, QGroupBox)
+            self.assertIs(scan_group, legacy_group)
+            self.assertEqual(scan_group.title(), "Maintenance")
+        finally:
+            dialog.deleteLater()
+
+    def test_maintenance_group_is_not_the_import_export_group(self):
+        from _rtl_plugin.rtl_settings import SettingsDialog
+
+        dialog = SettingsDialog()
+        try:
+            self.assertIsNot(dialog.btn_export.parentWidget(), dialog.btn_clear_scan.parentWidget())
+        finally:
+            dialog.deleteLater()
+
+    def test_run_tests_lives_in_the_same_maintenance_group_when_present(self):
+        from _rtl_plugin.rtl_settings import SettingsDialog
+
+        dialog = SettingsDialog()
+        try:
+            if hasattr(dialog, "btn_run_tests"):
+                self.assertIs(
+                    dialog.btn_run_tests.parentWidget(), dialog.btn_clear_scan.parentWidget()
+                )
+        finally:
+            dialog.deleteLater()
+
+
 class _FakeLayer:
     """Stands in for a QgsVectorLayer wherever only name()/providerType()/
     source() are read - see _describe_layer_source() - so path handling can

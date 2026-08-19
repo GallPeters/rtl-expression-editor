@@ -14,7 +14,13 @@ from qgis.PyQt.QtWidgets import QPlainTextEdit
 from _rtl_plugin import rtl_readmode as rm
 from _rtl_plugin.rtl_settings import Settings
 
-from .utils import host_in_dialog, make_context_layer, make_lookup_layer, reset_plugin_settings
+from .utils import (
+    host_in_dialog,
+    make_context_layer,
+    make_lookup_layer,
+    reset_choice_memory,
+    reset_plugin_settings,
+)
 
 
 def iso(text: str) -> str:
@@ -73,10 +79,10 @@ class SubstituteDescriptionsTests(unittest.TestCase):
 
     def test_a_remembered_choice_resolves_the_ambiguous_code(self):
         # ChoiceMemory.remember() writes into the ACTIVE QgsProject's custom
-        # properties - snapshot and restore that one entry, so this leaves no
-        # residue in a real project if run from inside a live QGIS session.
-        project = QgsProject.instance()
-        original, existed = project.readEntry("rtl_bidi_editor", "value_choices", "")
+        # properties - snapshot, blank and restore that one entry, so this
+        # neither leaks residue into nor reads stray data from a real
+        # project if run from inside a live QGIS session.
+        restore = reset_choice_memory()
         try:
             rm.ChoiceMemory.remember("mytable", "code", "610", "greenhouse", 0, "ctx")
             mapping = {"code": {"610": ["mosque", "greenhouse"]}}
@@ -86,11 +92,7 @@ class SubstituteDescriptionsTests(unittest.TestCase):
                 f'"CODE" = {iso("greenhouse")}',
             )
         finally:
-            if existed:
-                project.writeEntry("rtl_bidi_editor", "value_choices", original)
-            else:
-                project.removeEntry("rtl_bidi_editor", "value_choices")
-            rm.ChoiceMemory.invalidate()
+            restore()
 
     def test_field_names_are_replaced_by_their_configured_description(self):
         """Like a value's code, the field name disappears entirely in
@@ -126,8 +128,7 @@ class SubstituteDescriptionsTests(unittest.TestCase):
         )
 
     def test_alt_mode_respects_a_remembered_choice_among_several_meanings(self):
-        project = QgsProject.instance()
-        original, existed = project.readEntry("rtl_bidi_editor", "value_choices", "")
+        restore = reset_choice_memory()
         try:
             rm.ChoiceMemory.remember("mytable", "code", "610", "greenhouse", 0, "ctx")
             mapping = {"code": {"610": ["mosque", "greenhouse"]}}
@@ -140,11 +141,7 @@ class SubstituteDescriptionsTests(unittest.TestCase):
                 f'"CODE" = {iso("חממה")}',
             )
         finally:
-            if existed:
-                project.writeEntry("rtl_bidi_editor", "value_choices", original)
-            else:
-                project.removeEntry("rtl_bidi_editor", "value_choices")
-            rm.ChoiceMemory.invalidate()
+            restore()
 
 
 class ForceLtrParagraphsTests(unittest.TestCase):
@@ -384,16 +381,10 @@ class AlternativeDescriptionAutomaticEnrichmentTests(unittest.TestCase):
         rm.DescriptionResolver.invalidate()
 
         self.project = QgsProject.instance()
-        self.original_choices, self.existed = self.project.readEntry(
-            "rtl_bidi_editor", "value_choices", ""
-        )
+        self._restore_choices = reset_choice_memory()
 
     def tearDown(self):
-        if self.existed:
-            self.project.writeEntry("rtl_bidi_editor", "value_choices", self.original_choices)
-        else:
-            self.project.removeEntry("rtl_bidi_editor", "value_choices")
-        rm.ChoiceMemory.invalidate()
+        self._restore_choices()
         reset_plugin_settings()
         QgsProject.instance().removeMapLayer(self.layer.id())
         rm.DescriptionResolver.invalidate()
@@ -479,14 +470,10 @@ class ChoiceMemoryAltDescriptionPersistenceTests(unittest.TestCase):
         rm.DescriptionResolver.invalidate()
 
         self.project = QgsProject.instance()
-        self.original_choices, self.existed = self.project.readEntry(self.SCOPE, self.KEY, "")
+        self._restore_choices = reset_choice_memory()
 
     def tearDown(self):
-        if self.existed:
-            self.project.writeEntry(self.SCOPE, self.KEY, self.original_choices)
-        else:
-            self.project.removeEntry(self.SCOPE, self.KEY)
-        rm.ChoiceMemory.invalidate()
+        self._restore_choices()
         reset_plugin_settings()
         QgsProject.instance().removeMapLayer(self.layer.id())
         rm.DescriptionResolver.invalidate()
@@ -580,14 +567,10 @@ class ChoiceMemoryForgetTests(unittest.TestCase):
 
     def setUp(self):
         self.project = QgsProject.instance()
-        self.original, self.existed = self.project.readEntry("rtl_bidi_editor", "value_choices", "")
+        self._restore_choices = reset_choice_memory()
 
     def tearDown(self):
-        if self.existed:
-            self.project.writeEntry("rtl_bidi_editor", "value_choices", self.original)
-        else:
-            self.project.removeEntry("rtl_bidi_editor", "value_choices")
-        rm.ChoiceMemory.invalidate()
+        self._restore_choices()
 
     def test_forget_removes_both_the_primary_and_alternative_entry(self):
         rm.ChoiceMemory.remember("t", "f", "1", "Active", 0, "ctx")
@@ -622,14 +605,10 @@ class ChoiceMemoryPurgeForLayerTests(unittest.TestCase):
 
     def setUp(self):
         self.project = QgsProject.instance()
-        self.original, self.existed = self.project.readEntry("rtl_bidi_editor", "value_choices", "")
+        self._restore_choices = reset_choice_memory()
 
     def tearDown(self):
-        if self.existed:
-            self.project.writeEntry("rtl_bidi_editor", "value_choices", self.original)
-        else:
-            self.project.removeEntry("rtl_bidi_editor", "value_choices")
-        rm.ChoiceMemory.invalidate()
+        self._restore_choices()
 
     def test_removes_every_entry_whose_context_references_the_layer(self):
         # expression_context_key() always appends the layer's id as the
@@ -688,14 +667,10 @@ class ReconcileChoicesTests(unittest.TestCase):
 
     def setUp(self):
         self.project = QgsProject.instance()
-        self.original, self.existed = self.project.readEntry("rtl_bidi_editor", "value_choices", "")
+        self._restore_choices = reset_choice_memory()
 
     def tearDown(self):
-        if self.existed:
-            self.project.writeEntry("rtl_bidi_editor", "value_choices", self.original)
-        else:
-            self.project.removeEntry("rtl_bidi_editor", "value_choices")
-        rm.ChoiceMemory.invalidate()
+        self._restore_choices()
 
     def _recall(self, code, occurrence):
         return rm.ChoiceMemory.recall(self.TABLE, "code", code, occurrence, self.CONTEXT)
@@ -848,14 +823,10 @@ class ChoiceReconcilerTests(unittest.TestCase):
         self.context_layer = make_context_layer(("CODE", "OTHER"))
         QgsProject.instance().addMapLayer(self.context_layer)
         self.project = QgsProject.instance()
-        self.original, self.existed = self.project.readEntry("rtl_bidi_editor", "value_choices", "")
+        self._restore_choices = reset_choice_memory()
 
     def tearDown(self):
-        if self.existed:
-            self.project.writeEntry("rtl_bidi_editor", "value_choices", self.original)
-        else:
-            self.project.removeEntry("rtl_bidi_editor", "value_choices")
-        rm.ChoiceMemory.invalidate()
+        self._restore_choices()
         QgsProject.instance().removeMapLayer(self.context_layer.id())
         reset_plugin_settings()
 
@@ -1140,7 +1111,7 @@ class ChoiceMemoryClearAndScanTests(unittest.TestCase):
         rm.DescriptionResolver.invalidate()
 
         self.project = QgsProject.instance()
-        self.original, self.existed = self.project.readEntry("rtl_bidi_editor", "value_choices", "")
+        self._restore_choices = reset_choice_memory()
 
         # A recognised layer-filter context - its "in use" status can be
         # re-derived from the layer's own live subsetString().
@@ -1151,11 +1122,7 @@ class ChoiceMemoryClearAndScanTests(unittest.TestCase):
         self.override_context = f"SomeOverrideDialog|Symbol Properties|QgisApp|{self.context_layer.id()}"
 
     def tearDown(self):
-        if self.existed:
-            self.project.writeEntry("rtl_bidi_editor", "value_choices", self.original)
-        else:
-            self.project.removeEntry("rtl_bidi_editor", "value_choices")
-        rm.ChoiceMemory.invalidate()
+        self._restore_choices()
         rm.DescriptionResolver.invalidate()
         QgsProject.instance().removeMapLayers([self.context_layer.id(), self.lookup_layer.id()])
         reset_plugin_settings()
@@ -1383,6 +1350,28 @@ class ExpressionIdentityTests(unittest.TestCase):
             self.assertNotIn(special, comment)
 
 
+class StripEidCommentTests(unittest.TestCase):
+    """strip_eid_comment() - what rtl_editor.ClipboardEidGuard calls to keep
+    the hidden id comment off the system clipboard, regardless of whether
+    the user got there via Select All + Copy, Cut, the right-click context
+    menu, or an Edit-menu action."""
+
+    def test_removes_a_leading_id_comment(self):
+        eid = rm.new_eid()
+        text = rm.make_eid_comment(eid) + '"F_ATT" = 610'
+        self.assertEqual(rm.strip_eid_comment(text), '"F_ATT" = 610')
+
+    def test_plain_text_with_no_id_comment_is_returned_unchanged(self):
+        self.assertEqual(rm.strip_eid_comment('"F_ATT" = 610'), '"F_ATT" = 610')
+
+    def test_an_unrelated_leading_comment_is_left_alone(self):
+        text = "/* my own comment */\n\"F_ATT\" = 610"
+        self.assertEqual(rm.strip_eid_comment(text), text)
+
+    def test_empty_text_is_returned_unchanged(self):
+        self.assertEqual(rm.strip_eid_comment(""), "")
+
+
 class ChoiceMemoryEidStorageTests(unittest.TestCase):
     """ChoiceMemory.remember()/recall_eid() - the sibling-key storage for
     an occurrence's expression-identity id, the same non-destructive
@@ -1390,14 +1379,10 @@ class ChoiceMemoryEidStorageTests(unittest.TestCase):
 
     def setUp(self):
         self.project = QgsProject.instance()
-        self.original, self.existed = self.project.readEntry("rtl_bidi_editor", "value_choices", "")
+        self._restore_choices = reset_choice_memory()
 
     def tearDown(self):
-        if self.existed:
-            self.project.writeEntry("rtl_bidi_editor", "value_choices", self.original)
-        else:
-            self.project.removeEntry("rtl_bidi_editor", "value_choices")
-        rm.ChoiceMemory.invalidate()
+        self._restore_choices()
 
     def test_remember_with_an_eid_makes_it_recallable(self):
         rm.ChoiceMemory.remember("t", "f", "1", "Active", 0, "ctx", eid="abc123")
@@ -1429,14 +1414,10 @@ class ResetLegacyEntriesTests(unittest.TestCase):
 
     def setUp(self):
         self.project = QgsProject.instance()
-        self.original, self.existed = self.project.readEntry("rtl_bidi_editor", "value_choices", "")
+        self._restore_choices = reset_choice_memory()
 
     def tearDown(self):
-        if self.existed:
-            self.project.writeEntry("rtl_bidi_editor", "value_choices", self.original)
-        else:
-            self.project.removeEntry("rtl_bidi_editor", "value_choices")
-        rm.ChoiceMemory.invalidate()
+        self._restore_choices()
 
     def test_deletes_only_entries_without_an_eid(self):
         rm.ChoiceMemory.remember("t", "f", "1", "Active", 0, "ctx")  # legacy
@@ -1504,21 +1485,24 @@ class ProjectTextScanIntegrationTests(unittest.TestCase):
     """A real, non-mocked round trip: save the project to an actual temp
     file and confirm _read_project_text_for_scan() can find a live eid
     comment inside it for real - the mechanism clear_and_scan()'s eid path
-    relies on, exercised end to end rather than through a mock."""
+    relies on, exercised end to end rather than through a mock.
+
+    Uses an independent ``QgsProject()`` throughout - never
+    ``QgsProject.instance()``, the live singleton this very suite runs
+    against when launched from the Settings dialog's "Run Tests" button,
+    from inside an already-open QGIS session. An earlier version of this
+    test pointed THAT project's own ``fileName()`` at a temp path instead -
+    exactly what made the running session look like its real project had
+    just been swapped out or lost the moment this test ran. See
+    ``_read_project_text_for_scan()``'s own ``project`` parameter, added
+    for precisely this.
+    """
 
     def setUp(self):
-        self.project = QgsProject.instance()
-        self.original, self.existed = self.project.readEntry("rtl_bidi_editor", "value_choices", "")
+        self.project = QgsProject()
         self._tmp_dir = tempfile.mkdtemp()
-        self._original_filename = self.project.fileName()
 
     def tearDown(self):
-        if self.existed:
-            self.project.writeEntry("rtl_bidi_editor", "value_choices", self.original)
-        else:
-            self.project.removeEntry("rtl_bidi_editor", "value_choices")
-        rm.ChoiceMemory.invalidate()
-        self.project.setFileName(self._original_filename or "")
         shutil.rmtree(self._tmp_dir, ignore_errors=True)
 
     def test_a_saved_projects_text_contains_a_live_eid_comment(self):
@@ -1533,22 +1517,19 @@ class ProjectTextScanIntegrationTests(unittest.TestCase):
 
         layer = make_context_layer(("STATUS",))
         self.project.addMapLayer(layer)
-        try:
-            symbol_layer = layer.renderer().symbol().symbolLayer(0)
-            expr = rm.make_eid_comment(eid) + "'red'"
-            symbol_layer.setDataDefinedProperty(
-                QgsSymbolLayer.Property.PropertyFillColor, QgsProperty.fromExpression(expr)
-            )
+        symbol_layer = layer.renderer().symbol().symbolLayer(0)
+        expr = rm.make_eid_comment(eid) + "'red'"
+        symbol_layer.setDataDefinedProperty(
+            QgsSymbolLayer.Property.PropertyFillColor, QgsProperty.fromExpression(expr)
+        )
 
-            text = rm._read_project_text_for_scan()
-            self.assertIsNotNone(text)
-            self.assertIn(f"rtl-eid:{eid}", text)
-        finally:
-            self.project.removeMapLayer(layer.id())
+        text = rm._read_project_text_for_scan(self.project)
+        self.assertIsNotNone(text)
+        self.assertIn(f"rtl-eid:{eid}", text)
 
     def test_returns_none_when_the_project_has_never_been_saved(self):
         self.project.setFileName("")
-        self.assertIsNone(rm._read_project_text_for_scan())
+        self.assertIsNone(rm._read_project_text_for_scan(self.project))
 
 
 if __name__ == "__main__":

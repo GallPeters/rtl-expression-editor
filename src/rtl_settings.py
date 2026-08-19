@@ -958,8 +958,21 @@ class SettingsDialog(QDialog):
         io_buttons_row.addWidget(self.btn_import)
         io_layout.addLayout(io_buttons_row)
 
+        content_layout.addWidget(io_group)
+
+        # -- Maintenance ------------------------------------------------------
+        # Cleaning up this project's remembered choices (Clear & Scan, Reset
+        # Legacy Entries) and, for a development checkout, running the test
+        # suite - grouped together as they are the dialog's only actions that
+        # inspect or change the plugin's own stored/tested state rather than
+        # configuring it, which is what set them apart from Import / Export
+        # Settings above (saving/loading a *configuration*) clearly enough to
+        # deserve their own group.
+        maint_group = QGroupBox("Maintenance", self)
+        maint_layout = QVBoxLayout(maint_group)
+
         scan_buttons_row = QHBoxLayout()
-        self.btn_clear_scan = QPushButton("Clear && Scan...", io_group)
+        self.btn_clear_scan = QPushButton("Clear && Scan...", maint_group)
         self.btn_clear_scan.setToolTip(
             "Clean up this project's remembered value/description choices for "
             "the current autocomplete source.\n\n"
@@ -982,11 +995,11 @@ class SettingsDialog(QDialog):
         self.btn_clear_scan.clicked.connect(self._clear_and_scan)
         scan_buttons_row.addWidget(self.btn_clear_scan)
 
-        self.btn_reset_legacy = QPushButton("Reset Legacy Entries...", io_group)
+        self.btn_reset_legacy = QPushButton("Reset Legacy Entries...", maint_group)
         self.btn_reset_legacy.setToolTip(
-            "Deletes every remembered choice made before this version - the "
-            "ones with no hidden id, which Clear & Scan can only check with "
-            "the older, less precise method (see its own tooltip).\n\n"
+            "Deletes every remembered choice that has no hidden tracking id - "
+            "the ones Clear & Scan can only check with the older, less "
+            "precise method (see its own tooltip).\n\n"
             "A one-time, explicit reset: use it once, after upgrading a "
             "project with a lot of pre-existing choices, so everything made "
             "from then on is tracked precisely by Clear & Scan instead. Not "
@@ -996,24 +1009,28 @@ class SettingsDialog(QDialog):
         )
         self.btn_reset_legacy.clicked.connect(self._reset_legacy_entries)
         scan_buttons_row.addWidget(self.btn_reset_legacy)
-        io_layout.addLayout(scan_buttons_row)
+        maint_layout.addLayout(scan_buttons_row)
 
-        content_layout.addWidget(io_group)
-
-        # -- Developer -------------------------------------------------------
-        # Only shown at all when a development checkout's tests/ folder is
-        # found next to the running plugin - a normal end-user install only
-        # ships src/'s contents, with no such sibling, so this stays entirely
-        # invisible there rather than offering a button that could only fail.
+        # Run Tests is only added at all when a development checkout's
+        # tests/ folder is found next to the running plugin - a normal
+        # end-user install only ships src/'s contents, with no such
+        # sibling, so this stays entirely invisible there rather than
+        # offering a button that could only fail.
         tests_dir = self._tests_directory()
         if tests_dir is not None:
-            dev_group = QGroupBox("Developer", self)
-            dev_layout = QVBoxLayout(dev_group)
-            self.btn_run_tests = QPushButton("Run Tests", dev_group)
-            self.btn_run_tests.setToolTip(f"Run the test suite in:\n{tests_dir}")
+            self.btn_run_tests = QPushButton("Run Tests", maint_group)
+            self.btn_run_tests.setToolTip(
+                f"Run the test suite in:\n{tests_dir}\n\n"
+                "Your currently open project - its layers and its remembered "
+                "choices - is snapshotted before the run and restored exactly "
+                "afterwards, even if a test fails, so nothing about it is "
+                "left changed. This can take a few minutes; the window stays "
+                "open and responsive throughout."
+            )
             self.btn_run_tests.clicked.connect(self._run_tests)
-            dev_layout.addWidget(self.btn_run_tests)
-            content_layout.addWidget(dev_group)
+            maint_layout.addWidget(self.btn_run_tests)
+
+        content_layout.addWidget(maint_group)
 
         content_layout.addStretch(1)
 
@@ -1219,8 +1236,7 @@ class SettingsDialog(QDialog):
             self,
             "Reset Legacy Entries",
             "This permanently deletes every remembered value/description "
-            "choice made before this version - anything with no hidden "
-            "tracking id. There is no undo.\n\n"
+            "choice that has no hidden tracking id at all. There is no undo.\n\n"
             "Only do this once, deliberately - e.g. right after upgrading a "
             "project with a lot of pre-existing choices - so everything "
             "made from then on is tracked precisely by Clear & Scan "
@@ -1311,7 +1327,18 @@ class SettingsDialog(QDialog):
         return None
 
     def _run_tests(self) -> None:
-        """Run the test suite and show a pass/fail summary plus the full log."""
+        """Run the test suite and show a pass/fail summary plus the full log.
+
+        A full run takes a couple of minutes - long enough that, run
+        synchronously (the only option: many tests create and show real Qt
+        widgets and dialogs, which is only safe on the main GUI thread),
+        doing nothing to keep the event loop pumped would leave the whole
+        application looking hung the entire time, exactly as if it had
+        frozen. ``_ResponsiveTestResult`` below processes events after every
+        individual test, which is frequent enough to keep the window
+        repainting and responsive throughout without slowing the run down
+        in any noticeable way.
+        """
         tests_dir = self._tests_directory()
         if tests_dir is None:
             QMessageBox.information(
@@ -1323,7 +1350,8 @@ class SettingsDialog(QDialog):
             return
 
         self.btn_run_tests.setEnabled(False)
-        self.btn_run_tests.setText("Running...")
+        self.btn_run_tests.setText("Running... (this can take a couple of minutes)")
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         QApplication.processEvents()  # show the label change before the run blocks
 
         result = None
@@ -1331,6 +1359,7 @@ class SettingsDialog(QDialog):
         try:
             import io
             import sys
+            import unittest
 
             repo_root = str(tests_dir.parent)
             if repo_root not in sys.path:
@@ -1338,8 +1367,16 @@ class SettingsDialog(QDialog):
 
             from tests import run_all  # only importable in a dev checkout
 
+            class _ResponsiveTestResult(unittest.TextTestResult):
+                """Keeps the application repainting and responsive during a
+                long run - see this method's own docstring."""
+
+                def startTest(self, test) -> None:  # noqa: N802 (unittest API)
+                    super().startTest(test)
+                    QApplication.processEvents()
+
             buffer = io.StringIO()
-            result = run_all.main(verbosity=2, stream=buffer)
+            result = run_all.main(verbosity=2, stream=buffer, resultclass=_ResponsiveTestResult)
             log_text = buffer.getvalue()
         except Exception as exc:
             # The full traceback, not just str(exc): a bare exception message
@@ -1354,6 +1391,7 @@ class SettingsDialog(QDialog):
             log_text = f"Could not run the test suite:\n{traceback.format_exc()}"
             _log(f"Run Tests failed: {exc}")
         finally:
+            QApplication.restoreOverrideCursor()
             self.btn_run_tests.setEnabled(True)
             self.btn_run_tests.setText("Run Tests")
 

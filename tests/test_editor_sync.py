@@ -177,5 +177,47 @@ class HideExpressionIdentityLineTests(unittest.TestCase):
         self.assertFalse(self.overlay.document().firstBlock().isVisible())
 
 
+class ClipboardEidGuardTests(unittest.TestCase):
+    """ed.ClipboardEidGuard - strips the hidden expression-identity comment
+    from anything that reaches the system clipboard, regardless of which
+    key shortcut or menu action put it there (see strip_eid_comment(),
+    which does the actual work)."""
+
+    def setUp(self):
+        self.guard = ed.ClipboardEidGuard()
+        self.clipboard = QApplication.clipboard()
+        self._original_text = self.clipboard.text()
+
+    def tearDown(self):
+        self.guard.uninstall()
+        self.clipboard.setText(self._original_text)
+
+    def test_installed_guard_strips_an_id_comment_the_moment_it_is_copied(self):
+        from _rtl_plugin.rtl_readmode import make_eid_comment
+
+        self.guard.install()
+        text = make_eid_comment("0123456789abcdef") + '"F_ATT" = 610'
+        self.clipboard.setText(text)
+        QApplication.processEvents()
+
+        self.assertEqual(self.clipboard.text(), '"F_ATT" = 610')
+
+    def test_plain_text_with_no_id_comment_is_left_untouched(self):
+        self.guard.install()
+        self.clipboard.setText('"F_ATT" = 610')
+        QApplication.processEvents()
+
+        self.assertEqual(self.clipboard.text(), '"F_ATT" = 610')
+
+    def test_uninstalled_guard_leaves_the_id_comment_in_place(self):
+        from _rtl_plugin.rtl_readmode import make_eid_comment
+
+        text = make_eid_comment("0123456789abcdef") + '"F_ATT" = 610'
+        self.clipboard.setText(text)
+        QApplication.processEvents()
+
+        self.assertEqual(self.clipboard.text(), text)
+
+
 if __name__ == "__main__":
     unittest.main()

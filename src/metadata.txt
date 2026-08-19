@@ -12,7 +12,7 @@ about=QGIS's built-in editor (QScintilla) does not display right-to-left text co
     When a custom auto-complete source is configured, an optional Read Mode switch appears inside the editor. Read Mode shows the value descriptions instead of the stored codes, making a long expression far easier tounderstand, and never alters the expression itself. Where the same code has different meanings in different groups, the description you picked is saved in the project file and restored automatically, so Read Mode always shows the right one, for everyone who opens the project. An optional second, alternative description per value adds a third switch position for a different wording of the same descriptions.
 
     The whole configuration, including the auto-complete source, can be exported to a file and imported again elsewhere - useful for sharing a ready-made setup with colleagues.
-version=1.6
+version=1.5
 author=Jossef Kanter
 email=jossefkan@gmail.com
 
@@ -28,19 +28,19 @@ deprecated=False
 hasProcessingProvider=no
 server=False
 
-** v1.6 (18.08.2026):
-  - Improved: the Edit/Read mode switch is now a real slider - drag it, or tap anywhere on it to jump straight to that mode.
-  - Fixed: a Hebrew field or value description in Read mode could visually reverse the expression's own left-to-right structure - an operator's position, or the order of an IN (...) list.
-  - Fixed: editing an expression's value/description choices no longer only ever accumulates entries in the project file - accepting the dialog (OK) now rewrites them to exactly match the edited expression, dropping anything no longer needed and correcting any choice an edit had shifted onto the wrong occurrence.
-  - Fixed: removing a layer from the project now also removes its remembered value/description choices, instead of leaving them behind indefinitely.
-  - Added: a "Clear & Scan" button in Settings that removes remembered choices no longer used anywhere (a data-defined override, a rule filter, a label expression, or a layer filter), and warns - without deleting - about any that no longer match the configured lookup table (e.g. a database-backed table whose values changed).
-  - Added: a "Reset Legacy Entries" button in Settings for a one-time cleanup of choices remembered before this version.
-
 ** v1.5 (17.08.2026):
   - Added: the suggestion list now shows a title - the dataset name when naming a field, the field name when picking its value - enriched with optional Table description / Field description columns, which also replace field names outright in Read mode.
   - Added: an optional Alternative value description column, giving Read mode a third switch position - already-described values pick it up automatically, with nothing to reselect.
   - Added: Export Settings / Import Settings, saving and loading the whole configuration - including the autocomplete lookup layer - as a JSON file, never including a database connection's own credentials.
-  - Improved: the Settings window is resizable, with detailed tooltips throughout and clearer import errors (not found vs. not accessible).
+  - Added: a "Clear & Scan" button in Settings that removes remembered value/description choices no longer used anywhere (a data-defined override, a rule filter, a label expression, or a layer filter), and warns - without deleting - about any that no longer match the configured lookup table (e.g. a database-backed table whose values changed).
+  - Added: a "Reset Legacy Entries" button in Settings for a one-time cleanup of choices with no precise tracking id yet.
+  - Improved: the Edit/Read mode switch is now a real slider - drag it, or tap anywhere on it to jump straight to that mode.
+  - Improved: the Settings window is resizable, with detailed tooltips throughout and clearer import errors (not found vs. not accessible); Clear & Scan, Reset Legacy Entries and Run Tests now live together in their own "Maintenance" group.
+  - Improved: Run Tests keeps the window responsive throughout a run and never touches the currently open project, which is snapshotted and restored exactly regardless of what any test does.
+  - Fixed: a Hebrew field or value description in Read mode could visually reverse the expression's own left-to-right structure - an operator's position, or the order of an IN (...) list.
+  - Fixed: editing an expression's value/description choices no longer only ever accumulates entries in the project file - accepting the dialog (OK) now rewrites them to exactly match the edited expression, dropping anything no longer needed and correcting any choice an edit had shifted onto the wrong occurrence.
+  - Fixed: removing a layer from the project now also removes its remembered value/description choices, instead of leaving them behind indefinitely.
+  - Fixed: copying or cutting an expression - Select All, the context menu, or any other route - could carry the plugin's own hidden internal tracking id onto the clipboard along with the real text; only the real expression is ever copied or pasted now.
   - Fixed: a few tooltip and stale-warning display issues in the Settings dialog.
 
 ** v1.4 (12.08.2026):

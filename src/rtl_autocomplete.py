@@ -1116,10 +1116,7 @@ class AutocompleteCache(QObject):
             try:
                 request.setFlags(QgsFeatureRequest.Flag.NoGeometry)
             except Exception:
-                try:
-                    request.setFlags(QgsFeatureRequest.NoGeometry)
-                except Exception:
-                    pass
+                pass
             # Deliberately NOT calling setSubsetOfAttributes(): when a filter
             # expression is evaluated client-side (which happens whenever the
             # provider cannot compile it to SQL), any column missing from the

@@ -1803,6 +1803,70 @@ class RtlOverlayEditor(QPlainTextEdit):
 
 
 # --------------------------------------------------------------------------- #
+# Clipboard hygiene
+# --------------------------------------------------------------------------- #
+
+
+class ClipboardEidGuard(QObject):
+    """Strips this plugin's own hidden expression-identity comment (see
+    ``rtl_readmode.make_eid_comment``) from anything that reaches the
+    system clipboard.
+
+    The overlay never lets the user interact with the id line directly -
+    its own ``QTextBlock`` is collapsed (see
+    ``RtlOverlayEditor.hide_expression_identity_line()``) - but that only
+    suppresses *rendering*; the characters are still part of the real
+    ``QTextDocument``. A plain Select All + Copy still selects them right
+    along with the visible expression, and so would Cut, the right-click
+    context menu, an Edit-menu action, or a drag-out - every one of those
+    ultimately puts text on the very same system clipboard.
+
+    Filtering there, once, rather than trying to intercept ``copy()`` /
+    ``cut()`` / the context menu individually, is what makes this correct
+    regardless of which of those the user actually used: nothing about
+    *how* the clipboard was set matters, only what ends up in it.
+    """
+
+    def __init__(self, parent: Optional[QObject] = None):
+        super().__init__(parent)
+        self._stripping = False
+
+    def install(self) -> None:
+        clipboard = QApplication.clipboard()
+        if clipboard is not None:
+            clipboard.dataChanged.connect(self._strip)
+
+    def uninstall(self) -> None:
+        clipboard = QApplication.clipboard()
+        if clipboard is not None:
+            try:
+                clipboard.dataChanged.disconnect(self._strip)
+            except Exception:
+                pass
+
+    def _strip(self) -> None:
+        if self._stripping:
+            return  # our own clipboard.setText() below re-enters this slot
+        try:
+            from .rtl_readmode import strip_eid_comment
+
+            clipboard = QApplication.clipboard()
+            text = clipboard.text()
+            if not text:
+                return
+            stripped = strip_eid_comment(text)
+            if stripped == text:
+                return
+            self._stripping = True
+            try:
+                clipboard.setText(stripped)
+            finally:
+                self._stripping = False
+        except Exception as exc:
+            _log(f"Clipboard id filter failed: {exc}", Qgis.MessageLevel.Info)
+
+
+# --------------------------------------------------------------------------- #
 # Detection
 # --------------------------------------------------------------------------- #
 
@@ -2132,6 +2196,9 @@ class CodeEditorWatcher(QObject):
 #: Set by RtlBidiEditorPlugin.initGui(); None while the plugin is unloaded.
 _WATCHER: Optional["CodeEditorWatcher"] = None
 
+#: Set by RtlBidiEditorPlugin.initGui(); None while the plugin is unloaded.
+_CLIPBOARD_GUARD: Optional["ClipboardEidGuard"] = None
+
 
 def rescan() -> int:
     """Force a scan of all visible windows. Returns the live overlay count."""
@@ -2168,6 +2235,7 @@ class RtlBidiEditorPlugin:
     def __init__(self, iface):
         self.iface = iface
         self._watcher: Optional[CodeEditorWatcher] = None
+        self._clipboard_guard: Optional[ClipboardEidGuard] = None
         self._settings_action = None
 
     # -- optional feature: settings UI ----------------------------------- #
@@ -2244,12 +2312,19 @@ class RtlBidiEditorPlugin:
     # -- lifecycle -------------------------------------------------------- #
 
     def initGui(self) -> None:  # noqa: N802 (QGIS plugin API)
-        global _WATCHER
+        global _WATCHER, _CLIPBOARD_GUARD
         try:
             self._add_menu()
             self._watcher = CodeEditorWatcher()
             _WATCHER = self._watcher
             self._watcher.install()
+            try:
+                self._clipboard_guard = ClipboardEidGuard()
+                _CLIPBOARD_GUARD = self._clipboard_guard
+                self._clipboard_guard.install()
+            except Exception as exc:
+                self._clipboard_guard = None
+                _log(f"Clipboard id filter unavailable: {exc}", Qgis.MessageLevel.Info)
             if SETTINGS_BUS is not None:
                 SETTINGS_BUS.changed.connect(self.apply_settings)
             try:
@@ -2267,8 +2342,15 @@ class RtlBidiEditorPlugin:
             _log(f"Startup failed: {exc}", Qgis.MessageLevel.Critical)
 
     def unload(self) -> None:
-        global _WATCHER
+        global _WATCHER, _CLIPBOARD_GUARD
         _WATCHER = None
+        if self._clipboard_guard is not None:
+            try:
+                self._clipboard_guard.uninstall()
+            except Exception:
+                pass
+            self._clipboard_guard = None
+        _CLIPBOARD_GUARD = None
         if SETTINGS_BUS is not None:
             try:
                 SETTINGS_BUS.changed.disconnect(self.apply_settings)

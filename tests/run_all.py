@@ -26,7 +26,7 @@ import unittest
 from pathlib import Path
 
 
-def main(verbosity: int = 2, stream=None) -> unittest.TestResult:
+def main(verbosity: int = 2, stream=None, resultclass=None) -> unittest.TestResult:
     """Discover and run every ``test_*.py`` module in this package.
 
     ``start_dir``/``top_level_dir`` are passed as real filesystem paths
@@ -44,6 +44,15 @@ def main(verbosity: int = 2, stream=None) -> unittest.TestResult:
     ``_project_guard``), so running this from inside a live QGIS session
     never leaves the user's own project layers or read-mode choices altered,
     regardless of what any individual test does or whether it raises.
+
+    ``resultclass``, when given, is passed straight through to
+    ``unittest.TextTestRunner`` - the Settings dialog's "Run Tests" button
+    uses this to pump the Qt event loop between tests (see
+    ``SettingsDialog._run_tests()``), so a run that takes a couple of
+    minutes keeps the whole application visibly responsive instead of
+    looking like it has frozen. Left as ``None`` (unittest's own default)
+    for the plain command-line/Python-Console entry point, which has no Qt
+    event loop to keep pumping in the first place.
     """
     from ._project_guard import guarded_run
 
@@ -54,7 +63,10 @@ def main(verbosity: int = 2, stream=None) -> unittest.TestResult:
     suite = loader.discover(
         start_dir=str(tests_dir), top_level_dir=str(repo_root), pattern="test_*.py"
     )
-    runner = unittest.TextTestRunner(stream=stream or sys.stderr, verbosity=verbosity)
+    runner_kwargs = {"stream": stream or sys.stderr, "verbosity": verbosity}
+    if resultclass is not None:
+        runner_kwargs["resultclass"] = resultclass
+    runner = unittest.TextTestRunner(**runner_kwargs)
     return guarded_run(lambda: runner.run(suite))
 
 
