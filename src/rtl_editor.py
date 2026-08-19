@@ -1827,17 +1827,33 @@ class ClipboardEidGuard(QObject):
     *how* the clipboard was set matters, only what ends up in it.
     """
 
-    def __init__(self, parent: Optional[QObject] = None):
+    def __init__(self, parent: Optional[QObject] = None, clipboard=None):
+        """``clipboard`` is a testing-only seam: pass a fake standing in
+        for ``QApplication.clipboard()`` (same ``text()``/``setText()``/
+        ``dataChanged`` surface) to exercise this class's own logic
+        deterministically, with no dependency on the real OS clipboard's
+        behaviour - which has repeatedly proven unreliable to assert
+        against directly in an automated environment (a write not taking
+        effect, or a stale read), independently of anything this class
+        does. Left ``None`` for real use, which resolves the real,
+        singleton system clipboard exactly as before.
+        """
         super().__init__(parent)
         self._stripping = False
+        self._clipboard_override = clipboard
+
+    def _clipboard(self):
+        if self._clipboard_override is not None:
+            return self._clipboard_override
+        return QApplication.clipboard()
 
     def install(self) -> None:
-        clipboard = QApplication.clipboard()
+        clipboard = self._clipboard()
         if clipboard is not None:
             clipboard.dataChanged.connect(self._strip)
 
     def uninstall(self) -> None:
-        clipboard = QApplication.clipboard()
+        clipboard = self._clipboard()
         if clipboard is not None:
             try:
                 clipboard.dataChanged.disconnect(self._strip)
@@ -1850,7 +1866,7 @@ class ClipboardEidGuard(QObject):
         try:
             from .rtl_readmode import strip_eid_comment
 
-            clipboard = QApplication.clipboard()
+            clipboard = self._clipboard()
             text = clipboard.text()
             if not text:
                 return

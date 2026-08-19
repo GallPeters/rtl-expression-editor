@@ -1318,8 +1318,18 @@ class SettingsDialog(QDialog):
                 return candidate
         return None
 
-    def _run_tests(self, _run_all_override=None) -> None:
+    def _run_tests(self, *, _run_all_override=None) -> None:
         """Run the test suite and show a pass/fail summary plus the full log.
+
+        ``_run_all_override`` is keyword-only, deliberately: this method is
+        connected to ``btn_run_tests.clicked``, whose ``clicked(bool
+        checked)`` signal PyQt auto-forwards into a slot's own positional
+        parameters. A first version of this made it a plain positional
+        parameter, and a normal click then passed that ``bool`` straight
+        into ``_run_all_override`` - ``AttributeError: 'bool' object has
+        no attribute 'main'`` the moment "Run Tests" was actually clicked.
+        Keyword-only is invisible to that auto-forwarding, so a real click
+        still calls this with no arguments at all, exactly as before.
 
         ``_run_all_override`` is a testing-only seam: pass a fake module
         (anything with a ``main()``) to exercise this method's own control

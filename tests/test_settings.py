@@ -144,6 +144,26 @@ class RunTestsButtonTests(unittest.TestCase):
         finally:
             dialog.deleteLater()
 
+    def test_run_all_override_is_keyword_only_so_a_real_click_cannot_reach_it(self):
+        """Regression: QPushButton.clicked emits clicked(bool checked), and
+        PyQt auto-forwards emitted signal arguments into a slot's own
+        POSITIONAL parameters. A first version of _run_tests() made
+        _run_all_override an ordinary positional parameter, and an actual
+        click then passed that bool straight into it - run_all.main()
+        ends up being called on a bool instead of the real module
+        (AttributeError: 'bool' object has no attribute 'main'). Keeping
+        it keyword-only is what makes it invisible to that auto-forwarding
+        - checked here directly, structurally, rather than by clicking the
+        real button and needing to fake out an entire recursive test run
+        to observe the difference."""
+        import inspect
+
+        from _rtl_plugin.rtl_settings import SettingsDialog
+
+        sig = inspect.signature(SettingsDialog._run_tests)
+        param = sig.parameters["_run_all_override"]
+        self.assertEqual(param.kind, inspect.Parameter.KEYWORD_ONLY)
+
     def test_run_tests_passes_the_result_through_and_re_enables_the_button(self):
         """Exercises _run_tests()'s own control flow - disable/run/re-enable,
         handing the result to _show_test_results() - without paying for a
