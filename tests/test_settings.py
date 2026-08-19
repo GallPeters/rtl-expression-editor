@@ -147,7 +147,14 @@ class RunTestsButtonTests(unittest.TestCase):
     def test_run_tests_passes_the_result_through_and_re_enables_the_button(self):
         """Exercises _run_tests()'s own control flow - disable/run/re-enable,
         handing the result to _show_test_results() - without paying for a
-        real, recursive run of the whole suite via a mocked run_all.main().
+        real, recursive run of the whole suite.
+
+        Passes a fake module via the ``_run_all_override`` testing seam
+        rather than ``mock.patch("tests.run_all.main", ...)``: _run_tests()
+        forces a fresh re-import of ``tests`` on every real call (so a fix
+        to any test file is picked up without restarting QGIS - see its
+        own docstring), which would simply discard a module object patched
+        that way before ever calling it.
         """
         from unittest import mock
 
@@ -155,13 +162,12 @@ class RunTestsButtonTests(unittest.TestCase):
 
         dialog = SettingsDialog()
         fake_result = mock.Mock(wasSuccessful=lambda: True, testsRun=3, failures=[], errors=[])
+        fake_run_all = mock.Mock(main=mock.Mock(return_value=fake_result))
         try:
-            with mock.patch("tests.run_all.main", return_value=fake_result) as mocked_main, mock.patch.object(
-                SettingsDialog, "_show_test_results"
-            ) as mocked_show:
-                dialog._run_tests()
+            with mock.patch.object(SettingsDialog, "_show_test_results") as mocked_show:
+                dialog._run_tests(_run_all_override=fake_run_all)
 
-            mocked_main.assert_called_once()
+            fake_run_all.main.assert_called_once()
             mocked_show.assert_called_once()
             self.assertIs(mocked_show.call_args[0][0], fake_result)
             self.assertTrue(dialog.btn_run_tests.isEnabled())
@@ -186,13 +192,13 @@ class RunTestsButtonTests(unittest.TestCase):
                 raise TypeError("main() got an unexpected keyword argument 'resultclass'")
             return fake_result
 
-        try:
-            with mock.patch(
-                "tests.run_all.main", side_effect=_fake_main
-            ) as mocked_main, mock.patch.object(SettingsDialog, "_show_test_results") as mocked_show:
-                dialog._run_tests()
+        fake_run_all = mock.Mock(main=mock.Mock(side_effect=_fake_main))
 
-            self.assertEqual(mocked_main.call_count, 2)
+        try:
+            with mock.patch.object(SettingsDialog, "_show_test_results") as mocked_show:
+                dialog._run_tests(_run_all_override=fake_run_all)
+
+            self.assertEqual(fake_run_all.main.call_count, 2)
             mocked_show.assert_called_once()
             self.assertIs(mocked_show.call_args[0][0], fake_result)
             self.assertTrue(dialog.btn_run_tests.isEnabled())

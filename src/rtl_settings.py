@@ -1318,8 +1318,17 @@ class SettingsDialog(QDialog):
                 return candidate
         return None
 
-    def _run_tests(self) -> None:
+    def _run_tests(self, _run_all_override=None) -> None:
         """Run the test suite and show a pass/fail summary plus the full log.
+
+        ``_run_all_override`` is a testing-only seam: pass a fake module
+        (anything with a ``main()``) to exercise this method's own control
+        flow without paying for a real, recursive run of the whole suite.
+        It exists because this method itself forces a fresh re-import of
+        ``tests`` on every call (see below) - a plain
+        ``mock.patch("tests.run_all.main", ...)`` would just be undone by
+        that re-import, patching a ``run_all`` module object this method
+        was about to discard anyway. Left ``None`` for real use.
 
         A full run takes a couple of minutes - long enough that, run
         synchronously (the only option: many tests create and show real Qt
@@ -1357,7 +1366,32 @@ class SettingsDialog(QDialog):
             if repo_root not in sys.path:
                 sys.path.insert(0, repo_root)
 
-            from tests import run_all  # only importable in a dev checkout
+            if _run_all_override is not None:
+                run_all = _run_all_override
+            else:
+                # Force a fresh import of the whole tests/ package, and of
+                # the plugin's own source modules under the test-only
+                # "_rtl_plugin" alias every test module imports them
+                # through (see tests/__init__.py) - rather than reusing
+                # whatever Python already has cached in sys.modules. A
+                # QGIS session commonly outlives many "Run Tests" clicks,
+                # and without this, a fix to any test file - or to this
+                # plugin's own code - would keep running the STALE,
+                # already-imported version until QGIS itself restarts:
+                # once cached, a plain `from tests import run_all` never
+                # looks at any of those files again. Never touches the
+                # REAL, live plugin instance QGIS itself already loaded -
+                # that lives under its own real package name, an entirely
+                # separate set of module objects from this alias.
+                for name in list(sys.modules):
+                    if (
+                        name == "tests"
+                        or name.startswith("tests.")
+                        or name == "_rtl_plugin"
+                        or name.startswith("_rtl_plugin.")
+                    ):
+                        del sys.modules[name]
+                from tests import run_all  # only importable in a dev checkout
 
             class _ResponsiveTestResult(unittest.TextTestResult):
                 """Keeps the application repainting and responsive during a
