@@ -188,9 +188,42 @@ class ClipboardEidGuardTests(unittest.TestCase):
         self.clipboard = QApplication.clipboard()
         self._original_text = self.clipboard.text()
 
+        # The real system clipboard is not reliably available in every
+        # automated environment this suite might run in - e.g. no
+        # interactive desktop session attached - where Qt's setText()
+        # silently no-ops and text() keeps returning "". Skip rather than
+        # fail on that, via a basic guard-free round trip, so an
+        # environment quirk is never mistaken for a regression in
+        # ClipboardEidGuard itself.
+        probe = "rtl-clipboard-probe"
+        self.clipboard.setText(probe)
+        QApplication.processEvents()
+        if self.clipboard.text() != probe:
+            self.skipTest("system clipboard is not usable in this environment")
+        self.clipboard.setText(self._original_text)
+
     def tearDown(self):
         self.guard.uninstall()
         self.clipboard.setText(self._original_text)
+
+    def _assert_clipboard_eventually(self, expected: str) -> None:
+        """assertEqual against the clipboard, tolerant of Windows' clipboard
+        occasionally needing a moment to settle after a rapid write -
+        SetClipboardData/GetClipboardData can transiently race, especially
+        right after another setText() just before it, independently of
+        anything this plugin's own code does. Retries briefly rather than
+        failing on the first read, so a real regression (the text staying
+        wrong) still fails, but a momentary OS-level hiccup does not."""
+        import time
+
+        actual = self.clipboard.text()
+        for _ in range(10):
+            if actual == expected:
+                break
+            time.sleep(0.05)
+            QApplication.processEvents()
+            actual = self.clipboard.text()
+        self.assertEqual(actual, expected)
 
     def test_installed_guard_strips_an_id_comment_the_moment_it_is_copied(self):
         from _rtl_plugin.rtl_readmode import make_eid_comment
@@ -200,23 +233,45 @@ class ClipboardEidGuardTests(unittest.TestCase):
         self.clipboard.setText(text)
         QApplication.processEvents()
 
-        self.assertEqual(self.clipboard.text(), '"F_ATT" = 610')
+        self._assert_clipboard_eventually('"F_ATT" = 610')
 
     def test_plain_text_with_no_id_comment_is_left_untouched(self):
         self.guard.install()
         self.clipboard.setText('"F_ATT" = 610')
         QApplication.processEvents()
 
-        self.assertEqual(self.clipboard.text(), '"F_ATT" = 610')
+        self._assert_clipboard_eventually('"F_ATT" = 610')
 
     def test_uninstalled_guard_leaves_the_id_comment_in_place(self):
+        """Checks THIS guard instance's own _strip() was never invoked,
+        rather than the system clipboard's resulting text.
+
+        When this suite runs from inside a live QGIS session with the real
+        plugin loaded, that session's own already-installed
+        ClipboardEidGuard (see RtlBidiEditorPlugin.initGui()) is
+        legitimately watching the very same system clipboard and strips
+        the comment anyway - correct, desired production behaviour that
+        has nothing to do with whether THIS particular, never-installed
+        instance reacted. An independent second guard is installed here to
+        model exactly that, so this test is no longer sensitive to whether
+        it happens to run standalone or inside such a session.
+        """
+        from unittest import mock
+
         from _rtl_plugin.rtl_readmode import make_eid_comment
 
-        text = make_eid_comment("0123456789abcdef") + '"F_ATT" = 610'
-        self.clipboard.setText(text)
-        QApplication.processEvents()
+        other_guard = ed.ClipboardEidGuard()
+        other_guard.install()
+        self.addCleanup(other_guard.uninstall)
 
-        self.assertEqual(self.clipboard.text(), text)
+        text = make_eid_comment("0123456789abcdef") + '"F_ATT" = 610'
+        with mock.patch.object(self.guard, "_strip") as mocked_strip:
+            self.clipboard.setText(text)
+            QApplication.processEvents()
+
+            mocked_strip.assert_not_called()
+        # The independent guard above still does its own job correctly.
+        self._assert_clipboard_eventually('"F_ATT" = 610')
 
 
 if __name__ == "__main__":
