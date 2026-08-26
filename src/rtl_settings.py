@@ -952,77 +952,27 @@ class SettingsDialog(QDialog):
 
         content_layout.addWidget(io_group)
 
-        # -- Maintenance ------------------------------------------------------
-        # Cleaning up this project's remembered choices (Clear & Scan, Reset
-        # Legacy Entries) and, for a development checkout, running the test
-        # suite - grouped together as they are the dialog's only actions that
-        # inspect or change the plugin's own stored/tested state rather than
-        # configuring it, which is what set them apart from Import / Export
-        # Settings above (saving/loading a *configuration*) clearly enough to
-        # deserve their own group.
-        maint_group = QGroupBox("Maintenance", self)
-        maint_layout = QVBoxLayout(maint_group)
-
-        scan_buttons_row = QHBoxLayout()
-        self.btn_clear_scan = QPushButton("Clear && Scan...", maint_group)
-        self.btn_clear_scan.setToolTip(
-            "Clean up this project's remembered value/description choices for "
-            "the current autocomplete source.\n\n"
-            "Every choice made from now on is tagged with its own hidden id, "
-            "invisible while editing, that travels with its expression - so a "
-            "choice is removed the moment no expression anywhere in the "
-            "project still carries that id, precisely, no matter what kind "
-            "of expression it was (a filter, a data-defined override, a "
-            "labeling rule, ...).\n\n"
-            "A choice made before this existed has no such id - for those, "
-            "this falls back to the older check instead: removed if its "
-            "layer is gone, or (for a layer filter specifically) if that "
-            "exact value no longer appears in the filter text; otherwise "
-            "left untouched rather than guessed at.\n\n"
-            "Either way, everything left is then checked against the "
-            "currently configured lookup table, and anything that no longer "
-            "matches is reported - e.g. a database-backed table whose "
-            "values or descriptions changed since a choice was made."
-        )
-        self.btn_clear_scan.clicked.connect(self._clear_and_scan)
-        scan_buttons_row.addWidget(self.btn_clear_scan)
-
-        self.btn_reset_legacy = QPushButton("Reset Legacy Entries...", maint_group)
-        self.btn_reset_legacy.setToolTip(
-            "Deletes every remembered choice that has no hidden tracking id - "
-            "the ones Clear & Scan can only check with the older, less "
-            "precise method (see its own tooltip).\n\n"
-            "A one-time, explicit reset: use it once, after upgrading a "
-            "project with a lot of pre-existing choices, so everything made "
-            "from then on is tracked precisely by Clear & Scan instead. Not "
-            "run automatically by Clear & Scan itself, since a choice "
-            "missing an id only means it predates this feature - never that "
-            "it is no longer needed."
-        )
-        self.btn_reset_legacy.clicked.connect(self._reset_legacy_entries)
-        scan_buttons_row.addWidget(self.btn_reset_legacy)
-        maint_layout.addLayout(scan_buttons_row)
-
-        # Run Tests is only added at all when a development checkout's
-        # tests/ folder is found next to the running plugin - a normal
-        # end-user install only ships src/'s contents, with no such
-        # sibling, so this stays entirely invisible there rather than
-        # offering a button that could only fail.
+        # -- Developer -------------------------------------------------------
+        # Only shown at all when a development checkout's tests/ folder is
+        # found next to the running plugin - a normal end-user install only
+        # ships src/'s contents, with no such sibling, so this stays entirely
+        # invisible there rather than offering a button that could only fail.
         tests_dir = self._tests_directory()
         if tests_dir is not None:
-            self.btn_run_tests = QPushButton("Run Tests", maint_group)
+            dev_group = QGroupBox("Developer", self)
+            dev_layout = QVBoxLayout(dev_group)
+            self.btn_run_tests = QPushButton("Run Tests", dev_group)
             self.btn_run_tests.setToolTip(
                 f"Run the test suite in:\n{tests_dir}\n\n"
-                "Your currently open project - its layers and its remembered "
-                "choices - is snapshotted before the run and restored exactly "
-                "afterwards, even if a test fails, so nothing about it is "
-                "left changed. This can take a few minutes; the window stays "
-                "open and responsive throughout."
+                "Your currently open project and its layers are snapshotted "
+                "before the run and restored exactly afterwards, even if a "
+                "test fails, so nothing about it is left changed. This can "
+                "take a few minutes; the window stays open and responsive "
+                "throughout."
             )
             self.btn_run_tests.clicked.connect(self._run_tests)
-            maint_layout.addWidget(self.btn_run_tests)
-
-        content_layout.addWidget(maint_group)
+            dev_layout.addWidget(self.btn_run_tests)
+            content_layout.addWidget(dev_group)
 
         content_layout.addStretch(1)
 
@@ -1168,128 +1118,6 @@ class SettingsDialog(QDialog):
             )
         else:
             QMessageBox.information(self, "Import Settings", "Settings imported successfully.")
-
-    def _clear_and_scan(self) -> None:
-        """Clean up and verify this project's remembered value/description
-        choices - see ``ChoiceMemory.clear_and_scan()`` for exactly what it
-        does and, just as importantly, does not touch.
-
-        Imported locally, not at module level: ``rtl_readmode`` imports
-        ``Settings``/``BUS`` from this module, so importing back from it up
-        here would be a circular import - see the same pattern in
-        ``rtl_autocomplete.accept_current()``.
-        """
-        try:
-            from .rtl_readmode import ChoiceMemory
-        except Exception as exc:
-            QMessageBox.warning(self, "Clear & Scan", f"This feature is unavailable:\n{exc}")
-            return
-
-        confirmed = QMessageBox.question(
-            self,
-            "Clear & Scan",
-            "This checks every remembered value/description choice against "
-            "the project and the current lookup table.\n\n"
-            "Choices tagged with a hidden id (made from now on) are checked "
-            "by saving the project first, so the check reflects what is on "
-            "screen right now - this will save the project if it has unsaved "
-            "changes.\n\nContinue?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.Yes,
-        )
-        if confirmed != QMessageBox.StandardButton.Yes:
-            return
-
-        self.btn_clear_scan.setEnabled(False)
-        QApplication.processEvents()
-        try:
-            deleted, total, failures = ChoiceMemory.clear_and_scan()
-        except Exception as exc:
-            QMessageBox.warning(self, "Clear & Scan", f"Clear & Scan failed:\n{exc}")
-            return
-        finally:
-            self.btn_clear_scan.setEnabled(True)
-
-        self._show_clear_scan_results(deleted, total, failures)
-
-    def _reset_legacy_entries(self) -> None:
-        """Delete every remembered choice with no hidden id at all - a
-        deliberate, one-time reset. See
-        ``ChoiceMemory.reset_legacy_entries()`` for exactly what this does
-        and, just as importantly, why Clear & Scan never does it on its
-        own."""
-        try:
-            from .rtl_readmode import ChoiceMemory
-        except Exception as exc:
-            QMessageBox.warning(self, "Reset Legacy Entries", f"This feature is unavailable:\n{exc}")
-            return
-
-        confirmed = QMessageBox.question(
-            self,
-            "Reset Legacy Entries",
-            "This permanently deletes every remembered value/description "
-            "choice that has no hidden tracking id at all. There is no undo.\n\n"
-            "Only do this once, deliberately - e.g. right after upgrading a "
-            "project with a lot of pre-existing choices - so everything "
-            "made from then on is tracked precisely by Clear & Scan "
-            "instead.\n\nContinue?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if confirmed != QMessageBox.StandardButton.Yes:
-            return
-
-        self.btn_reset_legacy.setEnabled(False)
-        QApplication.processEvents()
-        try:
-            deleted, total = ChoiceMemory.reset_legacy_entries()
-        except Exception as exc:
-            QMessageBox.warning(self, "Reset Legacy Entries", f"Reset failed:\n{exc}")
-            return
-        finally:
-            self.btn_reset_legacy.setEnabled(True)
-
-        QMessageBox.information(
-            self,
-            "Reset Legacy Entries",
-            f"{deleted}/{total} legacy entries removed.",
-        )
-
-    def _show_clear_scan_results(self, deleted: int, total: int, failures: List[str]) -> None:
-        """A small dialog: a coloured summary, then every mismatch found -
-        mirrors ``_show_test_results()``'s layout."""
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Clear & Scan Results")
-        dialog.resize(760, 500)
-        layout = QVBoxLayout(dialog)
-
-        summary = f"{deleted}/{total} old entries removed."
-        if failures:
-            color = "#b7791f"
-            summary += f" {len(failures)} remaining entries no longer match the lookup table."
-        else:
-            color = "#2e7d32"
-            summary += " Everything else still matches the lookup table."
-
-        lbl_summary = QLabel(summary, dialog)
-        lbl_summary.setStyleSheet(f"font-weight: bold; color: {color};")
-        lbl_summary.setWordWrap(True)
-        layout.addWidget(lbl_summary)
-
-        log_view = QPlainTextEdit(dialog)
-        log_view.setReadOnly(True)
-        log_view.setPlainText("\n".join(failures) if failures else "No mismatches found.")
-        log_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
-        layout.addWidget(log_view)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, dialog)
-        buttons.rejected.connect(dialog.reject)
-        close_button = buttons.button(QDialogButtonBox.StandardButton.Close)
-        if close_button is not None:
-            close_button.clicked.connect(dialog.accept)
-        layout.addWidget(buttons)
-
-        dialog.exec()
 
     # ------------------------------------------------------------------ #
     # Developer: run the test suite

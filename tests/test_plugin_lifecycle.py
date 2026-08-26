@@ -30,38 +30,43 @@ class PluginLifecycleTests(unittest.TestCase):
         plugin = classFactory(iface=None)
         plugin.unload()  # never initialised - must be a safe no-op
 
-    def test_removing_a_layer_purges_its_remembered_choices(self):
-        """End-to-end: a layer removed from the project takes its
-        remembered value/description choices with it, since
-        reconcile_choices() only ever runs from a dialog's own OK - it has
-        no way to notice the layer behind it disappearing on its own."""
-        from qgis.core import QgsProject, QgsVectorLayer
+    def test_init_gui_purges_any_legacy_remembered_choice_entry(self):
+        """A project carrying the old, retired "remembered choices" entry
+        (see rtl_readmode.purge_legacy_project_entries()) starts clean the
+        moment the plugin activates, rather than carrying dead data around
+        indefinitely."""
+        from qgis.core import QgsProject
 
-        from _rtl_plugin.rtl_readmode import ChoiceMemory
-
-        layer = QgsVectorLayer("Point?crs=EPSG:4326", "purge_test_layer", "memory")
-        self.assertTrue(layer.isValid())
         project = QgsProject.instance()
-        project.addMapLayer(layer)
-
         original, existed = project.readEntry("rtl_bidi_editor", "value_choices", "")
+        project.writeEntry("rtl_bidi_editor", "value_choices", '{"stale": "entry"}')
+
         plugin = classFactory(iface=None)
-        plugin.initGui()
         try:
-            context = f"QgsQueryBuilderBase|Query Builder|QgisApp|{layer.id()}"
-            ChoiceMemory.remember("t", "f", "1", "Active", 0, context)
-            self.assertEqual(ChoiceMemory.recall("t", "f", "1", 0, context), "Active")
-
-            project.removeMapLayer(layer.id())
-
-            self.assertEqual(ChoiceMemory.recall("t", "f", "1", 0, context), "")
+            plugin.initGui()
+            _raw, still_there = project.readEntry("rtl_bidi_editor", "value_choices", "")
+            self.assertFalse(still_there)
         finally:
             plugin.unload()
             if existed:
                 project.writeEntry("rtl_bidi_editor", "value_choices", original)
             else:
                 project.removeEntry("rtl_bidi_editor", "value_choices")
-            ChoiceMemory.invalidate()
+
+    def test_init_gui_does_not_raise_when_there_is_no_legacy_entry(self):
+        from qgis.core import QgsProject
+
+        project = QgsProject.instance()
+        original, existed = project.readEntry("rtl_bidi_editor", "value_choices", "")
+        project.removeEntry("rtl_bidi_editor", "value_choices")
+
+        plugin = classFactory(iface=None)
+        try:
+            plugin.initGui()  # must not raise
+        finally:
+            plugin.unload()
+            if existed:
+                project.writeEntry("rtl_bidi_editor", "value_choices", original)
 
 
 if __name__ == "__main__":

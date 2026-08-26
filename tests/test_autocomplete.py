@@ -370,12 +370,13 @@ class AutocompletePopupTitleRenderingTests(unittest.TestCase):
         self.assertTrue(header_item.font().bold())
 
 
-class ExpressionIdentityInsertionTests(unittest.TestCase):
-    """CustomAutocompleteController._ensure_eid() - tags an accepted
-    value's expression with a hidden expression-identity id, except inside
-    a layer filter (Query Builder) context, where doing so has been
-    confirmed to break at least one mainstream provider's own filter
-    evaluation outright (see _ensure_eid()'s own docstring)."""
+class AcceptCurrentInsertsOnlyTheValueTests(unittest.TestCase):
+    """accept_current() inserts the chosen value and nothing else - no
+    hidden comment, no extra line, regardless of whether the code has one
+    meaning or several. An ambiguous code's meaning is resolved later,
+    from the expression's own group context, when Read mode renders it
+    (see rtl_readmode.substitute_descriptions()/_pick_label()) - nothing
+    about accepting a suggestion needs to remember which one was meant."""
 
     def setUp(self):
         reset_plugin_settings()
@@ -395,23 +396,12 @@ class ExpressionIdentityInsertionTests(unittest.TestCase):
         self.editor.layer = lambda: self.context_layer
         self.controller = ac.CustomAutocompleteController(self.editor)
 
-        from _rtl_plugin.rtl_readmode import ChoiceMemory
-
-        self.project = QgsProject.instance()
-        self.original, self.existed = self.project.readEntry("rtl_bidi_editor", "value_choices", "")
-        self.ChoiceMemory = ChoiceMemory
-
     def tearDown(self):
-        if self.existed:
-            self.project.writeEntry("rtl_bidi_editor", "value_choices", self.original)
-        else:
-            self.project.removeEntry("rtl_bidi_editor", "value_choices")
-        self.ChoiceMemory.invalidate()
         self.controller.teardown()
         QgsProject.instance().removeMapLayers([self.context_layer.id(), self.lookup_layer.id()])
         reset_plugin_settings()
 
-    def _accept_status_1(self) -> None:
+    def test_accepting_an_ambiguous_value_inserts_only_the_value(self):
         text = "\"STATUS\" = '1"
         self.editor.setPlainText(text)
         cursor = self.editor.textCursor()
@@ -425,28 +415,10 @@ class ExpressionIdentityInsertionTests(unittest.TestCase):
         popup.setCurrentRow(row)
         self.controller.accept_current()
 
-    def test_a_non_filter_context_gets_a_hidden_id_comment_tagging_the_choice(self):
-        self._accept_status_1()
-
-        from _rtl_plugin.rtl_readmode import expression_context_key, extract_eid
-
-        eid = extract_eid(self.editor.toPlainText())
-        self.assertNotEqual(eid, "")
-
-        context = expression_context_key(self.editor)
-        self.assertEqual(self.ChoiceMemory.recall_eid("context", "status", "1", 0, context), eid)
-
-    def test_a_layer_filter_context_never_gets_an_id_comment(self):
-        # The editor has no parent, so it is its own window() here - giving
-        # it this objectName is enough to make expression_context_key()
-        # see exactly what it would for a real Query Builder dialog.
-        self.editor.setObjectName("QgsQueryBuilderBase")
-
-        self._accept_status_1()
-
-        from _rtl_plugin.rtl_readmode import extract_eid
-
-        self.assertEqual(extract_eid(self.editor.toPlainText()), "")
+        result = self.editor.toPlainText()
+        self.assertNotIn("\n", result)
+        self.assertNotIn("/*", result)
+        self.assertTrue(result.startswith('"STATUS" = '))
 
 
 if __name__ == "__main__":

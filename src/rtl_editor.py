@@ -115,10 +115,8 @@ except Exception:  # pragma: no cover
     CustomAutocompleteController = None
 
 try:
-    from .rtl_readmode import ChoiceMemory, ChoiceReconciler, ReadModeController
+    from .rtl_readmode import ReadModeController
 except Exception:  # pragma: no cover
-    ChoiceMemory = None
-    ChoiceReconciler = None
     ReadModeController = None
 
 
@@ -1224,20 +1222,6 @@ class RtlOverlayEditor(QPlainTextEdit):
                     f"Custom autocomplete unavailable: {exc}", Qgis.MessageLevel.Info
                 )
 
-        # --- optional feature: remembered-choice reconciliation -----------
-        # Rewrites the project's ChoiceMemory entries to exactly match the
-        # expression once the surrounding dialog is accepted (OK), instead
-        # of letting them only ever accumulate - see ChoiceReconciler.
-        self._choice_reconciler = None
-        if ChoiceReconciler is not None:
-            try:
-                self._choice_reconciler = ChoiceReconciler(self)
-            except Exception as exc:
-                self._choice_reconciler = None
-                _log(
-                    f"Choice reconciliation unavailable: {exc}", Qgis.MessageLevel.Info
-                )
-
     # ------------------------------------------------------------------ #
     # Setup
     # ------------------------------------------------------------------ #
@@ -1486,50 +1470,12 @@ class RtlOverlayEditor(QPlainTextEdit):
                     # A fresh document should not start with a pending undo.
                     self.document().clearUndoRedoStacks()
             self._pull_cursor_from_sci()
-            # A full document replace resets every QTextBlock's visibility -
-            # if the text still starts with a hidden expression-identity
-            # comment (see hide_expression_identity_line()), keep it hidden.
-            self.hide_expression_identity_line()
         except RuntimeError:
             self._detached = True
         except Exception as exc:
             _log(f"Text pull failed: {exc}", Qgis.MessageLevel.Warning)
         finally:
             self._syncing = False
-
-    def hide_expression_identity_line(self) -> None:
-        """If the document's first line is one of this plugin's own hidden
-        expression-identity comments (see ``rtl_readmode.make_eid_comment``
-        / ``CustomAutocompleteController._ensure_eid``), collapse that one
-        ``QTextBlock`` so it is not rendered at all.
-
-        The text itself is completely untouched - still exactly what gets
-        pushed to Scintilla and saved - only its on-screen rendering is
-        suppressed, the same mechanism a code editor uses for folding a
-        collapsed region. Safe to call at any time; a no-op whenever the
-        first line is not one of these (including reverting a previously
-        hidden line back to visible, e.g. after an undo removes the
-        comment and leaves some other line first).
-        """
-        try:
-            from .rtl_readmode import extract_eid
-        except Exception:
-            return
-        try:
-            document = self.document()
-            first_block = document.firstBlock()
-            if not first_block.isValid():
-                return
-            is_id_line = bool(extract_eid(first_block.text()))
-            if first_block.isVisible() == (not is_id_line):
-                return  # already in the right state
-            first_block.setVisible(not is_id_line)
-            document.markContentsDirty(first_block.position(), first_block.length())
-            self.viewport().update()
-        except RuntimeError:
-            self._detached = True
-        except Exception as exc:
-            _log(f"Could not hide expression id line: {exc}", Qgis.MessageLevel.Info)
 
     def _pull_cursor_from_sci(self) -> None:
         """Mirror Scintilla's caret/selection into the overlay.
@@ -1748,13 +1694,6 @@ class RtlOverlayEditor(QPlainTextEdit):
             except Exception:
                 pass
             self._custom_autocomplete = None
-        reconciler = getattr(self, "_choice_reconciler", None)
-        if reconciler is not None:
-            try:
-                reconciler.teardown()
-            except Exception:
-                pass
-            self._choice_reconciler = None
         read_mode = getattr(self, "_read_mode", None)
         if read_mode is not None:
             try:
@@ -1800,86 +1739,6 @@ class RtlOverlayEditor(QPlainTextEdit):
         except Exception:
             pass
         self._sci = None
-
-
-# --------------------------------------------------------------------------- #
-# Clipboard hygiene
-# --------------------------------------------------------------------------- #
-
-
-class ClipboardEidGuard(QObject):
-    """Strips this plugin's own hidden expression-identity comment (see
-    ``rtl_readmode.make_eid_comment``) from anything that reaches the
-    system clipboard.
-
-    The overlay never lets the user interact with the id line directly -
-    its own ``QTextBlock`` is collapsed (see
-    ``RtlOverlayEditor.hide_expression_identity_line()``) - but that only
-    suppresses *rendering*; the characters are still part of the real
-    ``QTextDocument``. A plain Select All + Copy still selects them right
-    along with the visible expression, and so would Cut, the right-click
-    context menu, an Edit-menu action, or a drag-out - every one of those
-    ultimately puts text on the very same system clipboard.
-
-    Filtering there, once, rather than trying to intercept ``copy()`` /
-    ``cut()`` / the context menu individually, is what makes this correct
-    regardless of which of those the user actually used: nothing about
-    *how* the clipboard was set matters, only what ends up in it.
-    """
-
-    def __init__(self, parent: Optional[QObject] = None, clipboard=None):
-        """``clipboard`` is a testing-only seam: pass a fake standing in
-        for ``QApplication.clipboard()`` (same ``text()``/``setText()``/
-        ``dataChanged`` surface) to exercise this class's own logic
-        deterministically, with no dependency on the real OS clipboard's
-        behaviour - which has repeatedly proven unreliable to assert
-        against directly in an automated environment (a write not taking
-        effect, or a stale read), independently of anything this class
-        does. Left ``None`` for real use, which resolves the real,
-        singleton system clipboard exactly as before.
-        """
-        super().__init__(parent)
-        self._stripping = False
-        self._clipboard_override = clipboard
-
-    def _clipboard(self):
-        if self._clipboard_override is not None:
-            return self._clipboard_override
-        return QApplication.clipboard()
-
-    def install(self) -> None:
-        clipboard = self._clipboard()
-        if clipboard is not None:
-            clipboard.dataChanged.connect(self._strip)
-
-    def uninstall(self) -> None:
-        clipboard = self._clipboard()
-        if clipboard is not None:
-            try:
-                clipboard.dataChanged.disconnect(self._strip)
-            except Exception:
-                pass
-
-    def _strip(self) -> None:
-        if self._stripping:
-            return  # our own clipboard.setText() below re-enters this slot
-        try:
-            from .rtl_readmode import strip_eid_comment
-
-            clipboard = self._clipboard()
-            text = clipboard.text()
-            if not text:
-                return
-            stripped = strip_eid_comment(text)
-            if stripped == text:
-                return
-            self._stripping = True
-            try:
-                clipboard.setText(stripped)
-            finally:
-                self._stripping = False
-        except Exception as exc:
-            _log(f"Clipboard id filter failed: {exc}", Qgis.MessageLevel.Info)
 
 
 # --------------------------------------------------------------------------- #
@@ -2212,9 +2071,6 @@ class CodeEditorWatcher(QObject):
 #: Set by RtlBidiEditorPlugin.initGui(); None while the plugin is unloaded.
 _WATCHER: Optional["CodeEditorWatcher"] = None
 
-#: Set by RtlBidiEditorPlugin.initGui(); None while the plugin is unloaded.
-_CLIPBOARD_GUARD: Optional["ClipboardEidGuard"] = None
-
 
 def rescan() -> int:
     """Force a scan of all visible windows. Returns the live overlay count."""
@@ -2251,7 +2107,6 @@ class RtlBidiEditorPlugin:
     def __init__(self, iface):
         self.iface = iface
         self._watcher: Optional[CodeEditorWatcher] = None
-        self._clipboard_guard: Optional[ClipboardEidGuard] = None
         self._settings_action = None
 
     # -- optional feature: settings UI ----------------------------------- #
@@ -2288,25 +2143,6 @@ class RtlBidiEditorPlugin:
         except Exception as exc:
             _log(f"Settings dialog failed: {exc}", Qgis.MessageLevel.Warning)
 
-    def _on_layers_will_be_removed(self, layer_ids) -> None:
-        """Purge remembered value/description choices for a layer that is
-        about to disappear from the project entirely.
-
-        reconcile_choices() (see ChoiceReconciler) only ever runs when a
-        specific expression's own dialog is accepted - it has no way to
-        notice a whole layer, and every expression slot on it, vanishing
-        outright. Without this, those choices would sit in the project
-        file forever with no layer left that could ever reconcile them
-        away.
-        """
-        if ChoiceMemory is None:
-            return
-        try:
-            for layer_id in layer_ids:
-                ChoiceMemory.purge_for_layer(layer_id)
-        except Exception as exc:
-            _log(f"Could not purge choices for a removed layer: {exc}", Qgis.MessageLevel.Warning)
-
     def apply_settings(self) -> None:
         """React to the master switch being toggled, without a restart.
 
@@ -2328,27 +2164,20 @@ class RtlBidiEditorPlugin:
     # -- lifecycle -------------------------------------------------------- #
 
     def initGui(self) -> None:  # noqa: N802 (QGIS plugin API)
-        global _WATCHER, _CLIPBOARD_GUARD
+        global _WATCHER
         try:
             self._add_menu()
             self._watcher = CodeEditorWatcher()
             _WATCHER = self._watcher
             self._watcher.install()
             try:
-                self._clipboard_guard = ClipboardEidGuard()
-                _CLIPBOARD_GUARD = self._clipboard_guard
-                self._clipboard_guard.install()
+                from .rtl_readmode import purge_legacy_project_entries
+
+                purge_legacy_project_entries()
             except Exception as exc:
-                self._clipboard_guard = None
-                _log(f"Clipboard id filter unavailable: {exc}", Qgis.MessageLevel.Info)
+                _log(f"Legacy entry cleanup unavailable: {exc}", Qgis.MessageLevel.Info)
             if SETTINGS_BUS is not None:
                 SETTINGS_BUS.changed.connect(self.apply_settings)
-            try:
-                from qgis.core import QgsProject
-
-                QgsProject.instance().layersWillBeRemoved.connect(self._on_layers_will_be_removed)
-            except Exception as exc:
-                _log(f"Layer-removal choice cleanup unavailable: {exc}", Qgis.MessageLevel.Info)
             _log("RTL Expression Editor active.", Qgis.MessageLevel.Success)
             _dbg(
                 f"watching editor classes {sorted(TARGET_EDITOR_CLASSES)}; "
@@ -2358,26 +2187,13 @@ class RtlBidiEditorPlugin:
             _log(f"Startup failed: {exc}", Qgis.MessageLevel.Critical)
 
     def unload(self) -> None:
-        global _WATCHER, _CLIPBOARD_GUARD
+        global _WATCHER
         _WATCHER = None
-        if self._clipboard_guard is not None:
-            try:
-                self._clipboard_guard.uninstall()
-            except Exception:
-                pass
-            self._clipboard_guard = None
-        _CLIPBOARD_GUARD = None
         if SETTINGS_BUS is not None:
             try:
                 SETTINGS_BUS.changed.disconnect(self.apply_settings)
             except Exception:
                 pass
-        try:
-            from qgis.core import QgsProject
-
-            QgsProject.instance().layersWillBeRemoved.disconnect(self._on_layers_will_be_removed)
-        except Exception:
-            pass
         self._remove_menu()
         if self._watcher is None:
             return

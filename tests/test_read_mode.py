@@ -2,11 +2,7 @@
 """Read mode: code/description substitution, ambiguous-code handling, and the
 mapping built from a configured lookup layer."""
 
-import shutil
-import tempfile
 import unittest
-from pathlib import Path
-from unittest import mock
 
 from qgis.core import QgsProject
 from qgis.PyQt.QtWidgets import QPlainTextEdit
@@ -14,13 +10,7 @@ from qgis.PyQt.QtWidgets import QPlainTextEdit
 from _rtl_plugin import rtl_readmode as rm
 from _rtl_plugin.rtl_settings import Settings
 
-from .utils import (
-    host_in_dialog,
-    make_context_layer,
-    make_lookup_layer,
-    reset_choice_memory,
-    reset_plugin_settings,
-)
+from .utils import make_context_layer, make_lookup_layer, reset_plugin_settings
 
 
 def iso(text: str) -> str:
@@ -43,7 +33,7 @@ class NormalizeCodeTests(unittest.TestCase):
 
 class SubstituteDescriptionsTests(unittest.TestCase):
     def test_replaces_every_mapped_code_with_its_description(self):
-        mapping = {"status": {"1": ["Active"], "2": ["Inactive"]}}
+        mapping = {"status": {"1": [("Active", "")], "2": [("Inactive", "")]}}
         expr = "\"STATUS\" = '1' OR \"STATUS\" = '2'"
         self.assertEqual(
             rm.substitute_descriptions(expr, mapping),
@@ -57,42 +47,26 @@ class SubstituteDescriptionsTests(unittest.TestCase):
     def test_only_the_field_the_literal_follows_is_substituted(self):
         # "OTHER" = '610' must stay untouched even though "F_ATT" also has a
         # meaning for 610 elsewhere in the same expression.
-        mapping = {"f_att": {"610": ["mosque"]}}
+        mapping = {"f_att": {"610": [("mosque", "")]}}
         expr = "\"OTHER\" = '610' AND \"F_ATT\" = '610'"
         self.assertEqual(
             rm.substitute_descriptions(expr, mapping),
             f"\"OTHER\" = '610' AND \"F_ATT\" = {iso('mosque')}",
         )
 
-    def test_an_ambiguous_code_shows_every_meaning_until_one_is_chosen(self):
+    def test_an_ambiguous_code_shows_every_meaning_until_resolved(self):
         # _pick_label() isolates each candidate before joining with " / ",
         # and substitute_descriptions() isolates its WHOLE returned label
         # again on top - a harmless, valid nested isolate, not a double
-        # substitution - see _isolate().
-        mapping = {"code": {"610": ["mosque", "greenhouse"]}}
+        # substitution - see _isolate(). Neither candidate has a group
+        # value here, so there is nothing to resolve it from.
+        mapping = {"code": {"610": [("mosque", ""), ("greenhouse", "")]}}
         expr = "\"CODE\" = '610'"
         joined = f'{iso("mosque")} / {iso("greenhouse")}'
         self.assertEqual(
             rm.substitute_descriptions(expr, mapping),
             f'"CODE" = {iso(joined)}',
         )
-
-    def test_a_remembered_choice_resolves_the_ambiguous_code(self):
-        # ChoiceMemory.remember() writes into the ACTIVE QgsProject's custom
-        # properties - snapshot, blank and restore that one entry, so this
-        # neither leaks residue into nor reads stray data from a real
-        # project if run from inside a live QGIS session.
-        restore = reset_choice_memory()
-        try:
-            rm.ChoiceMemory.remember("mytable", "code", "610", "greenhouse", 0, "ctx")
-            mapping = {"code": {"610": ["mosque", "greenhouse"]}}
-            expr = "\"CODE\" = '610'"
-            self.assertEqual(
-                rm.substitute_descriptions(expr, mapping, "mytable", "ctx"),
-                f'"CODE" = {iso("greenhouse")}',
-            )
-        finally:
-            restore()
 
     def test_field_names_are_replaced_by_their_configured_description(self):
         """Like a value's code, the field name disappears entirely in
@@ -109,7 +83,7 @@ class SubstituteDescriptionsTests(unittest.TestCase):
         self.assertEqual(result, expr)
 
     def test_alt_mode_renders_the_alternative_description(self):
-        mapping = {"status": {"1": ["Active"]}}
+        mapping = {"status": {"1": [("Active", "")]}}
         alt_mapping = {"status": {"1": {"Active": "פעיל"}}}
         expr = "\"STATUS\" = '1'"
         self.assertEqual(
@@ -120,28 +94,197 @@ class SubstituteDescriptionsTests(unittest.TestCase):
     def test_alt_mode_falls_back_to_the_primary_description_when_none_is_set(self):
         """A row with no alternative of its own must still render something
         sensible in alternative mode, rather than nothing."""
-        mapping = {"status": {"1": ["Active"]}}
+        mapping = {"status": {"1": [("Active", "")]}}
         expr = "\"STATUS\" = '1'"
         self.assertEqual(
             rm.substitute_descriptions(expr, mapping, mode="alt", alt_mapping={}),
             f'"STATUS" = {iso("Active")}',
         )
 
-    def test_alt_mode_respects_a_remembered_choice_among_several_meanings(self):
-        restore = reset_choice_memory()
-        try:
-            rm.ChoiceMemory.remember("mytable", "code", "610", "greenhouse", 0, "ctx")
-            mapping = {"code": {"610": ["mosque", "greenhouse"]}}
-            alt_mapping = {"code": {"610": {"mosque": "מסגד", "greenhouse": "חממה"}}}
-            expr = "\"CODE\" = '610'"
-            self.assertEqual(
-                rm.substitute_descriptions(
-                    expr, mapping, "mytable", "ctx", mode="alt", alt_mapping=alt_mapping
-                ),
-                f'"CODE" = {iso("חממה")}',
-            )
-        finally:
-            restore()
+
+class GroupContextScanningTests(unittest.TestCase):
+    """_scan_literals_with_scope() / _governing_values() - the low-level
+    machinery _pick_label() uses to infer an ambiguous code's meaning from
+    its own surrounding "AND" context in the SAME expression, replacing
+    the need to remember anything at all. Two literals share a scope
+    (one can supply the group for the other) exactly when one's path is a
+    PREFIX of the other's - see _governing_values()'s own docstring."""
+
+    def test_flat_and_siblings_share_the_same_scope_path(self):
+        leaves = rm._scan_literals_with_scope('"F_CODE" = 2300 AND "F_ATT" = 610')
+        by_field = {leaf.field: leaf for leaf in leaves}
+        self.assertEqual(by_field["f_code"].path, ())
+        self.assertEqual(by_field["f_att"].path, ())
+
+    def test_a_literal_inside_parens_gets_a_deeper_path_than_one_outside(self):
+        leaves = rm._scan_literals_with_scope('"F_CODE" = 2300 AND ("F_ATT" = 610)')
+        by_field = {leaf.field: leaf for leaf in leaves}
+        self.assertEqual(by_field["f_code"].path, ())
+        self.assertEqual(len(by_field["f_att"].path), 1)
+
+    def test_governing_values_includes_a_same_scope_sibling(self):
+        leaves = rm._scan_literals_with_scope('"F_CODE" = 2300 AND "F_ATT" = 610')
+        f_att = next(leaf for leaf in leaves if leaf.field == "f_att")
+        governing = rm._governing_values(leaves, "f_att", f_att.path)
+        self.assertIn("2300", governing)
+
+    def test_governing_values_includes_an_enclosing_scopes_comparison(self):
+        leaves = rm._scan_literals_with_scope('"F_CODE" = 2300 AND ("F_ATT" = 610)')
+        f_att = next(leaf for leaf in leaves if leaf.field == "f_att")
+        governing = rm._governing_values(leaves, "f_att", f_att.path)
+        self.assertIn("2300", governing)
+
+    def test_governing_values_reach_through_multiple_nested_levels(self):
+        leaves = rm._scan_literals_with_scope('"F_CODE" = 2300 AND (("F_ATT" = 610))')
+        target = next(leaf for leaf in leaves if leaf.field == "f_att")
+        governing = rm._governing_values(leaves, "f_att", target.path)
+        self.assertIn("2300", governing)
+
+    def test_governing_values_never_includes_a_same_field_comparison(self):
+        leaves = rm._scan_literals_with_scope('"F_ATT" = 611 AND "F_ATT" = 610')
+        target = leaves[-1]
+        governing = rm._governing_values(leaves, "f_att", target.path)
+        self.assertNotIn("611", governing)
+
+    def test_sibling_parenthesised_groups_never_govern_each_other(self):
+        """Two unrelated parenthesised groups at the SAME level - each a
+        distinct paren instance - must not leak context into one another,
+        even with no explicit tracking of AND vs. OR: they simply never
+        share a scope path at all."""
+        leaves = rm._scan_literals_with_scope(
+            '("F_CODE" = 2300 AND "F_ATT" = 610) OR ("F_CODE" = 1400 AND "F_ATT" = 611)'
+        )
+        first_att = next(leaf for leaf in leaves if leaf.field == "f_att" and leaf.code == "610")
+        governing = rm._governing_values(leaves, "f_att", first_att.path)
+        self.assertIn("2300", governing)
+        self.assertNotIn("1400", governing)
+
+
+class PickLabelGroupResolutionTests(unittest.TestCase):
+    """_pick_label() - resolving an ambiguous code from the expression's
+    own group context: exactly the two patterns described - a flat "AND"
+    sibling comparison, or an enclosing scope's comparison governing
+    everything inside a parenthesised group - falling back to showing
+    every meaning whenever that is not conclusive."""
+
+    def test_a_single_candidate_needs_no_group_context_at_all(self):
+        label = rm._pick_label([("Active", "")], "status", (), [])
+        self.assertEqual(label, "Active")
+
+    def test_resolves_via_a_flat_and_sibling_comparison(self):
+        text = '"F_CODE" = 2300 AND "F_ATT" = 610'
+        leaves = rm._scan_literals_with_scope(text)
+        target = next(leaf for leaf in leaves if leaf.field == "f_att")
+        candidates = [("mosque", "2300"), ("greenhouse", "1400")]
+        label = rm._pick_label(candidates, "f_att", target.path, leaves)
+        self.assertEqual(label, "mosque")
+
+    def test_resolves_regardless_of_which_side_of_the_and_the_group_is_on(self):
+        text = '"F_ATT" = 610 AND "F_CODE" = 2300'
+        leaves = rm._scan_literals_with_scope(text)
+        target = next(leaf for leaf in leaves if leaf.field == "f_att")
+        candidates = [("mosque", "2300"), ("greenhouse", "1400")]
+        label = rm._pick_label(candidates, "f_att", target.path, leaves)
+        self.assertEqual(label, "mosque")
+
+    def test_resolves_via_an_enclosing_parenthesised_groups_comparison(self):
+        text = '"F_CODE" = 2300 AND ("F_ATT" = 610)'
+        leaves = rm._scan_literals_with_scope(text)
+        target = next(leaf for leaf in leaves if leaf.field == "f_att")
+        candidates = [("mosque", "2300"), ("greenhouse", "1400")]
+        label = rm._pick_label(candidates, "f_att", target.path, leaves)
+        self.assertEqual(label, "mosque")
+
+    def test_falls_back_to_every_meaning_when_no_group_matches(self):
+        text = '"F_ATT" = 610'
+        leaves = rm._scan_literals_with_scope(text)
+        target = leaves[0]
+        candidates = [("mosque", "2300"), ("greenhouse", "1400")]
+        label = rm._pick_label(candidates, "f_att", target.path, leaves)
+        self.assertEqual(label, f'{iso("mosque")} / {iso("greenhouse")}')
+
+    def test_falls_back_to_every_meaning_when_more_than_one_group_matches(self):
+        """Genuinely ambiguous - both candidates' groups happen to be
+        present in the surrounding context - never guess between them."""
+        text = '"F_CODE" = 2300 AND "OTHER_CODE" = 1400 AND "F_ATT" = 610'
+        leaves = rm._scan_literals_with_scope(text)
+        target = next(leaf for leaf in leaves if leaf.field == "f_att")
+        candidates = [("mosque", "2300"), ("greenhouse", "1400")]
+        label = rm._pick_label(candidates, "f_att", target.path, leaves)
+        self.assertEqual(label, f'{iso("mosque")} / {iso("greenhouse")}')
+
+    def test_a_candidate_with_no_group_value_never_matches(self):
+        text = '"F_CODE" = 2300 AND "F_ATT" = 610'
+        leaves = rm._scan_literals_with_scope(text)
+        target = next(leaf for leaf in leaves if leaf.field == "f_att")
+        candidates = [("mosque", ""), ("greenhouse", "1400")]
+        label = rm._pick_label(candidates, "f_att", target.path, leaves)
+        # "2300" governs, but neither candidate's own group is "2300".
+        self.assertEqual(label, f'{iso("mosque")} / {iso("greenhouse")}')
+
+    def test_alt_mode_resolves_the_same_way_then_renders_its_alternative(self):
+        text = '"F_CODE" = 2300 AND "F_ATT" = 610'
+        leaves = rm._scan_literals_with_scope(text)
+        target = next(leaf for leaf in leaves if leaf.field == "f_att")
+        candidates = [("mosque", "2300"), ("greenhouse", "1400")]
+        label = rm._pick_label(
+            candidates, "f_att", target.path, leaves, mode="alt",
+            alt_for_code={"mosque": "מסגד", "greenhouse": "חממה"},
+        )
+        self.assertEqual(label, "מסגד")
+
+
+class SubstituteDescriptionsGroupResolutionTests(unittest.TestCase):
+    """substitute_descriptions() end to end: an ambiguous code resolved
+    straight from the expression's own group context - the mechanism that
+    replaces remembering which meaning was chosen. Nothing here is ever
+    written anywhere; the same expression re-rendered later resolves the
+    same way again, straight from its own text and the lookup table."""
+
+    def test_flat_and_pattern_resolves_the_ambiguous_code(self):
+        mapping = {"f_att": {"610": [("mosque", "2300"), ("greenhouse", "1400")]}}
+        expr = '"F_CODE" = 2300 AND "F_ATT" = 610'
+        result = rm.substitute_descriptions(expr, mapping)
+        self.assertEqual(result, f'"F_CODE" = 2300 AND "F_ATT" = {iso("mosque")}')
+
+    def test_parenthesised_group_pattern_resolves_every_code_inside_it(self):
+        mapping = {
+            "f_att": {
+                "610": [("mosque", "2300"), ("greenhouse", "1400")],
+                "611": [("church", "2300"), ("barn", "1400")],
+            }
+        }
+        expr = '"F_CODE" = 2300 AND ("F_ATT" = 610 OR "F_ATT" = 611)'
+        result = rm.substitute_descriptions(expr, mapping)
+        self.assertEqual(
+            result,
+            f'"F_CODE" = 2300 AND ("F_ATT" = {iso("mosque")} OR "F_ATT" = {iso("church")})',
+        )
+
+    def test_no_group_context_falls_back_to_showing_every_meaning(self):
+        mapping = {"f_att": {"610": [("mosque", "2300"), ("greenhouse", "1400")]}}
+        expr = '"F_ATT" = 610'
+        result = rm.substitute_descriptions(expr, mapping)
+        joined = f'{iso("mosque")} / {iso("greenhouse")}'
+        self.assertEqual(result, f'"F_ATT" = {iso(joined)}')
+
+    def test_two_separate_groups_each_resolve_their_own_ambiguous_code(self):
+        """The same code appearing twice, under two different groups in
+        two different parenthesised clauses, resolves independently and
+        correctly each time - the whole point of reading it straight from
+        each occurrence's own context instead of remembering one answer
+        per code."""
+        mapping = {"f_att": {"610": [("mosque", "2300"), ("greenhouse", "1400")]}}
+        expr = (
+            '("F_CODE" = 2300 AND "F_ATT" = 610) OR '
+            '("F_CODE" = 1400 AND "F_ATT" = 610)'
+        )
+        result = rm.substitute_descriptions(expr, mapping)
+        self.assertEqual(
+            result,
+            f'("F_CODE" = 2300 AND "F_ATT" = {iso("mosque")}) OR '
+            f'("F_CODE" = 1400 AND "F_ATT" = {iso("greenhouse")})',
+        )
 
 
 class ForceLtrParagraphsTests(unittest.TestCase):
@@ -184,7 +327,7 @@ class ForceLtrParagraphsTests(unittest.TestCase):
         """The end-to-end scenario reported: a Hebrew field description
         replacing the field name must not cause the value description (or
         a whole IN-list) to visually reorder relative to it."""
-        mapping = {"f_code": {"2300": ["בית כנסת"], "2301": ["מבנה חקלאי"]}}
+        mapping = {"f_code": {"2300": [("בית כנסת", "")], "2301": [("מבנה חקלאי", "")]}}
         expr = "\"F_CODE\" IN (2300, 2301)"
         substituted = rm.substitute_descriptions(
             expr, mapping, field_descriptions={"f_code": "ישות"}
@@ -210,7 +353,7 @@ class BidiIsolationTests(unittest.TestCase):
     """
 
     def test_each_substituted_label_is_individually_isolated(self):
-        mapping = {"f_code": {"2300": ["בית כנסת"], "2301": ["מבנה חקלאי"]}}
+        mapping = {"f_code": {"2300": [("בית כנסת", "")], "2301": [("מבנה חקלאי", "")]}}
         result = rm.substitute_descriptions("\"F_CODE\" IN (2300, 2301)", mapping)
         self.assertEqual(
             result, f'"F_CODE" IN ({iso("בית כנסת")}, {iso("מבנה חקלאי")})'
@@ -223,7 +366,11 @@ class BidiIsolationTests(unittest.TestCase):
         regardless of how many RTL/LTR labels are involved or how they are
         nested."""
         mapping = {
-            "f_code": {"2300": ["מבנה דת"], "2301": ["מבנה חקלאי"], "2302": ["בית ספר"]}
+            "f_code": {
+                "2300": [("מבנה דת", "")],
+                "2301": [("מבנה חקלאי", "")],
+                "2302": [("בית ספר", "")],
+            }
         }
         expr = "\"F_CODE\" IN (2300, 2301, 2302)"
         result = rm.substitute_descriptions(
@@ -238,8 +385,8 @@ class BidiIsolationTests(unittest.TestCase):
         must still read in their original left-to-right sequence once the
         isolate markers are stripped."""
         mapping = {
-            "f_code": {"2300": ["מבנה דת"]},
-            "f_type": {"1": ["פעיל"], "2": ["לא פעיל"]},
+            "f_code": {"2300": [("מבנה דת", "")]},
+            "f_type": {"1": [("פעיל", "")], "2": [("לא פעיל", "")]},
         }
         expr = "(\"F_CODE\" = 2300) AND (\"F_TYPE\" IN (1, 2))"
         result = rm.substitute_descriptions(
@@ -249,32 +396,12 @@ class BidiIsolationTests(unittest.TestCase):
         self.assertEqual(stripped, "(ישות = מבנה דת) AND (סוג IN (פעיל, לא פעיל))")
 
     def test_ambiguous_meanings_joined_by_slash_are_each_isolated_too(self):
-        mapping = {"code": {"610": ["מסגד", "חממה"]}}
+        mapping = {"code": {"610": [("מסגד", ""), ("חממה", "")]}}
         result = rm.substitute_descriptions("\"CODE\" = '610'", mapping)
         joined = f'{iso("מסגד")} / {iso("חממה")}'
         self.assertEqual(result, f'"CODE" = {iso(joined)}')
         stripped = result.replace(rm._FSI, "").replace(rm._PDI, "")
         self.assertEqual(stripped, '"CODE" = מסגד / חממה')
-
-
-class OccurrenceIndexTests(unittest.TestCase):
-    """occurrence_index(text_before, ...) counts matches WITHIN whatever
-    slice it is given - callers pass the text up to (not including) the
-    literal being resolved, so that slice is what these tests build too."""
-
-    def test_counts_earlier_occurrences_of_the_same_field_and_code(self):
-        text = "\"CODE\" = '610' OR \"CODE\" = '610'"
-        first_starts_at = text.index("'610'")
-        second_starts_at = text.rindex("'610'")
-        self.assertEqual(rm.occurrence_index(text[:first_starts_at], "CODE", "610"), 0)
-        self.assertEqual(rm.occurrence_index(text[:second_starts_at], "CODE", "610"), 1)
-
-    def test_does_not_count_a_different_field_with_the_same_code(self):
-        text = "\"OTHER\" = '610' AND \"CODE\" = '610'"
-        second_starts_at = text.rindex("'610'")
-        # "OTHER" = '610' precedes the point of insertion, but it must never
-        # be mistaken for an earlier "CODE" occurrence.
-        self.assertEqual(rm.occurrence_index(text[:second_starts_at], "CODE", "610"), 0)
 
 
 class DescriptionResolverTests(unittest.TestCase):
@@ -287,6 +414,7 @@ class DescriptionResolverTests(unittest.TestCase):
         Settings.set_field("value", "value")
         Settings.set_field("description", "description")
         Settings.set_field("table", "table")
+        Settings.set_field("group_code", "group_code")
         rm.DescriptionResolver.invalidate()
 
     def tearDown(self):
@@ -300,7 +428,18 @@ class DescriptionResolverTests(unittest.TestCase):
     def test_mapping_builds_field_to_code_to_descriptions(self):
         values, _alt_values, _field_descriptions = rm.DescriptionResolver.mapping(["context"])
         self.assertIn("status", values)
-        self.assertEqual(values["status"]["1"], ["Active"])
+        # STATUS/1 in the fixture carries group_code "G1" - see
+        # test_mapping_captures_each_rows_group_code_alongside_its_description.
+        self.assertEqual(values["status"]["1"], [("Active", "G1")])
+
+    def test_mapping_captures_each_rows_group_code_alongside_its_description(self):
+        """The same "Group codes column" already used to head a suggestion-
+        list group doubles as what _pick_label() matches an ambiguous
+        code's surrounding context against - see its own docstring."""
+        values, _alt_values, _field_descriptions = rm.DescriptionResolver.mapping(["context"])
+        self.assertEqual(values["status"]["2"], [("Inactive", "G1")])
+        # COUNTRY/IL has no group_code in the fixture - recorded as "".
+        self.assertEqual(values["country"]["IL"], [("Israel", "")])
 
     def test_mapping_is_empty_without_a_description_or_field_description_configured(self):
         Settings.set_field("description", "")
@@ -359,523 +498,6 @@ class DescriptionResolverTests(unittest.TestCase):
 
         values, _alt, _field_desc = rm.DescriptionResolver.mapping(["context"])
         self.assertIn("newfield", values)
-
-
-class AlternativeDescriptionAutomaticEnrichmentTests(unittest.TestCase):
-    """The key requirement: a choice remembered BEFORE an alternative
-    description column existed must render correctly in alternative mode as
-    soon as the column is configured - with no re-selection and no
-    migration, because the alternative is always looked up fresh by the
-    remembered PRIMARY description text, never stored alongside the choice
-    itself. See ChoiceMemory and rm._pick_label()."""
-
-    def setUp(self):
-        reset_plugin_settings()
-        self.layer = make_lookup_layer()
-        QgsProject.instance().addMapLayer(self.layer)
-        Settings.set_layer_id(self.layer.id())
-        Settings.set_field("field_names", "field_name")
-        Settings.set_field("value", "value")
-        Settings.set_field("description", "description")
-        Settings.set_field("table", "table")
-        rm.DescriptionResolver.invalidate()
-
-        self.project = QgsProject.instance()
-        self._restore_choices = reset_choice_memory()
-
-    def tearDown(self):
-        self._restore_choices()
-        reset_plugin_settings()
-        QgsProject.instance().removeMapLayer(self.layer.id())
-        rm.DescriptionResolver.invalidate()
-
-    def test_a_choice_remembered_before_the_alt_column_existed_still_renders_in_alt_mode(self):
-        # STATUS has two meanings for a made-up ambiguous code - remember the
-        # user's choice exactly as the popup would, with no alt_description
-        # column configured at all yet.
-        rm.ChoiceMemory.remember("context", "status", "1", "Active", 0, "ctx")
-        values, alt_values, _field_desc = rm.DescriptionResolver.mapping(["context"])
-        label = rm._pick_label(
-            values["status"]["1"], "context", "status", "1", 0, "ctx", mode="alt",
-            alt_for_code=alt_values.get("status", {}).get("1", {}),
-        )
-        # No alt column yet - falls back to the primary description.
-        self.assertEqual(label, "Active")
-
-        # Now the alt_description column is configured - no re-selection,
-        # no migration, nothing touched in the remembered choice itself.
-        Settings.set_field("alt_description", "alt_description")
-        rm.DescriptionResolver.invalidate()
-        values, alt_values, _field_desc = rm.DescriptionResolver.mapping(["context"])
-        label = rm._pick_label(
-            values["status"]["1"], "context", "status", "1", 0, "ctx", mode="alt",
-            alt_for_code=alt_values.get("status", {}).get("1", {}),
-        )
-        self.assertEqual(label, "פעיל")
-
-    def test_editing_the_primary_description_changes_the_alt_rendering_too(self):
-        """"Look at the alternative description as a meta-description of the
-        description" - if the underlying row's own description text is what
-        changes, the alternative resolved for it changes right along with it,
-        since both are read fresh from the same row every time."""
-        Settings.set_field("alt_description", "alt_description")
-        rm.DescriptionResolver.invalidate()
-
-        field_index = self.layer.fields().indexOf("description")
-        alt_index = self.layer.fields().indexOf("alt_description")
-        self.layer.startEditing()
-        for feature in self.layer.getFeatures():
-            if feature["value"] == "1" and feature["field_name"] == "STATUS":
-                self.layer.changeAttributeValue(feature.id(), field_index, "Enabled")
-                self.layer.changeAttributeValue(feature.id(), alt_index, "מאופשר")
-                break
-        self.layer.commitChanges()
-
-        values, alt_values, _field_desc = rm.DescriptionResolver.mapping(["context"])
-        self.assertIn("Enabled", values["status"]["1"])
-        self.assertEqual(alt_values["status"]["1"]["Enabled"], "מאופשר")
-
-
-class ChoiceMemoryAltDescriptionPersistenceTests(unittest.TestCase):
-    """Requirement: a value/description pair a colleague already selected
-    with v1.4 must never be deleted or altered by v1.5 - only enriched with
-    an automatically-added alternative description, stored as a SIBLING
-    entry inside the very same project property (see
-    ChoiceMemory._ALT_SUFFIX), so that:
-
-    * v1.4 (with no notion of an alternative at all) keeps reading exactly
-      the same primary description it always did, unaware the extra entry
-      even exists;
-    * v1.4 saving the project again later (e.g. after making some other,
-      unrelated new choice) does not drop the alternative - its own
-      remember() merges into the whole stored dict rather than replacing
-      it, so an entry it does not understand simply survives untouched;
-    * a v1.5 install opening the same project later - or the same install,
-      right after entering Alternative Read mode - has the alternative
-      available with nothing to reselect.
-    """
-
-    SCOPE = "rtl_bidi_editor"
-    KEY = "value_choices"
-
-    def setUp(self):
-        reset_plugin_settings()
-        self.layer = make_lookup_layer()
-        QgsProject.instance().addMapLayer(self.layer)
-        Settings.set_layer_id(self.layer.id())
-        Settings.set_field("field_names", "field_name")
-        Settings.set_field("value", "value")
-        Settings.set_field("description", "description")
-        Settings.set_field("table", "table")
-        rm.DescriptionResolver.invalidate()
-
-        self.project = QgsProject.instance()
-        self._restore_choices = reset_choice_memory()
-
-    def tearDown(self):
-        self._restore_choices()
-        reset_plugin_settings()
-        QgsProject.instance().removeMapLayer(self.layer.id())
-        rm.DescriptionResolver.invalidate()
-
-    def _v14_style_load(self):
-        """Mirrors exactly what v1.4's own ChoiceMemory._load() does - a
-        plain, blind ``str(v)`` over every value in the stored dict, with no
-        awareness that some keys might carry an alternative description."""
-        import json
-
-        raw, ok = self.project.readEntry(self.SCOPE, self.KEY, "")
-        if not (ok and raw):
-            return {}
-        parsed = json.loads(raw)
-        return {str(k): str(v) for k, v in parsed.items()}
-
-    def _enter_alt_mode_for_status_1(self):
-        """Stands in for the user actually switching to Alternative Read
-        mode - the trigger that resolves (and persists) the alternative."""
-        values, alt_values, _field_desc = rm.DescriptionResolver.mapping(["context"])
-        return rm._pick_label(
-            values["status"]["1"], "context", "status", "1", 0, "ctx", mode="alt",
-            alt_for_code=alt_values.get("status", {}).get("1", {}),
-        )
-
-    def test_a_v14_style_choice_survives_untouched_after_alt_is_persisted(self):
-        # A colleague on v1.4 picked "Active" for STATUS/1 from the popup -
-        # the ordinary remember() call, unchanged since v1.4.
-        rm.ChoiceMemory.remember("context", "status", "1", "Active", 0, "ctx")
-        self.assertEqual(rm.ChoiceMemory.recall("context", "status", "1", 0, "ctx"), "Active")
-
-        # The same project opened with v1.5, which now has an
-        # alt_description column configured - entering Alternative Read
-        # mode is what triggers the automatic persistence.
-        Settings.set_field("alt_description", "alt_description")
-        rm.DescriptionResolver.invalidate()
-        label = self._enter_alt_mode_for_status_1()
-        self.assertEqual(label, "פעיל")
-
-        # The primary choice is completely unaffected...
-        self.assertEqual(rm.ChoiceMemory.recall("context", "status", "1", 0, "ctx"), "Active")
-        # ...and the alternative is now persisted too.
-        self.assertEqual(rm.ChoiceMemory.recall_alt("context", "status", "1", 0, "ctx"), "פעיל")
-
-    def test_a_v14_install_reading_the_project_sees_only_the_plain_primary_description(self):
-        """The critical backward-compatibility guarantee: whatever v1.4's
-        own (unmodified) loading code would produce for the primary key must
-        still be the plain description text - never a Python dict repr or
-        anything else that would corrupt its own read mode."""
-        rm.ChoiceMemory.remember("context", "status", "1", "Active", 0, "ctx")
-        Settings.set_field("alt_description", "alt_description")
-        rm.DescriptionResolver.invalidate()
-        self._enter_alt_mode_for_status_1()
-
-        v14_view = self._v14_style_load()
-        primary_key = rm.ChoiceMemory._key("context", "status", "1", 0, "ctx")
-        self.assertEqual(v14_view[primary_key], "Active")
-        self.assertIsInstance(v14_view[primary_key], str)
-
-    def test_a_v14_install_re_saving_the_project_does_not_drop_the_alternative(self):
-        """v1.4's remember() loads the WHOLE dict, adds/updates its own key
-        and writes the WHOLE dict back - so an entry it does not understand
-        (the alternative) must still be there afterwards, unmodified by
-        having passed through v1.4's own code."""
-        rm.ChoiceMemory.remember("context", "status", "1", "Active", 0, "ctx")
-        Settings.set_field("alt_description", "alt_description")
-        rm.DescriptionResolver.invalidate()
-        self._enter_alt_mode_for_status_1()
-        self.assertEqual(rm.ChoiceMemory.recall_alt("context", "status", "1", 0, "ctx"), "פעיל")
-
-        # Simulate v1.4 making an unrelated new choice elsewhere and saving.
-        rm.ChoiceMemory.remember("context", "country", "IL", "Israel", 0, "ctx")
-
-        self.assertEqual(rm.ChoiceMemory.recall("context", "status", "1", 0, "ctx"), "Active")
-        self.assertEqual(rm.ChoiceMemory.recall_alt("context", "status", "1", 0, "ctx"), "פעיל")
-        self.assertEqual(rm.ChoiceMemory.recall("context", "country", "IL", 0, "ctx"), "Israel")
-
-    def test_no_alternative_is_persisted_for_a_value_that_was_never_actually_chosen(self):
-        """Only ever enriches an EXISTING remembered pair - never invents
-        one for a code the user simply typed by hand or never picked from
-        the suggestion list."""
-        Settings.set_field("alt_description", "alt_description")
-        rm.DescriptionResolver.invalidate()
-        self._enter_alt_mode_for_status_1()  # no remember() call beforehand
-        self.assertEqual(rm.ChoiceMemory.recall_alt("context", "status", "1", 0, "ctx"), "")
-
-
-class ChoiceMemoryForgetTests(unittest.TestCase):
-    """ChoiceMemory.forget() - the low-level primitive reconcile_choices()
-    builds on: removes one occurrence's primary AND alternative entries."""
-
-    def setUp(self):
-        self.project = QgsProject.instance()
-        self._restore_choices = reset_choice_memory()
-
-    def tearDown(self):
-        self._restore_choices()
-
-    def test_forget_removes_both_the_primary_and_alternative_entry(self):
-        rm.ChoiceMemory.remember("t", "f", "1", "Active", 0, "ctx")
-        rm.ChoiceMemory.remember_alt("t", "f", "1", 0, "ctx", "פעיל")
-        self.assertEqual(rm.ChoiceMemory.recall("t", "f", "1", 0, "ctx"), "Active")
-        self.assertEqual(rm.ChoiceMemory.recall_alt("t", "f", "1", 0, "ctx"), "פעיל")
-
-        rm.ChoiceMemory.forget("t", "f", "1", 0, "ctx")
-
-        self.assertEqual(rm.ChoiceMemory.recall("t", "f", "1", 0, "ctx"), "")
-        self.assertEqual(rm.ChoiceMemory.recall_alt("t", "f", "1", 0, "ctx"), "")
-
-    def test_forgetting_a_never_remembered_occurrence_is_a_harmless_no_op(self):
-        rm.ChoiceMemory.forget("t", "f", "1", 0, "ctx")  # must not raise
-        self.assertEqual(rm.ChoiceMemory.recall("t", "f", "1", 0, "ctx"), "")
-
-    def test_forget_does_not_disturb_a_different_occurrence(self):
-        rm.ChoiceMemory.remember("t", "f", "1", "Active", 0, "ctx")
-        rm.ChoiceMemory.remember("t", "f", "1", "Enabled", 1, "ctx")
-
-        rm.ChoiceMemory.forget("t", "f", "1", 0, "ctx")
-
-        self.assertEqual(rm.ChoiceMemory.recall("t", "f", "1", 0, "ctx"), "")
-        self.assertEqual(rm.ChoiceMemory.recall("t", "f", "1", 1, "ctx"), "Enabled")
-
-
-class ChoiceMemoryPurgeForLayerTests(unittest.TestCase):
-    """ChoiceMemory.purge_for_layer() - the complementary cleanup for a
-    layer removed from the project entirely, which reconcile_choices() has
-    no way to notice on its own (it only runs when a specific expression's
-    own dialog is accepted, not when the layer behind it disappears)."""
-
-    def setUp(self):
-        self.project = QgsProject.instance()
-        self._restore_choices = reset_choice_memory()
-
-    def tearDown(self):
-        self._restore_choices()
-
-    def test_removes_every_entry_whose_context_references_the_layer(self):
-        # expression_context_key() always appends the layer's id as the
-        # last part of the context - mirrored here without needing a real
-        # widget/window, since purge_for_layer() only ever does a plain
-        # substring check.
-        context = "QgsQueryBuilderBase|Query Builder|QgisApp|layer-abc-123"
-        rm.ChoiceMemory.remember("t", "f_att", "610", "mosque", 0, context)
-        rm.ChoiceMemory.remember_alt("t", "f_att", "610", 0, context, "مسجد")
-        rm.ChoiceMemory.remember("t", "f_att", "610", "mosque", 1, context)
-
-        removed = rm.ChoiceMemory.purge_for_layer("layer-abc-123")
-
-        self.assertEqual(removed, 3)  # 2 primary entries + 1 alternative
-        self.assertEqual(rm.ChoiceMemory.recall("t", "f_att", "610", 0, context), "")
-        self.assertEqual(rm.ChoiceMemory.recall_alt("t", "f_att", "610", 0, context), "")
-        self.assertEqual(rm.ChoiceMemory.recall("t", "f_att", "610", 1, context), "")
-
-    def test_does_not_touch_a_different_layers_entries(self):
-        context_a = "QgsQueryBuilderBase|Query Builder|QgisApp|layer-abc-123"
-        context_b = "QgsQueryBuilderBase|Query Builder|QgisApp|layer-xyz-999"
-        rm.ChoiceMemory.remember("t", "f_att", "610", "mosque", 0, context_a)
-        rm.ChoiceMemory.remember("t", "f_att", "610", "greenhouse", 0, context_b)
-
-        rm.ChoiceMemory.purge_for_layer("layer-abc-123")
-
-        self.assertEqual(rm.ChoiceMemory.recall("t", "f_att", "610", 0, context_a), "")
-        self.assertEqual(rm.ChoiceMemory.recall("t", "f_att", "610", 0, context_b), "greenhouse")
-
-    def test_an_empty_or_unmatched_layer_id_is_a_harmless_no_op(self):
-        rm.ChoiceMemory.remember("t", "f", "1", "Active", 0, "ctx")
-        self.assertEqual(rm.ChoiceMemory.purge_for_layer(""), 0)
-        self.assertEqual(rm.ChoiceMemory.purge_for_layer("no-such-layer"), 0)
-        self.assertEqual(rm.ChoiceMemory.recall("t", "f", "1", 0, "ctx"), "Active")
-
-    def test_forget_does_not_disturb_a_different_occurrence(self):
-        rm.ChoiceMemory.remember("t", "f", "1", "Active", 0, "ctx")
-        rm.ChoiceMemory.remember("t", "f", "1", "Enabled", 1, "ctx")
-
-        rm.ChoiceMemory.forget("t", "f", "1", 0, "ctx")
-
-        self.assertEqual(rm.ChoiceMemory.recall("t", "f", "1", 0, "ctx"), "")
-        self.assertEqual(rm.ChoiceMemory.recall("t", "f", "1", 1, "ctx"), "Enabled")
-
-
-class ReconcileChoicesTests(unittest.TestCase):
-    """reconcile_choices() - rewriting ChoiceMemory so it exactly matches
-    the current expression instead of only ever accumulating entries, or
-    silently misattributing one occurrence's remembered choice to a
-    DIFFERENT literal once editing shifts which one holds a given
-    occurrence number.
-    """
-
-    CONTEXT = "ctx"
-    TABLE = "mytable"
-
-    def setUp(self):
-        self.project = QgsProject.instance()
-        self._restore_choices = reset_choice_memory()
-
-    def tearDown(self):
-        self._restore_choices()
-
-    def _recall(self, code, occurrence):
-        return rm.ChoiceMemory.recall(self.TABLE, "code", code, occurrence, self.CONTEXT)
-
-    def test_identical_text_is_a_no_op(self):
-        rm.ChoiceMemory.remember(self.TABLE, "code", "610", "mosque", 0, self.CONTEXT)
-        text = "\"CODE\" = 610"
-        rm.reconcile_choices(self.CONTEXT, self.TABLE, text, text)
-        self.assertEqual(self._recall("610", 0), "mosque")
-
-    def test_an_earlier_insertion_moves_survivors_to_their_new_occurrence(self):
-        """The exact scenario reported: inserting a new occurrence of the
-        same field/code pair BEFORE existing ones must not leave the
-        existing ones' remembered choices stranded under their old,
-        now-wrong occurrence numbers."""
-        rm.ChoiceMemory.remember(self.TABLE, "code", "610", "mosque", 0, self.CONTEXT)
-        rm.ChoiceMemory.remember(self.TABLE, "code", "610", "greenhouse", 1, self.CONTEXT)
-
-        before = '"CODE" = 610 AND "OTHER" = 1 AND "CODE" = 610'
-        # A brand-new third occurrence inserted at the very start - both
-        # previously-existing ones are still present, unchanged, just later.
-        after = '"CODE" = 610 AND "CODE" = 610 AND "OTHER" = 1 AND "CODE" = 610'
-
-        rm.reconcile_choices(self.CONTEXT, self.TABLE, before, after)
-
-        self.assertEqual(self._recall("610", 0), "")  # the new occurrence - nothing chosen yet
-        self.assertEqual(self._recall("610", 1), "mosque")  # carried from old occurrence 0
-        self.assertEqual(self._recall("610", 2), "greenhouse")  # carried from old occurrence 1
-
-    def test_removing_a_clause_deletes_its_choice_and_shifts_the_survivor_down(self):
-        """The other half of the same scenario: removing the first of two
-        occurrences must not leave the survivor showing the REMOVED one's
-        description."""
-        rm.ChoiceMemory.remember(self.TABLE, "code", "610", "mosque", 0, self.CONTEXT)
-        rm.ChoiceMemory.remember(self.TABLE, "code", "610", "greenhouse", 1, self.CONTEXT)
-
-        before = '"CODE" = 610 AND "OTHER" = 1 AND "CODE" = 610'
-        after = '"OTHER" = 1 AND "CODE" = 610'  # the first "CODE" = 610 clause was deleted
-
-        rm.reconcile_choices(self.CONTEXT, self.TABLE, before, after)
-
-        self.assertEqual(self._recall("610", 0), "greenhouse")  # NOT "mosque" - that clause is gone
-        self.assertEqual(self._recall("610", 1), "")  # no stale leftover for a slot that no longer exists
-
-    def test_an_alternative_description_moves_along_with_its_primary(self):
-        rm.ChoiceMemory.remember(self.TABLE, "code", "610", "mosque", 0, self.CONTEXT)
-        rm.ChoiceMemory.remember_alt(self.TABLE, "code", "610", 0, self.CONTEXT, "مسجد")
-
-        before = '"CODE" = 610'
-        after = '"OTHER" = 1 AND "CODE" = 610'  # an unrelated clause inserted before it
-
-        rm.reconcile_choices(self.CONTEXT, self.TABLE, before, after)
-
-        self.assertEqual(self._recall("610", 0), "mosque")
-        self.assertEqual(rm.ChoiceMemory.recall_alt(self.TABLE, "code", "610", 0, self.CONTEXT), "مسجد")
-
-    def test_a_fully_removed_occurrence_with_no_survivor_at_all_is_deleted(self):
-        rm.ChoiceMemory.remember(self.TABLE, "code", "610", "mosque", 0, self.CONTEXT)
-
-        before = '"CODE" = 610'
-        after = '"OTHER" = 1'  # the only occurrence is gone entirely
-
-        rm.reconcile_choices(self.CONTEXT, self.TABLE, before, after)
-
-        self.assertEqual(self._recall("610", 0), "")
-
-    def test_unrelated_fields_are_left_alone(self):
-        rm.ChoiceMemory.remember(self.TABLE, "country", "IL", "Israel", 0, self.CONTEXT)
-        before = '"COUNTRY" = \'IL\''
-        after = '"COUNTRY" = \'IL\' AND "STATUS" = 1'
-        rm.reconcile_choices(self.CONTEXT, self.TABLE, before, after)
-        self.assertEqual(
-            rm.ChoiceMemory.recall(self.TABLE, "country", "IL", 0, self.CONTEXT), "Israel"
-        )
-
-    def test_fresh_choices_made_during_the_same_session_are_never_touched(self):
-        """Regression: a brand-new filter built from scratch in one dialog
-        session (baseline is empty, since nothing existed before it was
-        opened) whose 3 values were picked from the popup DURING that same
-        session must not have those choices wiped the instant OK is
-        pressed, just because none of them existed in the (empty)
-        baseline. The old version cleared range(max(old_count, new_count))
-        unconditionally, which deleted exactly these."""
-        before = ""
-        after = "\"F_ATT\" = 'בית כנסת' OR \"F_ATT\" IN ('בית כנסת', 'בית כנסת')"
-        # Exactly what accept_current() already wrote live, once per
-        # occurrence, before OK is ever pressed.
-        for occ in range(3):
-            rm.ChoiceMemory.remember(self.TABLE, "f_att", "בית כנסת", "synagogue", occ, self.CONTEXT)
-
-        rm.reconcile_choices(self.CONTEXT, self.TABLE, before, after)
-
-        for occ in range(3):
-            self.assertEqual(
-                rm.ChoiceMemory.recall(self.TABLE, "f_att", "בית כנסת", occ, self.CONTEXT),
-                "synagogue",
-            )
-
-    def test_clearing_the_whole_expression_removes_every_one_of_its_entries(self):
-        rm.ChoiceMemory.remember(self.TABLE, "f_att", "בית כנסת", "synagogue", 0, self.CONTEXT)
-        rm.ChoiceMemory.remember(self.TABLE, "f_att", "בית כנסת", "synagogue", 1, self.CONTEXT)
-        rm.ChoiceMemory.remember(self.TABLE, "f_att", "בית כנסת", "synagogue", 2, self.CONTEXT)
-        before = "\"F_ATT\" = 'בית כנסת' OR \"F_ATT\" IN ('בית כנסת', 'בית כנסת')"
-        after = ""
-
-        rm.reconcile_choices(self.CONTEXT, self.TABLE, before, after)
-
-        for occ in range(3):
-            self.assertEqual(
-                rm.ChoiceMemory.recall(self.TABLE, "f_att", "בית כנסת", occ, self.CONTEXT), ""
-            )
-
-    def test_the_full_reported_sequence_build_clear_then_add_something_else(self):
-        """End to end: build a 3-occurrence filter (values chosen live),
-        accept it (all 3 must survive); clear the filter entirely, accept
-        again (all 3 must be gone); add an unrelated clause, accept again
-        (nothing resurrected, no crash)."""
-        f_att_before = ""
-        f_att_after = "\"F_ATT\" = 'בית כנסת' OR \"F_ATT\" IN ('בית כנסת', 'בית כנסת')"
-        for occ in range(3):
-            rm.ChoiceMemory.remember(self.TABLE, "f_att", "בית כנסת", "synagogue", occ, self.CONTEXT)
-        rm.reconcile_choices(self.CONTEXT, self.TABLE, f_att_before, f_att_after)
-        for occ in range(3):
-            self.assertEqual(
-                rm.ChoiceMemory.recall(self.TABLE, "f_att", "בית כנסת", occ, self.CONTEXT),
-                "synagogue",
-            )
-
-        cleared = ""
-        rm.reconcile_choices(self.CONTEXT, self.TABLE, f_att_after, cleared)
-        for occ in range(3):
-            self.assertEqual(
-                rm.ChoiceMemory.recall(self.TABLE, "f_att", "בית כנסת", occ, self.CONTEXT), ""
-            )
-
-        with_new_clause = "\"F_CODE\" = 2301"
-        rm.reconcile_choices(self.CONTEXT, self.TABLE, cleared, with_new_clause)
-        for occ in range(3):
-            self.assertEqual(
-                rm.ChoiceMemory.recall(self.TABLE, "f_att", "בית כנסת", occ, self.CONTEXT), ""
-            )
-
-
-class ChoiceReconcilerTests(unittest.TestCase):
-    """ChoiceReconciler - the wiring that actually triggers
-    reconcile_choices() once, when the surrounding dialog is accepted."""
-
-    def setUp(self):
-        reset_plugin_settings()
-        self.context_layer = make_context_layer(("CODE", "OTHER"))
-        QgsProject.instance().addMapLayer(self.context_layer)
-        self.project = QgsProject.instance()
-        self._restore_choices = reset_choice_memory()
-
-    def tearDown(self):
-        self._restore_choices()
-        QgsProject.instance().removeMapLayer(self.context_layer.id())
-        reset_plugin_settings()
-
-    def _make_editor(self, text):
-        editor = QPlainTextEdit()
-        editor.layer = lambda: self.context_layer
-        editor.setPlainText(text)
-        dialog = host_in_dialog(editor)
-        return editor, dialog
-
-    def test_accepting_the_dialog_reconciles_using_the_attach_time_baseline(self):
-        editor, dialog = self._make_editor('"CODE" = 610 AND "OTHER" = 1 AND "CODE" = 610')
-
-        from _rtl_plugin.rtl_autocomplete import resolve_table_candidates
-
-        tables = resolve_table_candidates(editor)
-        table = tables[0] if tables else ""
-        context = rm.expression_context_key(editor)
-        rm.ChoiceMemory.remember(table, "code", "610", "mosque", 0, context)
-        rm.ChoiceMemory.remember(table, "code", "610", "greenhouse", 1, context)
-
-        reconciler = rm.ChoiceReconciler(editor)
-        try:
-            # Edited AFTER the reconciler captured its baseline, exactly as
-            # a user would inside the real dialog before pressing OK.
-            editor.setPlainText(
-                '"CODE" = 610 AND "CODE" = 610 AND "OTHER" = 1 AND "CODE" = 610'
-            )
-            dialog.accept()  # emits QDialog.accepted
-
-            self.assertEqual(
-                rm.ChoiceMemory.recall(table, "code", "610", 1, context), "mosque"
-            )
-            self.assertEqual(
-                rm.ChoiceMemory.recall(table, "code", "610", 2, context), "greenhouse"
-            )
-        finally:
-            reconciler.teardown()
-            dialog.deleteLater()
-
-    def test_teardown_disconnects_so_a_later_accept_does_not_reconcile_again(self):
-        editor, dialog = self._make_editor('"CODE" = 610')
-        reconciler = rm.ChoiceReconciler(editor)
-        reconciler.teardown()
-
-        # Should not raise even though the reconciler is torn down and its
-        # own editor reference is gone.
-        dialog.accept()
-        dialog.deleteLater()
 
 
 class SlideSwitchTests(unittest.TestCase):
@@ -1086,450 +708,82 @@ class ReadModeControllerModeCountTests(unittest.TestCase):
         finally:
             controller.teardown()
 
+    def test_read_mode_resolves_an_ambiguous_code_from_its_own_group_context(self):
+        """End-to-end through the real controller and a real lookup layer:
+        two rows sharing one code, distinguished by group_code, resolved
+        correctly straight from the expression's own surrounding
+        "F_CODE" = ... context - no choice remembered anywhere."""
+        from .utils import make_layer
+        from qgis.PyQt.QtCore import QVariant
 
-class ChoiceMemoryClearAndScanTests(unittest.TestCase):
-    """ChoiceMemory.clear_and_scan() - the Settings dialog's Clear & Scan
-    action: deletes only what it can PROVE is no longer needed (the layer
-    is gone, or a layer-filter occurrence no longer exists in the live
-    filter text), and warns about - without ever touching - anything left
-    whose field/code/description no longer matches what the currently
-    configured lookup table actually says."""
-
-    def setUp(self):
-        reset_plugin_settings()
-        self.context_layer = make_context_layer(("STATUS", "COUNTRY"))
-        self.lookup_layer = make_lookup_layer()
-        QgsProject.instance().addMapLayers([self.context_layer, self.lookup_layer])
-
-        Settings.set_autocomplete_enabled(True)
-        Settings.set_layer_id(self.lookup_layer.id())
-        Settings.set_field("field_names", "field_name")
-        Settings.set_field("value", "value")
-        Settings.set_field("description", "description")
-        Settings.set_field("alt_description", "alt_description")
-        Settings.set_field("table", "table")
+        ambiguous_layer = make_layer(
+            "None",
+            "ambiguous_lookup",
+            [
+                ("field_name", QVariant.String),
+                ("value", QVariant.String),
+                ("description", QVariant.String),
+                ("group_code", QVariant.String),
+                ("table", QVariant.String),
+            ],
+            [
+                {"field_name": "F_ATT", "value": "610", "description": "mosque", "group_code": "2300", "table": "context"},
+                {"field_name": "F_ATT", "value": "610", "description": "greenhouse", "group_code": "1400", "table": "context"},
+            ],
+        )
+        QgsProject.instance().addMapLayer(ambiguous_layer)
+        Settings.set_layer_id(ambiguous_layer.id())
+        Settings.set_field("group_code", "group_code")
         rm.DescriptionResolver.invalidate()
-
-        self.project = QgsProject.instance()
-        self._restore_choices = reset_choice_memory()
-
-        # A recognised layer-filter context - its "in use" status can be
-        # re-derived from the layer's own live subsetString().
-        self.filter_context = f"QgsQueryBuilderBase|Query Builder|QgisApp|{self.context_layer.id()}"
-        # Stands in for a data-defined override / Field Calculator context -
-        # the layer exists, but this plugin has no way to independently
-        # re-derive whether it is still "in use" without a live dialog open.
-        self.override_context = f"SomeOverrideDialog|Symbol Properties|QgisApp|{self.context_layer.id()}"
-
-    def tearDown(self):
-        self._restore_choices()
-        rm.DescriptionResolver.invalidate()
-        QgsProject.instance().removeMapLayers([self.context_layer.id(), self.lookup_layer.id()])
-        reset_plugin_settings()
-
-    def test_a_fully_valid_in_use_entry_is_never_touched(self):
-        self.context_layer.setSubsetString('"STATUS" = 1')
-        rm.ChoiceMemory.remember("context", "status", "1", "Active", 0, self.filter_context)
-        rm.ChoiceMemory.remember_alt("context", "status", "1", 0, self.filter_context, "פעיל")
-
-        deleted, total, failures = rm.ChoiceMemory.clear_and_scan()
-
-        self.assertEqual(deleted, 0)
-        self.assertEqual(total, 1)
-        self.assertEqual(failures, [])
-        self.assertEqual(rm.ChoiceMemory.recall("context", "status", "1", 0, self.filter_context), "Active")
-        self.assertEqual(rm.ChoiceMemory.recall_alt("context", "status", "1", 0, self.filter_context), "פעיל")
-
-    def test_removes_an_entry_whose_layer_no_longer_exists(self):
-        ghost_context = "QgsQueryBuilderBase|Query Builder|QgisApp|no-such-layer-id"
-        rm.ChoiceMemory.remember("context", "status", "1", "Active", 0, ghost_context)
-
-        deleted, total, failures = rm.ChoiceMemory.clear_and_scan()
-
-        self.assertEqual(deleted, 1)
-        self.assertEqual(total, 1)
-        self.assertEqual(failures, [])
-        self.assertEqual(rm.ChoiceMemory.recall("context", "status", "1", 0, ghost_context), "")
-
-    def test_removes_a_layer_filter_entry_no_longer_in_the_live_filter(self):
-        self.context_layer.setSubsetString("")  # cleared since the choice was made
-        rm.ChoiceMemory.remember("context", "status", "1", "Active", 0, self.filter_context)
-
-        deleted, total, failures = rm.ChoiceMemory.clear_and_scan()
-
-        self.assertEqual(deleted, 1)
-        self.assertEqual(total, 1)
-        self.assertEqual(failures, [])
-        self.assertEqual(rm.ChoiceMemory.recall("context", "status", "1", 0, self.filter_context), "")
-
-    def test_keeps_a_layer_filter_entry_still_present_in_the_live_filter(self):
-        self.context_layer.setSubsetString('"STATUS" = 1')
-        rm.ChoiceMemory.remember("context", "status", "1", "Active", 0, self.filter_context)
-
-        deleted, total, failures = rm.ChoiceMemory.clear_and_scan()
-
-        self.assertEqual(deleted, 0)
-        self.assertEqual(failures, [])
-        self.assertEqual(rm.ChoiceMemory.recall("context", "status", "1", 0, self.filter_context), "Active")
-
-    def test_an_unverifiable_context_is_never_deleted(self):
-        rm.ChoiceMemory.remember("context", "status", "1", "Active", 0, self.override_context)
-
-        deleted, _total, failures = rm.ChoiceMemory.clear_and_scan()
-
-        self.assertEqual(deleted, 0)
-        self.assertEqual(failures, [])
-        self.assertEqual(rm.ChoiceMemory.recall("context", "status", "1", 0, self.override_context), "Active")
-
-    def test_reports_a_field_that_no_longer_exists_in_the_lookup_table(self):
-        rm.ChoiceMemory.remember("context", "gone_field", "1", "Active", 0, self.override_context)
-
-        deleted, _total, failures = rm.ChoiceMemory.clear_and_scan()
-
-        self.assertEqual(deleted, 0)  # reported, never deleted
-        self.assertEqual(len(failures), 1)
-        self.assertIn("gone_field", failures[0])
-        self.assertIn("no longer exists", failures[0])
-
-    def test_reports_a_value_that_no_longer_exists_for_the_field(self):
-        rm.ChoiceMemory.remember("context", "status", "999", "Whatever", 0, self.override_context)
-
-        deleted, _total, failures = rm.ChoiceMemory.clear_and_scan()
-
-        self.assertEqual(deleted, 0)
-        self.assertEqual(len(failures), 1)
-        self.assertIn("999", failures[0])
-        self.assertIn("status", failures[0])
-
-    def test_reports_a_description_that_no_longer_matches(self):
-        rm.ChoiceMemory.remember("context", "status", "1", "Some Old Text", 0, self.override_context)
-
-        deleted, _total, failures = rm.ChoiceMemory.clear_and_scan()
-
-        self.assertEqual(deleted, 0)
-        self.assertEqual(len(failures), 1)
-        self.assertIn("Some Old Text", failures[0])
-
-    def test_reports_an_alternative_description_that_no_longer_matches(self):
-        rm.ChoiceMemory.remember("context", "status", "1", "Active", 0, self.override_context)
-        rm.ChoiceMemory.remember_alt("context", "status", "1", 0, self.override_context, "Some Old Alt")
-
-        deleted, _total, failures = rm.ChoiceMemory.clear_and_scan()
-
-        self.assertEqual(deleted, 0)
-        self.assertEqual(len(failures), 1)
-        self.assertIn("Some Old Alt", failures[0])
-
-    def test_deleted_and_total_counts_are_reported_correctly(self):
-        ghost_context = "QgsQueryBuilderBase|Query Builder|QgisApp|no-such-layer-id"
-        rm.ChoiceMemory.remember("context", "status", "1", "Active", 0, ghost_context)
-        rm.ChoiceMemory.remember("context", "status", "2", "Inactive", 0, self.override_context)
-
-        deleted, total, failures = rm.ChoiceMemory.clear_and_scan()
-
-        self.assertEqual(deleted, 1)
-        self.assertEqual(total, 2)
-        self.assertEqual(failures, [])  # the surviving entry still matches the lookup table
-
-    # -- expression-identity (eid) based verification ----------------------- #
-    # This is the precise path: an entry tagged with an id is deleted only
-    # when no expression anywhere in the (mocked) saved project text still
-    # carries that exact id - regardless of what KIND of expression it
-    # is, unlike the legacy layer-filter-only check above.
-
-    def test_an_eid_bearing_entry_is_deleted_when_its_marker_is_not_found(self):
-        eid = "deadbeefcafebabe"
-        rm.ChoiceMemory.remember(
-            "context", "status", "1", "Active", 0, self.override_context, eid=eid
-        )
-
-        with mock.patch(
-            "_rtl_plugin.rtl_readmode._read_project_text_for_scan", return_value="nothing relevant here"
-        ):
-            deleted, total, failures = rm.ChoiceMemory.clear_and_scan()
-
-        self.assertEqual(deleted, 1)
-        self.assertEqual(total, 1)
-        self.assertEqual(failures, [])
-        self.assertEqual(rm.ChoiceMemory.recall("context", "status", "1", 0, self.override_context), "")
-
-    def test_an_eid_bearing_entry_is_kept_when_its_marker_is_found(self):
-        eid = "deadbeefcafebabe"
-        rm.ChoiceMemory.remember(
-            "context", "status", "1", "Active", 0, self.override_context, eid=eid
-        )
-        project_text = f"...some xml... {rm.make_eid_comment(eid)} ...more xml..."
-
-        with mock.patch("_rtl_plugin.rtl_readmode._read_project_text_for_scan", return_value=project_text):
-            deleted, total, failures = rm.ChoiceMemory.clear_and_scan()
-
-        self.assertEqual(deleted, 0)
-        self.assertEqual(failures, [])
-        self.assertEqual(
-            rm.ChoiceMemory.recall("context", "status", "1", 0, self.override_context), "Active"
-        )
-
-    def test_an_eid_bearing_entry_is_kept_when_the_project_cannot_be_read(self):
-        """Never saved, or the save/read failed - cannot verify this run,
-        so nothing is deleted, matching every other "cannot verify"
-        fallback in this design."""
-        eid = "deadbeefcafebabe"
-        rm.ChoiceMemory.remember(
-            "context", "status", "1", "Active", 0, self.override_context, eid=eid
-        )
-
-        with mock.patch("_rtl_plugin.rtl_readmode._read_project_text_for_scan", return_value=None):
-            deleted, total, failures = rm.ChoiceMemory.clear_and_scan()
-
-        self.assertEqual(deleted, 0)
-        self.assertEqual(
-            rm.ChoiceMemory.recall("context", "status", "1", 0, self.override_context), "Active"
-        )
-
-    def test_eid_bearing_entries_are_still_validated_against_the_lookup_table(self):
-        eid = "deadbeefcafebabe"
-        rm.ChoiceMemory.remember(
-            "context", "status", "999", "Whatever", 0, self.override_context, eid=eid
-        )
-        project_text = rm.make_eid_comment(eid)
-
-        with mock.patch("_rtl_plugin.rtl_readmode._read_project_text_for_scan", return_value=project_text):
-            deleted, _total, failures = rm.ChoiceMemory.clear_and_scan()
-
-        self.assertEqual(deleted, 0)
-        self.assertEqual(len(failures), 1)
-        self.assertIn("999", failures[0])
-
-    def test_legacy_and_eid_bearing_entries_are_handled_independently_in_one_run(self):
-        ghost_context = "QgsQueryBuilderBase|Query Builder|QgisApp|no-such-layer-id"
-        rm.ChoiceMemory.remember("context", "status", "1", "Active", 0, ghost_context)  # legacy, dead layer
-        eid = "deadbeefcafebabe"
-        rm.ChoiceMemory.remember(
-            "context", "status", "2", "Inactive", 0, self.override_context, eid=eid
-        )  # id-bearing, not found
-
-        with mock.patch(
-            "_rtl_plugin.rtl_readmode._read_project_text_for_scan", return_value="nothing relevant"
-        ):
-            deleted, total, failures = rm.ChoiceMemory.clear_and_scan()
-
-        self.assertEqual(deleted, 2)
-        self.assertEqual(total, 2)
-        self.assertEqual(failures, [])
-
-
-class ExpressionIdentityTests(unittest.TestCase):
-    """new_eid() / make_eid_comment() / extract_eid() - the hidden id
-    comment mechanism clear_and_scan() uses to precisely track one
-    specific expression instance, wherever it lives."""
-
-    def test_new_eid_is_a_16_character_hex_string(self):
-        eid = rm.new_eid()
-        self.assertEqual(len(eid), 16)
-        int(eid, 16)  # raises ValueError if this is not valid hex
-
-    def test_two_calls_produce_different_ids(self):
-        self.assertNotEqual(rm.new_eid(), rm.new_eid())
-
-    def test_make_eid_comment_round_trips_through_extract_eid(self):
-        eid = rm.new_eid()
-        comment = rm.make_eid_comment(eid)
-        self.assertEqual(rm.extract_eid(comment + '"F_ATT" = 610'), eid)
-
-    def test_extract_eid_of_plain_text_is_empty(self):
-        self.assertEqual(rm.extract_eid('"F_ATT" = 610'), "")
-
-    def test_extract_eid_ignores_an_unrelated_comment(self):
-        self.assertEqual(rm.extract_eid("/* my own comment */\n\"F_ATT\" = 610"), "")
-
-    def test_the_comment_contains_no_xml_special_characters(self):
-        """It must round-trip through a saved project's XML verbatim, with
-        no escaping mismatch to worry about - see _read_project_text_for_scan()."""
-        comment = rm.make_eid_comment(rm.new_eid())
-        for special in ("<", ">", "&", '"', "'"):
-            self.assertNotIn(special, comment)
-
-
-class StripEidCommentTests(unittest.TestCase):
-    """strip_eid_comment() - what rtl_editor.ClipboardEidGuard calls to keep
-    the hidden id comment off the system clipboard, regardless of whether
-    the user got there via Select All + Copy, Cut, the right-click context
-    menu, or an Edit-menu action."""
-
-    def test_removes_a_leading_id_comment(self):
-        eid = rm.new_eid()
-        text = rm.make_eid_comment(eid) + '"F_ATT" = 610'
-        self.assertEqual(rm.strip_eid_comment(text), '"F_ATT" = 610')
-
-    def test_plain_text_with_no_id_comment_is_returned_unchanged(self):
-        self.assertEqual(rm.strip_eid_comment('"F_ATT" = 610'), '"F_ATT" = 610')
-
-    def test_an_unrelated_leading_comment_is_left_alone(self):
-        text = "/* my own comment */\n\"F_ATT\" = 610"
-        self.assertEqual(rm.strip_eid_comment(text), text)
-
-    def test_empty_text_is_returned_unchanged(self):
-        self.assertEqual(rm.strip_eid_comment(""), "")
-
-
-class ChoiceMemoryEidStorageTests(unittest.TestCase):
-    """ChoiceMemory.remember()/recall_eid() - the sibling-key storage for
-    an occurrence's expression-identity id, the same non-destructive
-    pattern already used for the alternative description."""
-
-    def setUp(self):
-        self.project = QgsProject.instance()
-        self._restore_choices = reset_choice_memory()
-
-    def tearDown(self):
-        self._restore_choices()
-
-    def test_remember_with_an_eid_makes_it_recallable(self):
-        rm.ChoiceMemory.remember("t", "f", "1", "Active", 0, "ctx", eid="abc123")
-        self.assertEqual(rm.ChoiceMemory.recall_eid("t", "f", "1", 0, "ctx"), "abc123")
-        self.assertEqual(rm.ChoiceMemory.recall("t", "f", "1", 0, "ctx"), "Active")
-
-    def test_remember_without_an_eid_leaves_it_unset(self):
-        rm.ChoiceMemory.remember("t", "f", "1", "Active", 0, "ctx")
-        self.assertEqual(rm.ChoiceMemory.recall_eid("t", "f", "1", 0, "ctx"), "")
-
-    def test_forget_removes_the_eid_too(self):
-        rm.ChoiceMemory.remember("t", "f", "1", "Active", 0, "ctx", eid="abc123")
-        rm.ChoiceMemory.forget("t", "f", "1", 0, "ctx")
-        self.assertEqual(rm.ChoiceMemory.recall("t", "f", "1", 0, "ctx"), "")
-        self.assertEqual(rm.ChoiceMemory.recall_eid("t", "f", "1", 0, "ctx"), "")
-
-    def test_adding_an_eid_to_an_already_remembered_choice_does_not_need_a_description_change(self):
-        # Regression: remember()'s "nothing changed, skip the write" guard
-        # used to look only at the description, which would silently skip
-        # writing a NEW eid onto an already-remembered, unchanged choice.
-        rm.ChoiceMemory.remember("t", "f", "1", "Active", 0, "ctx")
-        rm.ChoiceMemory.remember("t", "f", "1", "Active", 0, "ctx", eid="abc123")
-        self.assertEqual(rm.ChoiceMemory.recall_eid("t", "f", "1", 0, "ctx"), "abc123")
-
-
-class ResetLegacyEntriesTests(unittest.TestCase):
-    """ChoiceMemory.reset_legacy_entries() - the deliberate, one-time
-    action that deletes every choice with no expression-identity id."""
-
-    def setUp(self):
-        self.project = QgsProject.instance()
-        self._restore_choices = reset_choice_memory()
-
-    def tearDown(self):
-        self._restore_choices()
-
-    def test_deletes_only_entries_without_an_eid(self):
-        rm.ChoiceMemory.remember("t", "f", "1", "Active", 0, "ctx")  # legacy
-        rm.ChoiceMemory.remember("t", "f", "2", "Inactive", 0, "ctx", eid="abc123")  # has an id
-
-        deleted, total = rm.ChoiceMemory.reset_legacy_entries()
-
-        self.assertEqual(deleted, 1)
-        self.assertEqual(total, 2)
-        self.assertEqual(rm.ChoiceMemory.recall("t", "f", "1", 0, "ctx"), "")
-        self.assertEqual(rm.ChoiceMemory.recall("t", "f", "2", 0, "ctx"), "Inactive")
-
-    def test_a_project_with_only_id_bearing_entries_deletes_nothing(self):
-        rm.ChoiceMemory.remember("t", "f", "1", "Active", 0, "ctx", eid="abc123")
-
-        deleted, total = rm.ChoiceMemory.reset_legacy_entries()
-
-        self.assertEqual(deleted, 0)
-        self.assertEqual(total, 1)
-        self.assertEqual(rm.ChoiceMemory.recall("t", "f", "1", 0, "ctx"), "Active")
-
-    def test_an_id_bearing_entrys_alternative_is_untouched(self):
-        rm.ChoiceMemory.remember("t", "f", "1", "Active", 0, "ctx", eid="abc123")
-        rm.ChoiceMemory.remember_alt("t", "f", "1", 0, "ctx", "פעיל")
-
-        rm.ChoiceMemory.reset_legacy_entries()
-
-        self.assertEqual(rm.ChoiceMemory.recall_alt("t", "f", "1", 0, "ctx"), "פעיל")
-
-
-class DescribeContextTests(unittest.TestCase):
-    """_describe_context()/_humanize_dd_button_name() - the human-readable
-    location shown in a Clear & Scan failure message. Never the id itself
-    - see ChoiceMemory.clear_and_scan()'s own docstring."""
-
-    def test_humanizes_a_data_defined_button_name(self):
-        self.assertEqual(rm._humanize_dd_button_name("mFillColorDDBtn"), "Fill Color")
-
-    def test_falls_back_to_the_raw_name_when_nothing_to_strip(self):
-        self.assertEqual(rm._humanize_dd_button_name("Whatever"), "Whatever")
-
-    def test_describes_a_layer_and_a_dd_button_slot(self):
-        layer = make_context_layer(("STATUS",))
-        QgsProject.instance().addMapLayer(layer)
         try:
-            context = f"SomeDialog|Symbol Properties|Chain>mFillColorDDBtn|{layer.id()}"
-            self.assertEqual(rm._describe_context(context), f'layer "{layer.name()}", Fill Color')
+            editor = self._make_editor('"F_CODE" = 2300 AND "F_ATT" = 610')
+            controller = rm.ReadModeController(editor)
+            try:
+                controller._switch.setMode(1)  # edit -> read
+                self.assertIn("mosque", editor.toPlainText())
+                self.assertNotIn("greenhouse", editor.toPlainText())
+            finally:
+                controller.teardown()
         finally:
-            QgsProject.instance().removeMapLayer(layer.id())
-
-    def test_falls_back_to_the_window_title_without_a_dd_button(self):
-        layer = make_context_layer(("STATUS",))
-        QgsProject.instance().addMapLayer(layer)
-        try:
-            context = f"QgsQueryBuilderBase|Query Builder|QgisApp|{layer.id()}"
-            self.assertEqual(rm._describe_context(context), f'layer "{layer.name()}", Query Builder')
-        finally:
-            QgsProject.instance().removeMapLayer(layer.id())
-
-    def test_empty_context_is_handled_gracefully(self):
-        self.assertEqual(rm._describe_context(""), "an unknown location")
+            QgsProject.instance().removeMapLayer(ambiguous_layer.id())
 
 
-class ProjectTextScanIntegrationTests(unittest.TestCase):
-    """A real, non-mocked round trip: save the project to an actual temp
-    file and confirm _read_project_text_for_scan() can find a live eid
-    comment inside it for real - the mechanism clear_and_scan()'s eid path
-    relies on, exercised end to end rather than through a mock.
+class PurgeLegacyProjectEntriesTests(unittest.TestCase):
+    """purge_legacy_project_entries() - the one-time cleanup run when the
+    plugin activates (see RtlBidiEditorPlugin.initGui()), removing whatever
+    remembered-choice entry an older install may have left behind. Nothing
+    writes such an entry any more - an ambiguous code is resolved straight
+    from the expression's own group context instead (see
+    substitute_descriptions()/_pick_label())."""
 
-    Uses an independent ``QgsProject()`` throughout - never
-    ``QgsProject.instance()``, the live singleton this very suite runs
-    against when launched from the Settings dialog's "Run Tests" button,
-    from inside an already-open QGIS session. An earlier version of this
-    test pointed THAT project's own ``fileName()`` at a temp path instead -
-    exactly what made the running session look like its real project had
-    just been swapped out or lost the moment this test ran. See
-    ``_read_project_text_for_scan()``'s own ``project`` parameter, added
-    for precisely this.
-    """
+    SCOPE = "rtl_bidi_editor"
+    KEY = "value_choices"
 
     def setUp(self):
-        self.project = QgsProject()
-        self._tmp_dir = tempfile.mkdtemp()
+        self.project = QgsProject.instance()
+        self.original, self.existed = self.project.readEntry(self.SCOPE, self.KEY, "")
 
     def tearDown(self):
-        shutil.rmtree(self._tmp_dir, ignore_errors=True)
+        if self.existed:
+            self.project.writeEntry(self.SCOPE, self.KEY, self.original)
+        else:
+            self.project.removeEntry(self.SCOPE, self.KEY)
 
-    def test_a_saved_projects_text_contains_a_live_eid_comment(self):
-        """Uses a data-defined symbol property, not a layer filter - the
-        real target of this mechanism (see CustomAutocompleteController.
-        _ensure_eid() for why a layer filter is deliberately excluded)."""
-        from qgis.core import QgsProperty, QgsSymbolLayer
+    def test_removes_an_existing_legacy_entry_and_reports_true(self):
+        self.project.writeEntry(self.SCOPE, self.KEY, '{"some": "stale entry"}')
 
-        path = str(Path(self._tmp_dir) / "scan_test.qgs")
-        self.project.setFileName(path)
-        eid = rm.new_eid()
+        removed = rm.purge_legacy_project_entries()
 
-        layer = make_context_layer(("STATUS",))
-        self.project.addMapLayer(layer)
-        symbol_layer = layer.renderer().symbol().symbolLayer(0)
-        expr = rm.make_eid_comment(eid) + "'red'"
-        symbol_layer.setDataDefinedProperty(
-            QgsSymbolLayer.Property.PropertyFillColor, QgsProperty.fromExpression(expr)
-        )
+        self.assertTrue(removed)
+        _raw, still_there = self.project.readEntry(self.SCOPE, self.KEY, "")
+        self.assertFalse(still_there)
 
-        text = rm._read_project_text_for_scan(self.project)
-        self.assertIsNotNone(text)
-        self.assertIn(f"rtl-eid:{eid}", text)
+    def test_a_project_with_no_legacy_entry_is_a_harmless_no_op(self):
+        self.project.removeEntry(self.SCOPE, self.KEY)
 
-    def test_returns_none_when_the_project_has_never_been_saved(self):
-        self.project.setFileName("")
-        self.assertIsNone(rm._read_project_text_for_scan(self.project))
+        removed = rm.purge_legacy_project_entries()
+
+        self.assertFalse(removed)
 
 
 if __name__ == "__main__":

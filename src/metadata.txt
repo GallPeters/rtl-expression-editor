@@ -9,10 +9,10 @@ about=QGIS's built-in editor (QScintilla) does not display right-to-left text co
 
     The plugin also offers an optional advanced auto-complete system. Choose any project layer and its fields as the source of allowed values, with optional descriptions, groups and group descriptions. Press Ctrl+Space to complete either a field name or a value, and the suggestions adapt automatically to the field being queried and to the layer you are working on.
 
-    When a custom auto-complete source is configured, an optional Read Mode switch appears inside the editor. Read Mode shows the value descriptions instead of the stored codes, making a long expression far easier tounderstand, and never alters the expression itself. Where the same code has different meanings in different groups, the description you picked is saved in the project file and restored automatically, so Read Mode always shows the right one, for everyone who opens the project. An optional second, alternative description per value adds a third switch position for a different wording of the same descriptions.
+    When a custom auto-complete source is configured, an optional Read Mode switch appears inside the editor. Read Mode shows the value descriptions instead of the stored codes, making a long expression far easier tounderstand, and never alters the expression itself. Where the same code has different meanings in different groups, Read Mode works out the right one automatically from the expression's own surrounding condition (e.g. "F_CODE" = 2300 AND "F_ATT" = 603), using an optional Group codes column - nothing about this is ever saved to the project. An optional second, alternative description per value adds a third switch position for a different wording of the same descriptions.
 
     The whole configuration, including the auto-complete source, can be exported to a file and imported again elsewhere - useful for sharing a ready-made setup with colleagues.
-version=1.5
+version=1.6
 author=Jossef Kanter
 email=jossefkan@gmail.com
 
@@ -27,6 +27,11 @@ experimental=False
 deprecated=False
 hasProcessingProvider=no
 server=False
+
+** v1.6 (19.08.2026):
+  - Changed: Read mode now works out a code with several meanings directly from the expression's own surrounding group condition (e.g. "F_CODE" = 2300 AND "F_ATT" = 603, using the Group codes column) instead of remembering a choice you picked - showing every meaning only when that context is missing or ambiguous.
+  - Removed: saving a picked description to the project file, and the "Clear & Scan" / "Reset Legacy Entries" Settings buttons that maintained it - nothing about Read mode is ever saved to the project any more.
+  - Added: any such entry left behind by an earlier version is removed automatically the first time the plugin activates.
 
 ** v1.5 (17.08.2026):
   - Added: suggestion-list titles with optional Table/Field description columns (also shown in Read mode); an optional Alternative value description, giving Read mode a third switch position; Export/Import Settings as a JSON file.

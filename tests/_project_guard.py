@@ -7,8 +7,10 @@ process, exactly wrong if this suite is ever run from inside a live QGIS
 session with the user's own project open (e.g. via the Settings dialog's
 "Run Tests" button). This is the outer safety net: it restores both the
 project's map layers and the plugin's own project-scoped custom property
-(read mode's remembered choices) to exactly what they were before the run,
-regardless of what any individual test does or whether the run raises.
+(PurgeLegacyProjectEntriesTests exercises it directly, and it is otherwise
+untouched by anything read mode itself still does) to exactly what they
+were before the run, regardless of what any individual test does or
+whether the run raises.
 
 It is a backstop, not the primary defence - the tests themselves remove only
 the specific layers they add (see e.g. test_autocomplete.py), rather than
