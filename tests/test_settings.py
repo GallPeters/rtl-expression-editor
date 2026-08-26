@@ -27,9 +27,12 @@ def _release_file_handles() -> None:
     plain refcounting cannot collect - only a ``gc.collect()`` pass can -
     and QGIS's own OGR connection pool can keep a file open independently
     of any Python reference to it, released only once pending, queued
-    cleanup work runs on the event loop. Without this, a temp directory
-    removed immediately afterwards can still raise ``PermissionError`` on
-    Windows even though nothing in the test still references the layer.
+    cleanup work runs on the event loop, on a schedule this cannot fully
+    control from here. This is therefore only a best-effort nudge, not a
+    guarantee - every ``tempfile.TemporaryDirectory()`` in this module is
+    also created with ``ignore_cleanup_errors=True``, so a file this could
+    not manage to release in time is skipped rather than failing the test
+    with ``PermissionError`` on Windows.
     """
     gc.collect()
     for _ in range(3):
@@ -152,7 +155,7 @@ class RunTestsButtonTests(unittest.TestCase):
         from _rtl_plugin import rtl_settings as settings_module
         from _rtl_plugin.rtl_settings import SettingsDialog
 
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             plugin_dir = Path(tmp) / "rtl_expression_editor"
             plugin_dir.mkdir()
             (plugin_dir / "rtl_settings.py").write_text("", encoding="utf-8")
@@ -319,7 +322,7 @@ class DescribeLayerSourceTests(unittest.TestCase):
     def test_a_file_inside_the_plugin_directory_gets_a_relative_path(self):
         from _rtl_plugin import rtl_settings as settings_module
 
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             plugin_dir = Path(tmp)
             data_dir = plugin_dir / "data"
             data_dir.mkdir()
@@ -341,7 +344,7 @@ class DescribeLayerSourceTests(unittest.TestCase):
     def test_a_file_outside_the_plugin_directory_has_no_relative_path(self):
         from _rtl_plugin import rtl_settings as settings_module
 
-        with tempfile.TemporaryDirectory() as plugin_tmp, tempfile.TemporaryDirectory() as other_tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as plugin_tmp, tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as other_tmp:
             outside_file = Path(other_tmp) / "lookup.gpkg"
             outside_file.write_text("stub", encoding="utf-8")
 
@@ -397,7 +400,7 @@ class LoadLayerFromDescriptionTests(unittest.TestCase):
         from _rtl_plugin import rtl_settings as settings_module
 
         before = self._added_layer_ids()
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             plugin_dir = Path(tmp)
             data_dir = plugin_dir / "data"
             data_dir.mkdir()
@@ -427,7 +430,7 @@ class LoadLayerFromDescriptionTests(unittest.TestCase):
     def test_a_missing_file_returns_no_layer_and_a_clear_warning(self):
         from _rtl_plugin import rtl_settings as settings_module
 
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             info = {
                 "name": "lookup",
                 "provider": "ogr",
@@ -453,7 +456,7 @@ class LoadLayerFromDescriptionTests(unittest.TestCase):
         fails to open (corrupted/unsupported content, permissions, ...)."""
         from _rtl_plugin import rtl_settings as settings_module
 
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             plugin_dir = Path(tmp)
             bad_file = plugin_dir / "lookup.gpkg"
             bad_file.write_text("this is not a real GeoPackage", encoding="utf-8")
@@ -621,7 +624,7 @@ class SettingsExportImportTests(unittest.TestCase):
         not silently dropped just because the enabled flag itself was off."""
         from _rtl_plugin import rtl_settings as settings_module
 
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             plugin_dir = Path(tmp)
             data_dir = plugin_dir / "data"
             data_dir.mkdir()
@@ -674,7 +677,7 @@ class SettingsExportImportTests(unittest.TestCase):
         its bundled data file) live somewhere else entirely."""
         from _rtl_plugin import rtl_settings as settings_module
 
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             plugin_dir = Path(tmp) / "rtl_expression_editor"
             data_dir = plugin_dir / "data"
             data_dir.mkdir(parents=True)
