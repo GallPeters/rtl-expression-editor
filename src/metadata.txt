@@ -32,7 +32,7 @@ server=False
   - Changed: the autocomplete lookup table is now picked straight from the QGIS Browser as a dataset, instead of being chosen from - and needing to be added to - the project's own layers. It is read directly from its own source and is never added to the project, so it no longer appears in the Layers panel or gets saved into the project file. A configuration saved by an earlier version is upgraded automatically the first time it is used.
 
 ** v1.6 (19.08.2026):
-  - Changed: Read mode now works out a code with several meanings directly from the expression's own surrounding group condition (e.g. "F_CODE" = 2300 AND "F_ATT" = 603, using the Group codes column) instead of remembering a choice you picked - showing every meaning only when that context is missing or ambiguous.
+  - Changed: Read mode now works out a code with several meanings directly from the expression's own surrounding group condition (e.g. "F_CODE" = 2300 AND "F_ATT" = 603, using the Group codes column) instead of remembering a choice you picked - showing every meaning only when that context is missing or ambiguous. A surrounding AND joins the two into one group correctly; a surrounding OR (or two AND-runs split by one) keeps them apart, exactly as the expression itself does.
   - Removed: saving a picked description to the project file, and the "Clear & Scan" / "Reset Legacy Entries" Settings buttons that maintained it - nothing about Read mode is ever saved to the project any more.
   - Added: any such entry left behind by an earlier version is removed automatically the first time the plugin activates.
 

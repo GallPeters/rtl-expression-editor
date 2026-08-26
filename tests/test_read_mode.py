@@ -113,14 +113,31 @@ class GroupContextScanningTests(unittest.TestCase):
     def test_flat_and_siblings_share_the_same_scope_path(self):
         leaves = rm._scan_literals_with_scope('"F_CODE" = 2300 AND "F_ATT" = 610')
         by_field = {leaf.field: leaf for leaf in leaves}
-        self.assertEqual(by_field["f_code"].path, ())
-        self.assertEqual(by_field["f_att"].path, ())
+        self.assertEqual(by_field["f_code"].path, by_field["f_att"].path)
 
     def test_a_literal_inside_parens_gets_a_deeper_path_than_one_outside(self):
         leaves = rm._scan_literals_with_scope('"F_CODE" = 2300 AND ("F_ATT" = 610)')
         by_field = {leaf.field: leaf for leaf in leaves}
-        self.assertEqual(by_field["f_code"].path, ())
-        self.assertEqual(len(by_field["f_att"].path), 1)
+        self.assertLess(len(by_field["f_code"].path), len(by_field["f_att"].path))
+
+    def test_a_bare_or_starts_a_fresh_run_at_its_own_scope_only(self):
+        """The path element for the CURRENT scope changes across an OR -
+        but an ancestor's does not, since the OR sits deeper than it."""
+        leaves = rm._scan_literals_with_scope('"F_CODE" = 2300 OR "F_ATT" = 610')
+        by_field = {leaf.field: leaf for leaf in leaves}
+        self.assertNotEqual(by_field["f_code"].path, by_field["f_att"].path)
+
+        leaves = rm._scan_literals_with_scope(
+            '"F_CODE" = 2300 AND ("COUNTRY" = 1 OR "COUNTRY" = 2)'
+        )
+        f_code = next(leaf for leaf in leaves if leaf.field == "f_code")
+        countries = [leaf for leaf in leaves if leaf.field == "country"]
+        self.assertEqual(len(countries), 2)
+        for country in countries:
+            # Both COUNTRY branches still nest under F_CODE's own scope -
+            # the OR that tells them apart is fully inside their shared
+            # parenthesis, one level deeper than where F_CODE itself sits.
+            self.assertEqual(country.path[: len(f_code.path)], f_code.path)
 
     def test_governing_values_includes_a_same_scope_sibling(self):
         leaves = rm._scan_literals_with_scope('"F_CODE" = 2300 AND "F_ATT" = 610')
@@ -158,6 +175,37 @@ class GroupContextScanningTests(unittest.TestCase):
         governing = rm._governing_values(leaves, "f_att", first_att.path)
         self.assertIn("2300", governing)
         self.assertNotIn("1400", governing)
+
+    def test_a_bare_or_at_the_same_scope_breaks_governance(self):
+        """An OR - not an AND - joins the two comparisons, so the first can
+        no longer supply the second's group."""
+        leaves = rm._scan_literals_with_scope('"F_CODE" = 2300 OR "F_ATT" = 610')
+        f_att = next(leaf for leaf in leaves if leaf.field == "f_att")
+        governing = rm._governing_values(leaves, "f_att", f_att.path)
+        self.assertNotIn("2300", governing)
+
+    def test_an_or_fully_inside_an_enclosing_parenthesis_does_not_break_it(self):
+        """The OR sits one level deeper than F_CODE itself - inside the
+        parenthesis - so it never touches the scope F_CODE governs."""
+        leaves = rm._scan_literals_with_scope(
+            '"F_CODE" = 2300 AND ("COUNTRY" = 1 OR "COUNTRY" = 2)'
+        )
+        for code in ("1", "2"):
+            country = next(leaf for leaf in leaves if leaf.field == "country" and leaf.code == code)
+            governing = rm._governing_values(leaves, "country", country.path)
+            self.assertIn("2300", governing)
+
+    def test_two_or_separated_and_runs_never_govern_each_other(self):
+        """"F_CODE = 2300 AND F_ATT = 610 OR F_CODE = 2301 AND F_ATT = 611" -
+        no parentheses at all, just a top-level OR splitting two flat AND
+        runs - each F_ATT still only sees its OWN run's F_CODE."""
+        leaves = rm._scan_literals_with_scope(
+            '"F_CODE" = 2300 AND "F_ATT" = 610 OR "F_CODE" = 2301 AND "F_ATT" = 611'
+        )
+        first = next(leaf for leaf in leaves if leaf.field == "f_att" and leaf.code == "610")
+        second = next(leaf for leaf in leaves if leaf.field == "f_att" and leaf.code == "611")
+        self.assertEqual(rm._governing_values(leaves, "f_att", first.path), {"2300"})
+        self.assertEqual(rm._governing_values(leaves, "f_att", second.path), {"2301"})
 
 
 class PickLabelGroupResolutionTests(unittest.TestCase):
@@ -284,6 +332,56 @@ class SubstituteDescriptionsGroupResolutionTests(unittest.TestCase):
             result,
             f'("F_CODE" = 2300 AND "F_ATT" = {iso("mosque")}) OR '
             f'("F_CODE" = 1400 AND "F_ATT" = {iso("greenhouse")})',
+        )
+
+    def test_a_bare_or_between_the_two_fields_falls_back_to_showing_every_meaning(self):
+        """"F_CODE" = 2300 OR "F_ATT" = 610 - an OR, not an AND, joins them,
+        so 2300 must NOT be treated as 610's group."""
+        mapping = {"f_att": {"610": [("mosque", "2300"), ("greenhouse", "1400")]}}
+        expr = '"F_CODE" = 2300 OR "F_ATT" = 610'
+        result = rm.substitute_descriptions(expr, mapping)
+        joined = f'{iso("mosque")} / {iso("greenhouse")}'
+        self.assertEqual(result, f'"F_CODE" = 2300 OR "F_ATT" = {iso(joined)}')
+
+    def test_two_or_separated_and_runs_each_resolve_their_own_code(self):
+        """"F_CODE" = 2300 AND "F_ATT" = 610 OR "F_CODE" = 2301 AND "F_ATT" =
+        610 - no parentheses at all: a top-level OR alone must split the two
+        flat AND runs, exactly as a pair of parenthesised groups would."""
+        mapping = {"f_att": {"610": [("mosque", "2300"), ("greenhouse", "2301")]}}
+        expr = '"F_CODE" = 2300 AND "F_ATT" = 610 OR "F_CODE" = 2301 AND "F_ATT" = 610'
+        result = rm.substitute_descriptions(expr, mapping)
+        self.assertEqual(
+            result,
+            f'"F_CODE" = 2300 AND "F_ATT" = {iso("mosque")} OR '
+            f'"F_CODE" = 2301 AND "F_ATT" = {iso("greenhouse")}',
+        )
+
+    def test_an_or_fully_inside_a_parenthesised_group_does_not_break_governance(self):
+        """Every value in this expression belongs to F_CODE 2300's group,
+        including two fields joined by an OR - but that OR sits entirely
+        inside its OWN parenthesis, never at the same scope as F_CODE
+        itself, so it must not stop either COUNTRY branch from resolving."""
+        mapping = {
+            "f_att": {"610": [("mosque", "2300"), ("greenhouse", "1400")]},
+            "sensitivity": {
+                "610": [("high", "2300"), ("low", "1400")],
+                "603": [("medium", "2300"), ("minimal", "1400")],
+            },
+            "country": {
+                "604": [("Israel", "2300"), ("Jordan", "1400")],
+                "603": [("Egypt", "2300"), ("Lebanon", "1400")],
+            },
+        }
+        expr = (
+            '"F_CODE" = 2300 AND "F_ATT" = 610 AND "SENSITIVITY" IN (610,603) '
+            'AND ("COUNTRY" = 604 OR "COUNTRY" = 603)'
+        )
+        result = rm.substitute_descriptions(expr, mapping)
+        self.assertEqual(
+            result,
+            '"F_CODE" = 2300 AND "F_ATT" = '
+            f'{iso("mosque")} AND "SENSITIVITY" IN ({iso("high")},{iso("medium")}) '
+            f'AND ("COUNTRY" = {iso("Israel")} OR "COUNTRY" = {iso("Egypt")})',
         )
 
 

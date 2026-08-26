@@ -620,23 +620,30 @@ class SettingsExportImportTests(unittest.TestCase):
 
             self.assertEqual(warnings, [])
             self.assertFalse(Settings.autocomplete_enabled())  # respected as exported
-            # autocomplete_layer() re-resolves the stored (relative-path)
-            # description lazily, against wherever THIS plugin install
-            # actually lives (see Settings.autocomplete_layer()) - in real
-            # use that is always the same directory apply_dict() itself was
-            # told about, since the dialog passes its own real location for
-            # both. Only a test simulating a fake install location like this
-            # one needs to fake that out too.
-            with mock.patch.object(settings_module, "__file__", str(plugin_dir / "rtl_settings.py")):
-                layer = Settings.autocomplete_layer()
+            # Settings.autocomplete_layer() itself re-resolves the stored
+            # (relative-path) description lazily, against wherever THIS
+            # plugin install currently lives (Path(__file__).resolve().parent
+            # - see its own docstring) - in real use that is always the same
+            # directory apply_dict() was just given, since the dialog passes
+            # its own real location for both. Verified directly through
+            # _load_layer_from_description() with that same explicit
+            # plugin_dir instead of through that lazy __file__-derived path:
+            # mocking __file__ to a FILE THAT DOES NOT EXIST (there is no
+            # real rtl_settings.py inside this temp dir) is exactly the case
+            # Path.resolve() cannot always canonicalise correctly on Windows
+            # (see SettingsDialog._tests_directory()'s own docstring on
+            # short-name aliasing) - an artifact of faking __file__ for a
+            # test, not something a real, already-installed plugin ever hits.
+            layer, load_warning = settings_module._load_layer_from_description(
+                Settings.layer_source(), plugin_dir
+            )
+            self.assertEqual(load_warning, "")
             self.assertIsNotNone(layer)  # but still connected, ready to use
             self.assertTrue(layer.isValid())
-            # Release the OGR/GDAL file handle - both the local reference and
-            # the one Settings itself cached - before tmp is removed below;
+            # Release the OGR/GDAL file handle before tmp is removed below -
             # on Windows, deleting a directory while a layer still has one of
             # its files open raises PermissionError.
             layer = None
-            settings_module._LAYER_CACHE.clear()
 
     def test_export_then_apply_round_trips_a_bundled_layer(self):
         """The full distribution scenario: export from one "install"
@@ -687,23 +694,25 @@ class SettingsExportImportTests(unittest.TestCase):
                 warnings = Settings.apply_dict(exported, plugin_dir=other_install)
                 self.assertEqual(warnings, [])
                 self.assertTrue(Settings.autocomplete_enabled())
-                # autocomplete_layer() re-resolves the stored description
-                # lazily, against wherever THIS plugin install actually
-                # lives (see Settings.autocomplete_layer()) - fake that out
-                # to other_install too, exactly as done for export above.
-                with mock.patch.object(settings_module, "__file__", str(other_install / "rtl_settings.py")):
-                    new_layer = Settings.autocomplete_layer()
+                # Verified directly through _load_layer_from_description()
+                # with the same explicit plugin_dir apply_dict() itself just
+                # used, rather than through Settings.autocomplete_layer()'s
+                # own lazy __file__-derived path - see the note on this same
+                # pattern in test_a_referenced_layer_is_resolved_even_when_
+                # autocomplete_enabled_is_false above.
+                new_layer, load_warning = settings_module._load_layer_from_description(
+                    Settings.layer_source(), other_install
+                )
+                self.assertEqual(load_warning, "")
                 self.assertIsNotNone(new_layer)
                 self.assertTrue(new_layer.isValid())
             finally:
                 import shutil
 
-                # Release the OGR/GDAL handle(s) on other_install's file
-                # before removing it - both the local reference and the one
-                # Settings itself cached - or Windows refuses to delete a
-                # directory while a file inside it is still open.
+                # Release the OGR/GDAL handle on other_install's file before
+                # removing it - or Windows refuses to delete a directory
+                # while a file inside it is still open.
                 new_layer = None
-                settings_module._LAYER_CACHE.clear()
                 shutil.rmtree(other_install, ignore_errors=True)
 
 

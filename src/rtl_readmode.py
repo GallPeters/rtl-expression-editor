@@ -507,6 +507,14 @@ _SCAN_RE = re.compile(
     r"|(?P<bare>\b\d+(?:\.\d+)?\b)"
 )
 
+#: A parenthesis, or a bare ``OR`` keyword - the only structure
+#: ``_advance_scope_stack()`` needs to tell one AND-run apart from another.
+#: Only ever matched against the text BETWEEN ``_SCAN_RE`` matches, so an
+#: "OR" inside a quoted field name or string literal (or as part of a longer
+#: word, e.g. "COLOR" or "ORDER" - ``\b`` guards against that too) is never
+#: mistaken for the keyword.
+_STRUCTURE_RE = re.compile(r"\(|\)|\bOR\b", re.IGNORECASE)
+
 
 def normalize_code(text: str) -> str:
     """Strip one layer of matching outer quotes from a code value.
@@ -632,30 +640,59 @@ class _ScopedLiteral(NamedTuple):
 
     field: str
     code: str
-    path: Tuple[int, ...]
+    path: Tuple[Tuple[int, int], ...]
+
+
+def _advance_scope_stack(stack: List[list], text: str, start: int, end: int) -> None:
+    """Advance ``stack`` over ``text[start:end]`` - the raw text BETWEEN two
+    ``_SCAN_RE`` matches, never inside a quoted field name or string literal
+    - mutating it in place. Shared by ``_scan_literals_with_scope()`` and
+    ``substitute_descriptions()``'s own pass, so the two can never drift
+    apart on how a scope path is built.
+
+    ``stack`` is a list of ``[marker, run_index]`` pairs, one per currently
+    open scope: index 0 is the always-present top level (``marker = -1``);
+    each ``(`` pushes one more, popped again by its matching ``)``.
+
+    ``run_index`` starts at 0 and counts which AND-run of ITS OWN scope the
+    text at the current position is in - incremented every time a bare
+    ``OR`` is crossed at that exact nesting depth. Critically, an ``OR``
+    only ever touches ``stack[-1]`` - the CURRENT innermost scope - never an
+    ancestor's: this is what makes
+    ``"F_CODE" = 2300 AND ("COUNTRY" = 1 OR "COUNTRY" = 2)`` still treat
+    both COUNTRY branches as governed by F_CODE (the OR is fully inside the
+    parenthesis, so it never touches the top-level run F_CODE sits in),
+    while ``"F_CODE" = 2300 OR "F_ATT" = 610`` does NOT treat 610 as
+    belonging to F_CODE's group (that OR IS at F_ATT's own top-level scope,
+    so it starts a new run there) - see ``_governing_values()``.
+    """
+    for token_match in _STRUCTURE_RE.finditer(text, start, end):
+        token = token_match.group(0)
+        if token == "(":
+            stack.append([token_match.start(), 0])
+        elif token == ")":
+            if len(stack) > 1:
+                stack.pop()
+        else:  # a bare OR (case-insensitive)
+            stack[-1][1] += 1
 
 
 def _scan_literals_with_scope(text: str) -> List[_ScopedLiteral]:
     """Every value literal in ``text``, tagged with the field it is
     attributed to - the same nearest-preceding-quoted-field rule
-    ``substitute_descriptions()`` itself uses - and with a SCOPE PATH: a
-    tuple of ancestor ``(`` start offsets, root = ``()``, identifying
-    which level of parenthesis nesting it sits at. Quoted spans (a field
-    name or a string literal) are treated as opaque - a "(" inside one is
-    never mistaken for real expression structure - by construction, since
-    only the unmatched TEXT BETWEEN ``_SCAN_RE`` matches is ever scanned
-    for parentheses at all.
+    ``substitute_descriptions()`` itself uses - and with a SCOPE PATH built
+    by ``_advance_scope_stack()``. Quoted spans (a field name or a string
+    literal) are treated as opaque - a "(" or "OR" inside one is never
+    mistaken for real expression structure - by construction, since only
+    the unmatched TEXT BETWEEN ``_SCAN_RE`` matches is ever scanned for
+    structure at all.
     """
     results: List[_ScopedLiteral] = []
-    stack: List[int] = []
+    stack: List[list] = [[-1, 0]]
     current_field = ""
     scan_pos = 0
     for match in _SCAN_RE.finditer(text):
-        for offset, ch in enumerate(text[scan_pos:match.start()], start=scan_pos):
-            if ch == "(":
-                stack.append(offset)
-            elif ch == ")" and stack:
-                stack.pop()
+        _advance_scope_stack(stack, text, scan_pos, match.start())
         scan_pos = match.end()
 
         field = match.group("field")
@@ -669,11 +706,12 @@ def _scan_literals_with_scope(text: str) -> List[_ScopedLiteral]:
             continue
         code = normalize_code(literal)
         if code:
-            results.append(_ScopedLiteral(current_field, code, tuple(stack)))
+            path = tuple((marker, run) for marker, run in stack)
+            results.append(_ScopedLiteral(current_field, code, path))
     return results
 
 
-def _governing_values(leaves: List[_ScopedLiteral], field: str, path: Tuple[int, ...]) -> set:
+def _governing_values(leaves: List[_ScopedLiteral], field: str, path: Tuple[Tuple[int, int], ...]) -> set:
     """Every value from some OTHER field's comparison that could be "the
     group" for a literal of ``field`` sitting at scope ``path`` - see
     ``_pick_label()``.
@@ -682,9 +720,14 @@ def _governing_values(leaves: List[_ScopedLiteral], field: str, path: Tuple[int,
     ``leaf.path`` is a PREFIX of ``path`` - the SAME scope (flat AND
     siblings, ``"F_CODE" = 2300 AND "F_ATT" = 603``) counts as a prefix of
     itself, and a SHORTER, ANCESTOR scope (``"F_CODE" = 2300 AND (...
-    "F_ATT" = 603 ...)``) counts too. Comparisons on the SAME field are
-    never governors of one another - a value only ever gets its group from
-    a genuinely different field.
+    "F_ATT" = 603 ...)``) counts too. Each path element is itself a
+    ``(marker, run_index)`` pair (see ``_advance_scope_stack()``), so an
+    intervening ``OR`` at either literal's own depth - which starts a new
+    ``run_index`` there - breaks the prefix match and, with it, the
+    governing relationship: ``"F_CODE" = 2300 OR "F_ATT" = 603`` does NOT
+    let 2300 govern 603, even though both sit at the same nesting depth.
+    Comparisons on the SAME field are never governors of one another - a
+    value only ever gets its group from a genuinely different field.
     """
     values = set()
     for leaf in leaves:
@@ -733,20 +776,17 @@ def substitute_descriptions(
     out: List[str] = []
     last_end = 0
     current_field = ""
-    stack: List[int] = []
+    stack: List[list] = [[-1, 0]]
     scan_pos = 0
 
     for match in _SCAN_RE.finditer(text):
-        # Tracks paren nesting up to this match on its OWN cursor
-        # (scan_pos), independently of `out`'s last_end: a match that does
-        # not end up substituted (no field description, no candidates)
-        # never advances last_end, but must still advance scan_pos, or the
-        # next match's gap-scan would re-count the same "(" twice.
-        for offset, ch in enumerate(text[scan_pos:match.start()], start=scan_pos):
-            if ch == "(":
-                stack.append(offset)
-            elif ch == ")" and stack:
-                stack.pop()
+        # Tracks scope (paren nesting + AND-run, see _advance_scope_stack())
+        # up to this match on its OWN cursor (scan_pos), independently of
+        # `out`'s last_end: a match that does not end up substituted (no
+        # field description, no candidates) never advances last_end, but
+        # must still advance scan_pos, or the next match's gap-scan would
+        # re-process the same text twice.
+        _advance_scope_stack(stack, text, scan_pos, match.start())
         scan_pos = match.end()
 
         field = match.group("field")
@@ -780,7 +820,8 @@ def substitute_descriptions(
             continue
 
         alt_for_code = (alt_mapping or {}).get(current_field, {}).get(code, {})
-        label = _pick_label(candidates, current_field, tuple(stack), leaves, mode, alt_for_code)
+        path = tuple((marker, run) for marker, run in stack)
+        label = _pick_label(candidates, current_field, path, leaves, mode, alt_for_code)
         if not label:
             continue
 
@@ -809,7 +850,7 @@ def substitute_descriptions(
 def _pick_label(
     candidates: List[Tuple[str, str]],
     field: str,
-    path: Tuple[int, ...],
+    path: Tuple[Tuple[int, int], ...],
     leaves: List[_ScopedLiteral],
     mode: str = "primary",
     alt_for_code: Optional[Dict[str, str]] = None,
@@ -832,14 +873,17 @@ def _pick_label(
        match, or more than one - never guess between two equally
        plausible readings.
 
-    This deliberately does not track AND vs. OR, or a negated (``!=``)
-    comparison, at all - which scope governs which is decided purely by
-    parenthesis nesting, nothing about the operators joining them. That is
-    an accepted simplification: it resolves both patterns above correctly,
-    and anything genuinely ambiguous - two candidate group values both
-    present, an OR instead of an AND, a comparison this cannot make sense
-    of - simply falls back to rule 2 rather than risking a confidently
-    wrong guess.
+    A bare ``OR`` breaks rule 1's "same AND scope": ``"F_CODE" = 2300 OR
+    "F_ATT" = 603`` does NOT let 2300 govern 603, since an OR - not an AND -
+    joins them; ``"F_CODE" = 2300 AND ("COUNTRY" = 1 OR "COUNTRY" = 2)``
+    still lets 2300 govern both COUNTRY branches, since that OR sits fully
+    inside its own parenthesis, never touching the scope F_CODE itself sits
+    in - see ``_advance_scope_stack()`` for exactly how that is tracked.
+    This deliberately does not track a negated (``!=``) comparison at all -
+    an accepted simplification: anything genuinely ambiguous - two
+    candidate group values both present, a comparison this cannot make
+    sense of - simply falls back to rule 2 rather than risking a
+    confidently wrong guess.
 
     ``mode="alt"`` renders whichever description ends up chosen through its
     own alternative text instead (``alt_for_code``, keyed by the primary
