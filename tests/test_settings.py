@@ -393,6 +393,10 @@ class LoadLayerFromDescriptionTests(unittest.TestCase):
             self.assertEqual(warning, "")
             self.assertIsNotNone(layer)
             self.assertTrue(layer.isValid())
+            # Release the OGR/GDAL file handle before the temp dir is removed
+            # below - on Windows, deleting a directory while a layer still
+            # has one of its files open raises PermissionError.
+            del layer
         # Never added to the project - that is the whole point of this
         # mechanism (see Settings.autocomplete_layer()).
         self.assertEqual(self._added_layer_ids(), before)
@@ -592,6 +596,8 @@ class SettingsExportImportTests(unittest.TestCase):
         autocomplete source" (an easy thing to forget) still has a fully
         configured lookup dataset and fields - those must still be loaded,
         not silently dropped just because the enabled flag itself was off."""
+        from _rtl_plugin import rtl_settings as settings_module
+
         with tempfile.TemporaryDirectory() as tmp:
             plugin_dir = Path(tmp)
             data_dir = plugin_dir / "data"
@@ -614,9 +620,23 @@ class SettingsExportImportTests(unittest.TestCase):
 
             self.assertEqual(warnings, [])
             self.assertFalse(Settings.autocomplete_enabled())  # respected as exported
-            layer = Settings.autocomplete_layer()
+            # autocomplete_layer() re-resolves the stored (relative-path)
+            # description lazily, against wherever THIS plugin install
+            # actually lives (see Settings.autocomplete_layer()) - in real
+            # use that is always the same directory apply_dict() itself was
+            # told about, since the dialog passes its own real location for
+            # both. Only a test simulating a fake install location like this
+            # one needs to fake that out too.
+            with mock.patch.object(settings_module, "__file__", str(plugin_dir / "rtl_settings.py")):
+                layer = Settings.autocomplete_layer()
             self.assertIsNotNone(layer)  # but still connected, ready to use
             self.assertTrue(layer.isValid())
+            # Release the OGR/GDAL file handle - both the local reference and
+            # the one Settings itself cached - before tmp is removed below;
+            # on Windows, deleting a directory while a layer still has one of
+            # its files open raises PermissionError.
+            layer = None
+            settings_module._LAYER_CACHE.clear()
 
     def test_export_then_apply_round_trips_a_bundled_layer(self):
         """The full distribution scenario: export from one "install"
@@ -641,9 +661,16 @@ class SettingsExportImportTests(unittest.TestCase):
                 Settings.set_layer_source(settings_module._describe_layer_source(layer))
             Settings.set_field("field_names", "field_name")
             Settings.set_field("value", "value")
+            # Release this OGR/GDAL handle on data_file now that its source
+            # has been captured - see the note by other del/None points below.
+            layer = None
 
             with mock.patch.object(settings_module, "__file__", fake_module_file):
                 exported = Settings.export_dict()
+                # export_dict() itself resolves and caches a layer (to run
+                # the legacy-layer_id migration, see its docstring) - drop it
+                # too, it also points into data_file.
+                settings_module._LAYER_CACHE.clear()
 
             self.assertEqual(
                 exported["autocomplete_layer"]["path_relative_to_plugin"], "data/lookup.geojson"
@@ -660,12 +687,23 @@ class SettingsExportImportTests(unittest.TestCase):
                 warnings = Settings.apply_dict(exported, plugin_dir=other_install)
                 self.assertEqual(warnings, [])
                 self.assertTrue(Settings.autocomplete_enabled())
-                new_layer = Settings.autocomplete_layer()
+                # autocomplete_layer() re-resolves the stored description
+                # lazily, against wherever THIS plugin install actually
+                # lives (see Settings.autocomplete_layer()) - fake that out
+                # to other_install too, exactly as done for export above.
+                with mock.patch.object(settings_module, "__file__", str(other_install / "rtl_settings.py")):
+                    new_layer = Settings.autocomplete_layer()
                 self.assertIsNotNone(new_layer)
                 self.assertTrue(new_layer.isValid())
             finally:
                 import shutil
 
+                # Release the OGR/GDAL handle(s) on other_install's file
+                # before removing it - both the local reference and the one
+                # Settings itself cached - or Windows refuses to delete a
+                # directory while a file inside it is still open.
+                new_layer = None
+                settings_module._LAYER_CACHE.clear()
                 shutil.rmtree(other_install, ignore_errors=True)
 
 
@@ -749,9 +787,14 @@ class SettingsDialogLookupDatasetTests(unittest.TestCase):
 
             self.assertEqual(Settings.layer_source(), info)
             self.assertEqual(Settings.field("field_names"), "field_name")
-            resolved = Settings.autocomplete_layer()
-            self.assertIsNotNone(resolved)
-            self.assertTrue(resolved.isValid())
+            # Not, here, a round trip through Settings.autocomplete_layer():
+            # info's path_absolute is captured from a "memory" provider's
+            # own source() string, which - unlike a real Browser-picked
+            # dataset - describes only that layer's schema, not the actual
+            # features it holds at runtime (see set_layer_for_testing()'s
+            # docstring); reconstructing from it is not guaranteed to
+            # reproduce the same layer. What matters here is only that _save()
+            # persisted exactly what was picked, asserted above.
         finally:
             dialog.deleteLater()
 
