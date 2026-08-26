@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Settings storage: every getter/setter round-trips through QgsSettings."""
 
+import gc
 import json
 import tempfile
 import unittest
@@ -8,10 +9,32 @@ from pathlib import Path
 from unittest import mock
 
 from qgis.core import QgsProject
+from qgis.PyQt.QtWidgets import QApplication
 
 from _rtl_plugin.rtl_settings import Settings, SettingsImportError
 
 from .utils import make_lookup_layer, reset_plugin_settings
+
+
+def _release_file_handles() -> None:
+    """Give any just-dropped QgsVectorLayer a chance to actually release
+    its underlying OGR/GDAL file handle, before removing the directory it
+    points into.
+
+    Dropping the last Python reference to a layer (``layer = None``,
+    clearing a cache that held it) does not always release that handle
+    IMMEDIATELY: PyQt/PyQGIS objects commonly sit in reference cycles that
+    plain refcounting cannot collect - only a ``gc.collect()`` pass can -
+    and QGIS's own OGR connection pool can keep a file open independently
+    of any Python reference to it, released only once pending, queued
+    cleanup work runs on the event loop. Without this, a temp directory
+    removed immediately afterwards can still raise ``PermissionError`` on
+    Windows even though nothing in the test still references the layer.
+    """
+    gc.collect()
+    for _ in range(3):
+        QApplication.processEvents()
+    gc.collect()
 
 
 class SettingsRoundTripTests(unittest.TestCase):
@@ -394,9 +417,9 @@ class LoadLayerFromDescriptionTests(unittest.TestCase):
             self.assertIsNotNone(layer)
             self.assertTrue(layer.isValid())
             # Release the OGR/GDAL file handle before the temp dir is removed
-            # below - on Windows, deleting a directory while a layer still
-            # has one of its files open raises PermissionError.
+            # below - see _release_file_handles()'s own docstring.
             del layer
+            _release_file_handles()
         # Never added to the project - that is the whole point of this
         # mechanism (see Settings.autocomplete_layer()).
         self.assertEqual(self._added_layer_ids(), before)
@@ -641,9 +664,9 @@ class SettingsExportImportTests(unittest.TestCase):
             self.assertIsNotNone(layer)  # but still connected, ready to use
             self.assertTrue(layer.isValid())
             # Release the OGR/GDAL file handle before tmp is removed below -
-            # on Windows, deleting a directory while a layer still has one of
-            # its files open raises PermissionError.
+            # see _release_file_handles()'s own docstring.
             layer = None
+            _release_file_handles()
 
     def test_export_then_apply_round_trips_a_bundled_layer(self):
         """The full distribution scenario: export from one "install"
@@ -669,8 +692,9 @@ class SettingsExportImportTests(unittest.TestCase):
             Settings.set_field("field_names", "field_name")
             Settings.set_field("value", "value")
             # Release this OGR/GDAL handle on data_file now that its source
-            # has been captured - see the note by other del/None points below.
+            # has been captured - see _release_file_handles()'s own docstring.
             layer = None
+            _release_file_handles()
 
             with mock.patch.object(settings_module, "__file__", fake_module_file):
                 exported = Settings.export_dict()
@@ -678,6 +702,7 @@ class SettingsExportImportTests(unittest.TestCase):
                 # the legacy-layer_id migration, see its docstring) - drop it
                 # too, it also points into data_file.
                 settings_module._LAYER_CACHE.clear()
+            _release_file_handles()
 
             self.assertEqual(
                 exported["autocomplete_layer"]["path_relative_to_plugin"], "data/lookup.geojson"
@@ -710,10 +735,13 @@ class SettingsExportImportTests(unittest.TestCase):
                 import shutil
 
                 # Release the OGR/GDAL handle on other_install's file before
-                # removing it - or Windows refuses to delete a directory
-                # while a file inside it is still open.
+                # removing it - see _release_file_handles()'s own docstring.
                 new_layer = None
+                _release_file_handles()
                 shutil.rmtree(other_install, ignore_errors=True)
+            # And once more before the OUTER temp dir (tmp, still open here)
+            # is removed on the way out of the "with" block above.
+            _release_file_handles()
 
 
 class SettingsDialogLookupDatasetTests(unittest.TestCase):
