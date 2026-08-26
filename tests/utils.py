@@ -125,5 +125,7 @@ def reset_plugin_settings() -> None:
 
     Settings.set_autocomplete_enabled(False)
     Settings.set_layer_id("")
+    Settings.set_layer_source(None)
+    Settings.set_layer_for_testing(None)
     for key in Settings.FIELD_KEYS:
         Settings.set_field(key, "")

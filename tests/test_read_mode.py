@@ -408,8 +408,10 @@ class DescriptionResolverTests(unittest.TestCase):
     def setUp(self):
         reset_plugin_settings()
         self.layer = make_lookup_layer()
-        QgsProject.instance().addMapLayer(self.layer)
-        Settings.set_layer_id(self.layer.id())
+        # Not added to the project - a real lookup dataset never is any more
+        # (see Settings.autocomplete_layer()); set_layer_for_testing() is the
+        # test-only seam that injects this standalone memory layer directly.
+        Settings.set_layer_for_testing(self.layer)
         Settings.set_field("field_names", "field_name")
         Settings.set_field("value", "value")
         Settings.set_field("description", "description")
@@ -419,10 +421,6 @@ class DescriptionResolverTests(unittest.TestCase):
 
     def tearDown(self):
         reset_plugin_settings()
-        # Only the layer this test added - never every layer in the project,
-        # which could be the user's own if this suite is run from inside a
-        # live QGIS session.
-        QgsProject.instance().removeMapLayer(self.layer.id())
         rm.DescriptionResolver.invalidate()
 
     def test_mapping_builds_field_to_code_to_descriptions(self):
@@ -608,10 +606,11 @@ class ReadModeControllerModeCountTests(unittest.TestCase):
         reset_plugin_settings()
         self.context_layer = make_context_layer(("STATUS", "COUNTRY"))
         self.lookup_layer = make_lookup_layer()
-        QgsProject.instance().addMapLayers([self.context_layer, self.lookup_layer])
+        # Not added to the project - see the note in DescriptionResolverTests.setUp.
+        QgsProject.instance().addMapLayer(self.context_layer)
 
         Settings.set_autocomplete_enabled(True)
-        Settings.set_layer_id(self.lookup_layer.id())
+        Settings.set_layer_for_testing(self.lookup_layer)
         Settings.set_field("field_names", "field_name")
         Settings.set_field("value", "value")
         Settings.set_field("description", "description")
@@ -620,7 +619,7 @@ class ReadModeControllerModeCountTests(unittest.TestCase):
 
     def tearDown(self):
         rm.DescriptionResolver.invalidate()
-        QgsProject.instance().removeMapLayers([self.context_layer.id(), self.lookup_layer.id()])
+        QgsProject.instance().removeMapLayers([self.context_layer.id()])
         reset_plugin_settings()
 
     def _make_editor(self, text: str) -> QPlainTextEdit:
@@ -731,21 +730,18 @@ class ReadModeControllerModeCountTests(unittest.TestCase):
                 {"field_name": "F_ATT", "value": "610", "description": "greenhouse", "group_code": "1400", "table": "context"},
             ],
         )
-        QgsProject.instance().addMapLayer(ambiguous_layer)
-        Settings.set_layer_id(ambiguous_layer.id())
+        # Not added to the project - see the note in DescriptionResolverTests.setUp.
+        Settings.set_layer_for_testing(ambiguous_layer)
         Settings.set_field("group_code", "group_code")
         rm.DescriptionResolver.invalidate()
+        editor = self._make_editor('"F_CODE" = 2300 AND "F_ATT" = 610')
+        controller = rm.ReadModeController(editor)
         try:
-            editor = self._make_editor('"F_CODE" = 2300 AND "F_ATT" = 610')
-            controller = rm.ReadModeController(editor)
-            try:
-                controller._switch.setMode(1)  # edit -> read
-                self.assertIn("mosque", editor.toPlainText())
-                self.assertNotIn("greenhouse", editor.toPlainText())
-            finally:
-                controller.teardown()
+            controller._switch.setMode(1)  # edit -> read
+            self.assertIn("mosque", editor.toPlainText())
+            self.assertNotIn("greenhouse", editor.toPlainText())
         finally:
-            QgsProject.instance().removeMapLayer(ambiguous_layer.id())
+            controller.teardown()
 
 
 class PurgeLegacyProjectEntriesTests(unittest.TestCase):

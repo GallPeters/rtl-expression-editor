@@ -11,6 +11,8 @@ from qgis.core import QgsProject
 
 from _rtl_plugin.rtl_settings import Settings, SettingsImportError
 
+from .utils import make_lookup_layer, reset_plugin_settings
+
 
 class SettingsRoundTripTests(unittest.TestCase):
     def setUp(self):
@@ -21,6 +23,7 @@ class SettingsRoundTripTests(unittest.TestCase):
         self._max_values = Settings.max_suggested_values()
         self._default_read_mode = Settings.default_read_mode()
         self._layer_id = Settings.layer_id()
+        self._layer_source = Settings.layer_source()
         self._fields = {key: Settings.field(key) for key in Settings.FIELD_KEYS}
 
     def tearDown(self):
@@ -29,6 +32,8 @@ class SettingsRoundTripTests(unittest.TestCase):
         Settings.set_max_suggested_values(self._max_values)
         Settings.set_default_read_mode(self._default_read_mode)
         Settings.set_layer_id(self._layer_id)
+        Settings.set_layer_source(self._layer_source)
+        Settings.set_layer_for_testing(None)
         for key, value in self._fields.items():
             Settings.set_field(key, value)
 
@@ -71,7 +76,32 @@ class SettingsRoundTripTests(unittest.TestCase):
 
     def test_autocomplete_layer_is_none_when_unconfigured(self):
         Settings.set_layer_id("")
+        Settings.set_layer_source(None)
         self.assertIsNone(Settings.autocomplete_layer())
+
+    def test_autocomplete_layer_returns_the_testing_override_when_set(self):
+        layer = object()
+        Settings.set_layer_for_testing(layer)
+        self.assertIs(Settings.autocomplete_layer(), layer)
+        Settings.set_layer_for_testing(None)
+        self.assertIsNone(Settings.autocomplete_layer())
+
+    def test_layer_source_round_trips_through_settings(self):
+        info = {"name": "lookup", "provider": "ogr", "kind": "file", "path_absolute": "/tmp/x.gpkg"}
+        Settings.set_layer_source(info)
+        self.assertEqual(Settings.layer_source(), info)
+        Settings.set_layer_source(None)
+        self.assertIsNone(Settings.layer_source())
+
+    def test_has_layer_configured_reflects_either_the_new_or_legacy_key(self):
+        Settings.set_layer_id("")
+        Settings.set_layer_source(None)
+        self.assertFalse(Settings.has_layer_configured())
+        Settings.set_layer_source({"name": "x", "provider": "ogr"})
+        self.assertTrue(Settings.has_layer_configured())
+        Settings.set_layer_source(None)
+        Settings.set_layer_id("some-legacy-id")
+        self.assertTrue(Settings.has_layer_configured())
 
 
 class RunTestsButtonTests(unittest.TestCase):
@@ -332,9 +362,10 @@ class DescribeLayerSourceTests(unittest.TestCase):
         self.assertIn("mydb", info["path_absolute"])
 
 
-class ResolveLayerFromDescriptionTests(unittest.TestCase):
-    """_resolve_layer_from_description() - the import-time counterpart:
-    locating and loading (or gracefully failing on) a described layer."""
+class LoadLayerFromDescriptionTests(unittest.TestCase):
+    """_load_layer_from_description() - the import-time (and live-lookup)
+    counterpart: locating and opening (or gracefully failing on) a described
+    dataset as a standalone layer, never added to any project."""
 
     def _added_layer_ids(self):
         return set(QgsProject.instance().mapLayers().keys())
@@ -357,44 +388,16 @@ class ResolveLayerFromDescriptionTests(unittest.TestCase):
                 "path_absolute": None,
                 "uri_suffix": "",
             }
-            layer_id, warning = settings_module._resolve_layer_from_description(info, plugin_dir)
+            layer, warning = settings_module._load_layer_from_description(info, plugin_dir)
 
             self.assertEqual(warning, "")
-            self.assertTrue(layer_id)
-            layer = QgsProject.instance().mapLayer(layer_id)
             self.assertIsNotNone(layer)
             self.assertTrue(layer.isValid())
-            QgsProject.instance().removeMapLayer(layer_id)
+        # Never added to the project - that is the whole point of this
+        # mechanism (see Settings.autocomplete_layer()).
         self.assertEqual(self._added_layer_ids(), before)
 
-    def test_reuses_an_already_loaded_layer_with_the_same_source(self):
-        from _rtl_plugin import rtl_settings as settings_module
-
-        with tempfile.TemporaryDirectory() as tmp:
-            plugin_dir = Path(tmp)
-            data_file = plugin_dir / "lookup.geojson"
-            data_file.write_text(_GEOJSON_SAMPLE, encoding="utf-8")
-
-            from qgis.core import QgsVectorLayer
-
-            existing = QgsVectorLayer(str(data_file), "already loaded", "ogr")
-            self.assertTrue(existing.isValid())
-            QgsProject.instance().addMapLayer(existing)
-            try:
-                info = {
-                    "name": "lookup",
-                    "provider": "ogr",
-                    "path_relative_to_plugin": "lookup.geojson",
-                    "path_absolute": None,
-                    "uri_suffix": "",
-                }
-                layer_id, warning = settings_module._resolve_layer_from_description(info, plugin_dir)
-                self.assertEqual(warning, "")
-                self.assertEqual(layer_id, existing.id())
-            finally:
-                QgsProject.instance().removeMapLayer(existing.id())
-
-    def test_a_missing_file_returns_no_id_and_a_clear_warning(self):
+    def test_a_missing_file_returns_no_layer_and_a_clear_warning(self):
         from _rtl_plugin import rtl_settings as settings_module
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -405,17 +408,17 @@ class ResolveLayerFromDescriptionTests(unittest.TestCase):
                 "path_absolute": None,
                 "uri_suffix": "",
             }
-            layer_id, warning = settings_module._resolve_layer_from_description(info, Path(tmp))
+            layer, warning = settings_module._load_layer_from_description(info, Path(tmp))
 
-        self.assertEqual(layer_id, "")
+        self.assertIsNone(layer)
         self.assertIn("could not be found", warning)
 
-    def test_a_description_with_no_path_at_all_returns_no_id_and_a_clear_warning(self):
+    def test_a_description_with_no_path_at_all_returns_no_layer_and_a_clear_warning(self):
         from _rtl_plugin import rtl_settings as settings_module
 
         info = {"name": "lookup", "provider": "memory", "path_relative_to_plugin": None, "path_absolute": None, "uri_suffix": ""}
-        layer_id, warning = settings_module._resolve_layer_from_description(info, Path.cwd())
-        self.assertEqual(layer_id, "")
+        layer, warning = settings_module._load_layer_from_description(info, Path.cwd())
+        self.assertIsNone(layer)
         self.assertTrue(warning)
 
     def test_a_file_that_exists_but_will_not_load_is_reported_not_accessible(self):
@@ -436,32 +439,28 @@ class ResolveLayerFromDescriptionTests(unittest.TestCase):
                 "path_absolute": None,
                 "uri_suffix": "",
             }
-            layer_id, warning = settings_module._resolve_layer_from_description(info, plugin_dir)
+            layer, warning = settings_module._load_layer_from_description(info, plugin_dir)
 
-        self.assertEqual(layer_id, "")
+        self.assertIsNone(layer)
         self.assertIn("not accessible", warning)
         self.assertNotIn("could not be found", warning)
 
-    def test_a_connection_reuses_an_already_loaded_layer_with_the_same_source(self):
+    def test_a_connection_is_opened_directly_without_touching_the_project(self):
         from _rtl_plugin import rtl_settings as settings_module
-        from qgis.core import QgsVectorLayer
 
-        existing = QgsVectorLayer("Point?crs=EPSG:4326&field=name:string", "existing", "memory")
-        self.assertTrue(existing.isValid())
-        QgsProject.instance().addMapLayer(existing)
-        try:
-            info = {
-                "name": "lookup",
-                "provider": "memory",
-                "kind": "connection",
-                "path_absolute": existing.source(),
-                "uri_suffix": "",
-            }
-            layer_id, warning = settings_module._resolve_layer_from_description(info, Path.cwd())
-            self.assertEqual(warning, "")
-            self.assertEqual(layer_id, existing.id())
-        finally:
-            QgsProject.instance().removeMapLayer(existing.id())
+        before = self._added_layer_ids()
+        info = {
+            "name": "lookup",
+            "provider": "memory",
+            "kind": "connection",
+            "path_absolute": "Point?crs=EPSG:4326&field=name:string",
+            "uri_suffix": "",
+        }
+        layer, warning = settings_module._load_layer_from_description(info, Path.cwd())
+        self.assertEqual(warning, "")
+        self.assertIsNotNone(layer)
+        self.assertTrue(layer.isValid())
+        self.assertEqual(self._added_layer_ids(), before)
 
     def test_a_connection_that_cannot_be_reached_is_reported_not_accessible(self):
         from _rtl_plugin import rtl_settings as settings_module
@@ -473,16 +472,16 @@ class ResolveLayerFromDescriptionTests(unittest.TestCase):
             "path_absolute": "not a real connection string at all",
             "uri_suffix": "",
         }
-        layer_id, warning = settings_module._resolve_layer_from_description(info, Path.cwd())
-        self.assertEqual(layer_id, "")
+        layer, warning = settings_module._load_layer_from_description(info, Path.cwd())
+        self.assertIsNone(layer)
         self.assertIn("not accessible", warning)
 
     def test_a_connection_with_no_information_recorded_gives_a_clear_warning(self):
         from _rtl_plugin import rtl_settings as settings_module
 
         info = {"name": "remote_table", "provider": "postgres", "kind": "connection", "path_absolute": None}
-        layer_id, warning = settings_module._resolve_layer_from_description(info, Path.cwd())
-        self.assertEqual(layer_id, "")
+        layer, warning = settings_module._load_layer_from_description(info, Path.cwd())
+        self.assertIsNone(layer)
         self.assertTrue(warning)
 
 
@@ -496,6 +495,7 @@ class SettingsExportImportTests(unittest.TestCase):
         self._max_values = Settings.max_suggested_values()
         self._default_read_mode = Settings.default_read_mode()
         self._layer_id = Settings.layer_id()
+        self._layer_source = Settings.layer_source()
         self._fields = {key: Settings.field(key) for key in Settings.FIELD_KEYS}
 
     def tearDown(self):
@@ -504,12 +504,14 @@ class SettingsExportImportTests(unittest.TestCase):
         Settings.set_max_suggested_values(self._max_values)
         Settings.set_default_read_mode(self._default_read_mode)
         Settings.set_layer_id(self._layer_id)
+        Settings.set_layer_source(self._layer_source)
         for key, value in self._fields.items():
             Settings.set_field(key, value)
 
     def test_export_dict_with_autocomplete_disabled_has_no_layer(self):
         Settings.set_autocomplete_enabled(False)
         Settings.set_layer_id("")
+        Settings.set_layer_source(None)
         data = Settings.export_dict()
         self.assertTrue(data["rtl_expression_editor_settings"])
         self.assertFalse(data["autocomplete_enabled"])
@@ -565,8 +567,9 @@ class SettingsExportImportTests(unittest.TestCase):
         self.assertTrue(any("autocomplete_fields" in w for w in warnings))
         self.assertTrue(Settings.plugin_enabled())
 
-    def test_apply_dict_with_an_unresolvable_layer_warns_and_clears_the_layer_id(self):
+    def test_apply_dict_with_an_unresolvable_layer_warns_and_clears_the_configured_layer(self):
         Settings.set_layer_id("some-stale-id")
+        Settings.set_layer_source({"name": "old", "provider": "ogr", "kind": "connection", "path_absolute": "x"})
         data = {
             "rtl_expression_editor_settings": True,
             "autocomplete_enabled": True,
@@ -582,12 +585,13 @@ class SettingsExportImportTests(unittest.TestCase):
         warnings = Settings.apply_dict(data)
         self.assertTrue(any("could not be found" in w for w in warnings))
         self.assertEqual(Settings.layer_id(), "")
+        self.assertIsNone(Settings.layer_source())
 
     def test_a_referenced_layer_is_resolved_even_when_autocomplete_enabled_is_false(self):
         """Regression: a file exported before ticking "Enable custom
         autocomplete source" (an easy thing to forget) still has a fully
-        configured layer and fields - those must still be loaded, not
-        silently dropped just because the enabled flag itself was off."""
+        configured lookup dataset and fields - those must still be loaded,
+        not silently dropped just because the enabled flag itself was off."""
         with tempfile.TemporaryDirectory() as tmp:
             plugin_dir = Path(tmp)
             data_dir = plugin_dir / "data"
@@ -611,9 +615,8 @@ class SettingsExportImportTests(unittest.TestCase):
             self.assertEqual(warnings, [])
             self.assertFalse(Settings.autocomplete_enabled())  # respected as exported
             layer = Settings.autocomplete_layer()
-            self.assertIsNotNone(layer)  # but still loaded into the project
+            self.assertIsNotNone(layer)  # but still connected, ready to use
             self.assertTrue(layer.isValid())
-            QgsProject.instance().removeMapLayer(layer.id())
 
     def test_export_then_apply_round_trips_a_bundled_layer(self):
         """The full distribution scenario: export from one "install"
@@ -632,18 +635,15 @@ class SettingsExportImportTests(unittest.TestCase):
 
             layer = QgsVectorLayer(str(data_file), "lookup", "ogr")
             self.assertTrue(layer.isValid())
-            QgsProject.instance().addMapLayer(layer)
             Settings.set_autocomplete_enabled(True)
-            Settings.set_layer_id(layer.id())
+            fake_module_file = str(plugin_dir / "rtl_settings.py")
+            with mock.patch.object(settings_module, "__file__", fake_module_file):
+                Settings.set_layer_source(settings_module._describe_layer_source(layer))
             Settings.set_field("field_names", "field_name")
             Settings.set_field("value", "value")
 
-            fake_module_file = str(plugin_dir / "rtl_settings.py")
-            try:
-                with mock.patch.object(settings_module, "__file__", fake_module_file):
-                    exported = Settings.export_dict()
-            finally:
-                QgsProject.instance().removeMapLayer(layer.id())
+            with mock.patch.object(settings_module, "__file__", fake_module_file):
+                exported = Settings.export_dict()
 
             self.assertEqual(
                 exported["autocomplete_layer"]["path_relative_to_plugin"], "data/lookup.geojson"
@@ -663,11 +663,97 @@ class SettingsExportImportTests(unittest.TestCase):
                 new_layer = Settings.autocomplete_layer()
                 self.assertIsNotNone(new_layer)
                 self.assertTrue(new_layer.isValid())
-                QgsProject.instance().removeMapLayer(new_layer.id())
             finally:
                 import shutil
 
                 shutil.rmtree(other_install, ignore_errors=True)
+
+
+class SettingsDialogLookupDatasetTests(unittest.TestCase):
+    """The Browse.../Clear pair that replaced the old project-layer combo -
+    see SettingsDialog._browse_layer()/_clear_layer()/_pick_layer_from_browser().
+    _pick_layer_from_browser() itself (the real modal Browser dialog) is not
+    exercised here - only what happens with whatever it returns."""
+
+    def setUp(self):
+        reset_plugin_settings()
+
+    def tearDown(self):
+        reset_plugin_settings()
+
+    def test_browsing_a_dataset_updates_the_label_and_field_combos(self):
+        from _rtl_plugin.rtl_settings import SettingsDialog
+
+        layer = make_lookup_layer()
+        info = {"name": "lookup", "provider": "memory", "kind": "connection", "path_absolute": layer.source(), "uri_suffix": ""}
+
+        dialog = SettingsDialog()
+        try:
+            with mock.patch.object(SettingsDialog, "_pick_layer_from_browser", return_value=(layer, info)):
+                dialog._browse_layer()
+
+            self.assertIs(dialog._selected_layer, layer)
+            self.assertIs(dialog._selected_source_info, info)
+            self.assertEqual(dialog.lbl_layer.text(), layer.name())
+            # Field combos were repopulated from the newly picked dataset.
+            dialog.field_combos["field_names"].setField("field_name")
+            self.assertEqual(dialog.field_combos["field_names"].currentField(), "field_name")
+        finally:
+            dialog.deleteLater()
+
+    def test_clear_resets_the_selection(self):
+        from _rtl_plugin.rtl_settings import SettingsDialog
+
+        layer = make_lookup_layer()
+        info = {"name": "lookup", "provider": "memory", "kind": "connection", "path_absolute": layer.source(), "uri_suffix": ""}
+
+        dialog = SettingsDialog()
+        try:
+            with mock.patch.object(SettingsDialog, "_pick_layer_from_browser", return_value=(layer, info)):
+                dialog._browse_layer()
+            dialog._clear_layer()
+
+            self.assertIsNone(dialog._selected_layer)
+            self.assertIsNone(dialog._selected_source_info)
+            self.assertEqual(dialog.lbl_layer.text(), "(none selected)")
+        finally:
+            dialog.deleteLater()
+
+    def test_cancelling_the_browser_leaves_the_previous_selection_untouched(self):
+        from _rtl_plugin.rtl_settings import SettingsDialog
+
+        dialog = SettingsDialog()
+        try:
+            with mock.patch.object(SettingsDialog, "_pick_layer_from_browser", return_value=(None, None)):
+                dialog._browse_layer()
+            self.assertIsNone(dialog._selected_layer)
+            self.assertEqual(dialog.lbl_layer.text(), "(none selected)")
+        finally:
+            dialog.deleteLater()
+
+    def test_accepting_persists_the_picked_source_description(self):
+        from _rtl_plugin.rtl_settings import SettingsDialog
+
+        layer = make_lookup_layer()
+        info = {"name": "lookup", "provider": "memory", "kind": "connection", "path_absolute": layer.source(), "uri_suffix": ""}
+
+        dialog = SettingsDialog()
+        try:
+            dialog.chk_ac.setChecked(True)
+            with mock.patch.object(SettingsDialog, "_pick_layer_from_browser", return_value=(layer, info)):
+                dialog._browse_layer()
+            dialog.field_combos["field_names"].setField("field_name")
+            dialog.field_combos["value"].setField("value")
+
+            dialog._save()
+
+            self.assertEqual(Settings.layer_source(), info)
+            self.assertEqual(Settings.field("field_names"), "field_name")
+            resolved = Settings.autocomplete_layer()
+            self.assertIsNotNone(resolved)
+            self.assertTrue(resolved.isValid())
+        finally:
+            dialog.deleteLater()
 
 
 def _row_label_for(dialog, widget):
@@ -696,7 +782,7 @@ class SettingsDialogLabelTooltipTests(unittest.TestCase):
         dialog = SettingsDialog()
         try:
             widgets = [
-                dialog.cmb_layer,
+                dialog.layer_row,
                 dialog.cmb_mode,
                 dialog.spin_max_values,
                 *dialog.field_combos.values(),

@@ -137,10 +137,16 @@ class WithALookupTableTests(unittest.TestCase):
         reset_plugin_settings()
         self.context_layer = make_context_layer(("STATUS", "COUNTRY"))
         self.lookup_layer = make_lookup_layer()
-        QgsProject.instance().addMapLayers([self.context_layer, self.lookup_layer])
+        # The lookup layer is deliberately NOT added to the project - it is
+        # read straight from a standalone object, exactly as a real dataset
+        # picked from the Browser is (see Settings.autocomplete_layer()).
+        # set_layer_for_testing() is the test-only seam for that; a memory
+        # layer could not round-trip through the real
+        # source-description/URI mechanism (see its own docstring).
+        QgsProject.instance().addMapLayer(self.context_layer)
 
         Settings.set_autocomplete_enabled(True)
-        Settings.set_layer_id(self.lookup_layer.id())
+        Settings.set_layer_for_testing(self.lookup_layer)
         Settings.set_field("field_names", "field_name")
         Settings.set_field("value", "value")
         Settings.set_field("description", "description")
@@ -151,9 +157,9 @@ class WithALookupTableTests(unittest.TestCase):
 
     def tearDown(self):
         reset_plugin_settings()
-        # Only the two layers this test added - see the note in
+        # Only the context layer this test added - see the note in
         # WithoutAnyLookupTableTests.tearDown above.
-        QgsProject.instance().removeMapLayers([self.context_layer.id(), self.lookup_layer.id()])
+        QgsProject.instance().removeMapLayers([self.context_layer.id()])
         ac.cache().invalidate()
 
     def test_configuration_is_usable(self):
@@ -263,10 +269,11 @@ class PopupTitleDescriptionEnrichmentTests(unittest.TestCase):
         reset_plugin_settings()
         self.context_layer = make_context_layer(("STATUS", "COUNTRY"))
         self.lookup_layer = make_lookup_layer()
-        QgsProject.instance().addMapLayers([self.context_layer, self.lookup_layer])
+        # Not added to the project - see the note in WithALookupTableTests.setUp.
+        QgsProject.instance().addMapLayer(self.context_layer)
 
         Settings.set_autocomplete_enabled(True)
-        Settings.set_layer_id(self.lookup_layer.id())
+        Settings.set_layer_for_testing(self.lookup_layer)
         Settings.set_field("field_names", "field_name")
         Settings.set_field("value", "value")
         Settings.set_field("description", "description")
@@ -281,7 +288,7 @@ class PopupTitleDescriptionEnrichmentTests(unittest.TestCase):
 
     def tearDown(self):
         self.controller.teardown()
-        QgsProject.instance().removeMapLayers([self.context_layer.id(), self.lookup_layer.id()])
+        QgsProject.instance().removeMapLayers([self.context_layer.id()])
         reset_plugin_settings()
         ac.cache().invalidate()
 
@@ -382,10 +389,11 @@ class AcceptCurrentInsertsOnlyTheValueTests(unittest.TestCase):
         reset_plugin_settings()
         self.context_layer = make_context_layer(("STATUS", "COUNTRY"))
         self.lookup_layer = make_lookup_layer()
-        QgsProject.instance().addMapLayers([self.context_layer, self.lookup_layer])
+        # Not added to the project - see the note in WithALookupTableTests.setUp.
+        QgsProject.instance().addMapLayer(self.context_layer)
 
         Settings.set_autocomplete_enabled(True)
-        Settings.set_layer_id(self.lookup_layer.id())
+        Settings.set_layer_for_testing(self.lookup_layer)
         Settings.set_field("field_names", "field_name")
         Settings.set_field("value", "value")
         Settings.set_field("description", "description")
@@ -398,7 +406,7 @@ class AcceptCurrentInsertsOnlyTheValueTests(unittest.TestCase):
 
     def tearDown(self):
         self.controller.teardown()
-        QgsProject.instance().removeMapLayers([self.context_layer.id(), self.lookup_layer.id()])
+        QgsProject.instance().removeMapLayers([self.context_layer.id()])
         reset_plugin_settings()
 
     def test_accepting_an_ambiguous_value_inserts_only_the_value(self):

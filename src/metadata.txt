@@ -7,12 +7,12 @@ about=QGIS's built-in editor (QScintilla) does not display right-to-left text co
 
     This plugin places an enhanced editor directly above the original one. The enhanced editor renders mixed RTL and LTR text correctly while staying fully sync-hronized with the original editor beneath it, so all existing QGIS functionality keeps working: the field, function and operator tools, validation, value previews and syntax highlighting. Matching brackets are highlighted as well. Nothing in QGIS is modified or replaced.
 
-    The plugin also offers an optional advanced auto-complete system. Choose any project layer and its fields as the source of allowed values, with optional descriptions, groups and group descriptions. Press Ctrl+Space to complete either a field name or a value, and the suggestions adapt automatically to the field being queried and to the layer you are working on.
+    The plugin also offers an optional advanced auto-complete system. Choose any table or dataset - picked straight from the QGIS Browser, without adding it to your project - and its fields as the source of allowed values, with optional descriptions, groups and group descriptions. Press Ctrl+Space to complete either a field name or a value, and the suggestions adapt automatically to the field being queried and to the layer you are working on.
 
     When a custom auto-complete source is configured, an optional Read Mode switch appears inside the editor. Read Mode shows the value descriptions instead of the stored codes, making a long expression far easier tounderstand, and never alters the expression itself. Where the same code has different meanings in different groups, Read Mode works out the right one automatically from the expression's own surrounding condition (e.g. "F_CODE" = 2300 AND "F_ATT" = 603), using an optional Group codes column - nothing about this is ever saved to the project. An optional second, alternative description per value adds a third switch position for a different wording of the same descriptions.
 
     The whole configuration, including the auto-complete source, can be exported to a file and imported again elsewhere - useful for sharing a ready-made setup with colleagues.
-version=1.6
+version=1.7
 author=Jossef Kanter
 email=jossefkan@gmail.com
 
@@ -27,6 +27,9 @@ experimental=False
 deprecated=False
 hasProcessingProvider=no
 server=False
+
+** v1.7 (26.08.2026):
+  - Changed: the autocomplete lookup table is now picked straight from the QGIS Browser as a dataset, instead of being chosen from - and needing to be added to - the project's own layers. It is read directly from its own source and is never added to the project, so it no longer appears in the Layers panel or gets saved into the project file. A configuration saved by an earlier version is upgraded automatically the first time it is used.
 
 ** v1.6 (19.08.2026):
   - Changed: Read mode now works out a code with several meanings directly from the expression's own surrounding group condition (e.g. "F_CODE" = 2300 AND "F_ATT" = 603, using the Group codes column) instead of remembering a choice you picked - showing every meaning only when that context is missing or ambiguous.

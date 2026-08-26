@@ -16,8 +16,9 @@ Two pieces live here:
 ``SettingsDialog``
     Built in code rather than from a ``.ui`` file, to keep the plugin's file
     count low, consistent with the existing architecture.  It uses the native
-    QGIS widgets ``QgsMapLayerComboBox`` and ``QgsFieldComboBox``, which give
-    dynamic field population and layer tracking for free.
+    QGIS widget ``QgsFieldComboBox`` for dynamic field population, and
+    ``QgsDataSourceSelectDialog`` (the Browser, in picker form) to choose the
+    lookup dataset itself without adding it to the project.
 """
 
 from __future__ import annotations
@@ -54,10 +55,9 @@ from qgis.core import QgsProject, QgsSettings
 # Native QGIS selector widgets.  Imported defensively so that a binding change
 # degrades to a clear error message instead of breaking plugin load.
 try:
-    from qgis.gui import QgsFieldComboBox, QgsMapLayerComboBox
+    from qgis.gui import QgsFieldComboBox
 except ImportError:  # pragma: no cover
     QgsFieldComboBox = None
-    QgsMapLayerComboBox = None
 
 
 #: All keys live under this prefix inside QgsSettings.
@@ -115,6 +115,18 @@ class _SettingsBus(QObject):
 
 #: Module-level singleton. Consumers connect to ``BUS.changed``.
 BUS = _SettingsBus()
+
+#: Settings.autocomplete_layer()'s single-slot cache: ``[source_json, layer]``,
+#: or empty when nothing has been resolved yet. A list (not a plain pair of
+#: module globals) purely so a classmethod can clear it with ``.clear()``
+#: without a ``global`` statement. Cleared by set_layer_source() and by
+#: set_layer_for_testing(), so a freshly (re)configured dataset is never
+#: served stale.
+_LAYER_CACHE: list = []
+
+#: Testing-only override for Settings.autocomplete_layer() - see
+#: set_layer_for_testing().
+_TEST_LAYER_OVERRIDE: list = []
 
 
 class Settings:
@@ -250,11 +262,90 @@ class Settings:
 
     @classmethod
     def layer_id(cls) -> str:
+        """Legacy (< v1.7) project-layer id. Kept only so a not-yet-migrated
+        configuration can still be recognised - see
+        ``_migrate_legacy_layer_id()``. Never written by current code."""
         return cls._get_str("ac/layer_id", "")
 
     @classmethod
     def set_layer_id(cls, value: str) -> None:
         cls._set("ac/layer_id", value or "")
+
+    @classmethod
+    def layer_source(cls) -> Optional[dict]:
+        """The configured lookup dataset, as a portable source description -
+        the same shape ``_describe_layer_source()`` produces for Export
+        Settings - or ``None`` if nothing is configured.
+
+        This, not a project layer id, is what actually gets persisted from
+        v1.7 on: the dataset is picked from the QGIS Browser and read
+        straight from its own source, without ever being added to the
+        project - see ``autocomplete_layer()``.
+        """
+        raw = cls._get_str("ac/layer_source", "")
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return None
+        return data if isinstance(data, dict) else None
+
+    @classmethod
+    def set_layer_source(cls, info: Optional[dict]) -> None:
+        cls._set("ac/layer_source", json.dumps(info) if info else "")
+        _LAYER_CACHE.clear()
+
+    @classmethod
+    def set_layer_for_testing(cls, layer) -> None:
+        """Test seam: make ``autocomplete_layer()`` return ``layer`` directly,
+        bypassing the normal source-description round trip.
+
+        Real lookup datasets always come from the Browser - a file or a
+        database table, never QGIS's "memory" provider - so they can be
+        reopened later from their own source string alone. A memory layer
+        cannot: that string describes only its schema, not the features
+        added to it at runtime, so round-tripping one through
+        ``set_layer_source()``/``autocomplete_layer()`` would silently come
+        back empty. Tests build their lookup fixtures as memory layers, so
+        they inject the already-built object here instead. Pass ``None`` to
+        clear the override.
+        """
+        _TEST_LAYER_OVERRIDE[:] = [layer] if layer is not None else []
+        _LAYER_CACHE.clear()
+
+    @classmethod
+    def has_layer_configured(cls) -> bool:
+        """Whether a lookup dataset is configured at all, regardless of
+        whether it currently resolves - lets the Settings dialog tell "never
+        configured" apart from "configured but could not be loaded"."""
+        return cls.layer_source() is not None or bool(cls._get_str("ac/layer_id", ""))
+
+    @classmethod
+    def _migrate_legacy_layer_id(cls) -> Optional[dict]:
+        """One-time upgrade from a pre-v1.7 project-layer id to a portable
+        source description, run the first time ``autocomplete_layer()`` finds
+        no ``ac/layer_source`` of its own.
+
+        A configuration saved before v1.7 points at a layer that was added to
+        the project itself (``ac/layer_id``). This describes that layer's
+        source exactly as Export Settings has always done, stores it under
+        the new key, and clears the legacy id - so an existing configuration
+        keeps working with no action needed, and is only ever migrated once.
+        """
+        legacy_id = cls._get_str("ac/layer_id", "")
+        if not legacy_id:
+            return None
+        try:
+            layer = QgsProject.instance().mapLayer(legacy_id)
+        except Exception:
+            layer = None
+        cls._set("ac/layer_id", "")  # consumed either way - never looked at again
+        if layer is None:
+            return None
+        info = _describe_layer_source(layer)
+        cls.set_layer_source(info)
+        return info
 
     #: Logical name -> settings key for every field selector.
     FIELD_KEYS = {
@@ -331,18 +422,35 @@ class Settings:
 
     @classmethod
     def autocomplete_layer(cls):
-        """Resolve the configured layer, or None if it is gone from the project.
+        """Resolve the configured lookup dataset, or None if unconfigured or
+        unreachable.
 
-        Returning None on a deleted layer is the graceful-degradation path: the
-        feature simply does nothing rather than raising.
+        Loaded directly from its own source (see ``layer_source()``) and
+        never added to the project's layer tree - it does not appear in the
+        Layers panel and is not saved into the project file, so using it
+        never requires importing an extra layer. Cached by its source
+        description, since this can be called on every keystroke; the cache
+        is dropped whenever the configuration changes (``set_layer_source()``)
+        or, in tests, by ``set_layer_for_testing()``.
+
+        Returning None when the dataset cannot be reached is the graceful-
+        degradation path: the feature simply does nothing rather than raising.
         """
-        layer_id = cls.layer_id()
-        if not layer_id:
+        if _TEST_LAYER_OVERRIDE:
+            return _TEST_LAYER_OVERRIDE[0]
+
+        info = cls.layer_source()
+        if info is None:
+            info = cls._migrate_legacy_layer_id()
+        if info is None:
             return None
-        try:
-            return QgsProject.instance().mapLayer(layer_id)
-        except Exception:
-            return None
+
+        key = json.dumps(info, sort_keys=True)
+        if _LAYER_CACHE and _LAYER_CACHE[0] == key:
+            return _LAYER_CACHE[1]
+        layer, _warning = _load_layer_from_description(info)
+        _LAYER_CACHE[:] = [key, layer]
+        return layer
 
     @classmethod
     def autocomplete_is_usable(cls) -> tuple:
@@ -351,7 +459,7 @@ class Settings:
             return False, "custom autocomplete is disabled"
         layer = cls.autocomplete_layer()
         if layer is None:
-            return False, "configured autocomplete layer is missing from the project"
+            return False, "configured lookup dataset could not be loaded"
         try:
             available = {f.name() for f in layer.fields()}
         except Exception:
@@ -370,16 +478,20 @@ class Settings:
     def export_dict(cls) -> dict:
         """Everything needed to reproduce this configuration elsewhere.
 
-        The autocomplete lookup layer is described by its *source*, never by
-        its QGIS layer id: an id is only meaningful inside the project it was
-        assigned in, so it could never be resolved in a colleague's project.
-        When the source file lives inside this plugin's own install
-        directory (or a subfolder of it), its path is additionally recorded
-        relative to that directory - see ``_describe_layer_source()`` - so
-        the same exported file keeps working after the plugin is reinstalled
-        somewhere else entirely, as long as the data file travels with it.
+        The autocomplete lookup dataset is described by its *source*, never
+        by a QGIS layer id: it is never a project layer to begin with (see
+        ``autocomplete_layer()``), and an id would only be meaningful inside
+        the project it was assigned in anyway. When the source file lives
+        inside this plugin's own install directory (or a subfolder of it),
+        its path is additionally recorded relative to that directory - see
+        ``_describe_layer_source()`` - so the same exported file keeps
+        working after the plugin is reinstalled somewhere else entirely, as
+        long as the data file travels with it. Stored verbatim, exactly as
+        it was recorded when the dataset was picked, rather than re-described
+        from the resolved layer, so that relative path survives untouched.
         """
-        data = {
+        cls.autocomplete_layer()  # side effect: migrates a legacy layer_id, if any (see below)
+        return {
             CONFIG_MARKER: True,
             "format_version": CONFIG_FORMAT_VERSION,
             "plugin_enabled": cls.plugin_enabled(),
@@ -387,12 +499,8 @@ class Settings:
             "default_read_mode": cls.default_read_mode(),
             "autocomplete_enabled": cls.autocomplete_enabled(),
             "autocomplete_fields": {key: cls.field(key) for key in cls.FIELD_KEYS},
-            "autocomplete_layer": None,
+            "autocomplete_layer": cls.layer_source(),
         }
-        layer = cls.autocomplete_layer()
-        if layer is not None:
-            data["autocomplete_layer"] = _describe_layer_source(layer)
-        return data
 
     @classmethod
     def apply_dict(cls, data: dict, plugin_dir: Optional[Path] = None) -> List[str]:
@@ -431,20 +539,25 @@ class Settings:
             if data.get("autocomplete_fields") is not None:
                 warnings.append("'autocomplete_fields' was malformed; ignored.")
 
-        layer_id = ""
+        layer_source = None
         layer_info = data.get("autocomplete_layer")
         if layer_info:
             # Resolved whenever the file references one, regardless of
             # whether "autocomplete_enabled" also happens to be true -
-            # loading the referenced layer into the project is exactly what
-            # "import the config" means; gating it on the enabled flag used
-            # to mean a bundled file exported with the feature not yet
-            # ticked on (an easy thing to forget before Export Settings)
-            # never got its layer loaded at all, even though everything
-            # else about it was configured correctly.
-            layer_id, layer_warning = _resolve_layer_from_description(layer_info, plugin_dir)
+            # loading the referenced dataset is exactly what "import the
+            # config" means; gating it on the enabled flag used to mean a
+            # bundled file exported with the feature not yet ticked on (an
+            # easy thing to forget before Export Settings) never got its
+            # dataset connected at all, even though everything else about it
+            # was configured correctly.
+            layer, layer_warning = _load_layer_from_description(layer_info, plugin_dir)
             if layer_warning:
                 warnings.append(layer_warning)
+            if layer is not None:
+                # The description as imported, verbatim - not re-derived from
+                # the resolved layer - so a path recorded relative to the
+                # plugin folder is preserved exactly as exported.
+                layer_source = layer_info
 
         # Only now, with the whole file read without raising, is anything
         # actually written.
@@ -454,16 +567,25 @@ class Settings:
         cls.set_autocomplete_enabled(ac_enabled)
         for key in cls.FIELD_KEYS:
             cls.set_field(key, str(fields.get(key, "") or ""))
-        cls.set_layer_id(layer_id)
+        cls.set_layer_source(layer_source)
+        # Overwrite any stale legacy id too, so a later autocomplete_layer()
+        # call never finds one to migrate back in - importing a settings file
+        # always states the lookup dataset in full, one way or the other.
+        cls._set("ac/layer_id", "")
 
         BUS.changed.emit()
         return warnings
 
 
 def _describe_layer_source(layer) -> dict:
-    """Capture a layer's source portably, for ``Settings.export_dict()``.
+    """Capture a layer's source portably.
 
-    ``kind`` says how ``_resolve_layer_from_description()`` should treat the
+    Used both for ``Settings.export_dict()`` and, since v1.7, as the shape
+    the live configuration itself is stored in (see
+    ``Settings.set_layer_source()``) - a dataset is picked once via the
+    Browser and described this way, rather than kept as a project layer id.
+
+    ``kind`` says how ``_load_layer_from_description()`` should treat the
     rest of the description:
 
     * ``"file"`` - a filesystem path (Shapefile, GeoPackage, CSV, ...),
@@ -544,20 +666,21 @@ def _describe_layer_source(layer) -> dict:
     return info
 
 
-def _resolve_layer_from_description(info, plugin_dir: Optional[Path] = None) -> Tuple[str, str]:
-    """Return ``(layer_id, warning)`` for an exported layer description.
+def _load_layer_from_description(info, plugin_dir: Optional[Path] = None) -> Tuple[Optional[object], str]:
+    """Return ``(layer, warning)`` for a stored/exported source description.
 
-    ``layer_id`` is ``""`` whenever nothing could be resolved - never a
-    dangling id pointing at a layer that does not exist, which is what keeps
-    a failed import from leaving the plugin's autocomplete pointed at
-    nothing in a way that looks configured but silently is not.
+    ``layer`` is a standalone ``QgsVectorLayer`` opened straight from the
+    description's own source - never added to any project - or ``None`` if
+    it could not be resolved at all. ``None`` is also what keeps a failed
+    import (or a failed live lookup) from leaving the plugin's autocomplete
+    pointed at something that looks configured but silently is not.
 
     The warning distinguishes two genuinely different problems, so it is
     clear which one to fix:
 
-    * **not found** - a file-based layer whose path does not exist at all
+    * **not found** - a file-based dataset whose path does not exist at all
       (never copied over, or copied somewhere else).
-    * **not accessible** - the path exists but the layer still failed to
+    * **not accessible** - the path exists but the dataset still failed to
       load (permissions, a corrupted or unsupported file), or a database
       connection could not be established (an unreachable server, or -
       since credentials are deliberately never exported, see
@@ -565,41 +688,33 @@ def _resolve_layer_from_description(info, plugin_dir: Optional[Path] = None) -> 
       original machine had configured).
     """
     if not isinstance(info, dict):
-        return "", "The autocomplete layer description was malformed; not configured."
+        return None, "The lookup dataset description was malformed; not configured."
 
     name = str(info.get("name") or "lookup table")
     provider = str(info.get("provider") or "ogr")
     kind = str(info.get("kind") or "file")
     suffix = str(info.get("uri_suffix") or "")
-    project = QgsProject.instance()
+
+    from qgis.core import QgsVectorLayer
 
     if kind == "connection":
         source = str(info.get("path_absolute") or "")
         if not source:
             return (
-                "",
-                f"Autocomplete layer '{name}' has no usable connection information "
+                None,
+                f"Lookup dataset '{name}' has no usable connection information "
                 "recorded; please reconfigure it manually in Settings.",
             )
         full_uri = source + suffix
-        for existing in project.mapLayers().values():
-            try:
-                if (existing.source() or "").strip() == full_uri.strip():
-                    return existing.id(), ""
-            except Exception:
-                continue
         try:
-            from qgis.core import QgsVectorLayer
-
             layer = QgsVectorLayer(full_uri, name, provider)
         except Exception:
             layer = None
         if layer is not None and layer.isValid():
-            project.addMapLayer(layer)
-            return layer.id(), ""
+            return layer, ""
         return (
-            "",
-            f"Autocomplete layer '{name}' is not accessible - the connection could not "
+            None,
+            f"Lookup dataset '{name}' is not accessible - the connection could not "
             "be established (unreachable server, or missing credentials that were never "
             "included in the exported file). Reconnect it manually in Settings.",
         )
@@ -622,20 +737,10 @@ def _resolve_layer_from_description(info, plugin_dir: Optional[Path] = None) -> 
 
     if not candidates:
         return (
-            "",
-            f"Autocomplete layer '{name}' has no usable path recorded; please "
+            None,
+            f"Lookup dataset '{name}' has no usable path recorded; please "
             "configure it manually in Settings.",
         )
-
-    # 1. An already-loaded layer with the same source file wins outright.
-    for path in candidates:
-        for existing in project.mapLayers().values():
-            try:
-                existing_source = (existing.source() or "").partition("|")[0].strip()
-                if existing_source and Path(existing_source).resolve() == path:
-                    return existing.id(), ""
-            except Exception:
-                continue
 
     existing_paths = []
     for path in candidates:
@@ -648,25 +753,22 @@ def _resolve_layer_from_description(info, plugin_dir: Optional[Path] = None) -> 
     if not existing_paths:
         tried = ", ".join(str(p) for p in candidates)
         return (
-            "",
-            f"Autocomplete layer '{name}' could not be found (tried: {tried}). "
+            None,
+            f"Lookup dataset '{name}' could not be found (tried: {tried}). "
             "Reselect it manually in Settings.",
         )
 
     for path in existing_paths:
         try:
-            from qgis.core import QgsVectorLayer
-
             layer = QgsVectorLayer(str(path) + suffix, name, provider)
             if layer.isValid():
-                project.addMapLayer(layer)
-                return layer.id(), ""
+                return layer, ""
         except Exception:
             continue
 
     return (
-        "",
-        f"Autocomplete layer '{name}' exists at {existing_paths[0]} but is not "
+        None,
+        f"Lookup dataset '{name}' exists at {existing_paths[0]} but is not "
         "accessible - it could not be opened (check permissions or the file format). "
         "Reselect it manually in Settings.",
     )
@@ -733,9 +835,9 @@ class SettingsDialog(QDialog):
 
         self.chk_ac = QCheckBox("Enable custom autocomplete source", ac_group)
         self.chk_ac.setToolTip(
-            "Look up allowed values from a project layer and offer them with "
-            "Ctrl+Space (and automatically while typing) in an expression or "
-            "filter.\n\n"
+            "Look up allowed values from a lookup table/dataset and offer "
+            "them with Ctrl+Space (and automatically while typing) in an "
+            "expression or filter.\n\n"
             "This is entirely optional: fields, functions, variables and "
             "operators are always suggested regardless of this setting. "
             "Turning it on only adds a lookup table's own values and "
@@ -747,36 +849,47 @@ class SettingsDialog(QDialog):
         form = QFormLayout(self.config)
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
 
-        if QgsMapLayerComboBox is None or QgsFieldComboBox is None:
+        if QgsFieldComboBox is None:
             form.addRow(
                 QLabel(
                     "QGIS selector widgets are unavailable in this build; "
                     "custom autocomplete cannot be configured."
                 )
             )
-            self.cmb_layer = None
+            self.lbl_layer = None
+            self.layer_row = None
             self.field_combos = {}
         else:
-            self.cmb_layer = QgsMapLayerComboBox(self.config)
-            self._apply_vector_filter(self.cmb_layer)
-            self.cmb_layer.setAllowEmptyLayer(True)
-            self.cmb_layer.setToolTip(
-                "The project layer or table that defines what Ctrl+Space "
+            self.layer_row = QWidget(self.config)
+            layer_row_layout = QHBoxLayout(self.layer_row)
+            layer_row_layout.setContentsMargins(0, 0, 0, 0)
+            self.lbl_layer = QLabel("(none selected)", self.layer_row)
+            self.lbl_layer.setStyleSheet("color: gray;")
+            layer_row_layout.addWidget(self.lbl_layer, 1)
+            self.btn_browse_layer = QPushButton("Browse...", self.layer_row)
+            self.btn_browse_layer.clicked.connect(self._browse_layer)
+            layer_row_layout.addWidget(self.btn_browse_layer)
+            self.btn_clear_layer = QPushButton("Clear", self.layer_row)
+            self.btn_clear_layer.clicked.connect(self._clear_layer)
+            layer_row_layout.addWidget(self.btn_clear_layer)
+            self.layer_row.setToolTip(
+                "The lookup table/dataset that defines what Ctrl+Space "
                 "suggests. Each row describes one (field, value) pair - e.g. "
                 "a row with 'STATUS' / '1' / 'Active' makes the editor offer "
                 "1 (Active) when completing the STATUS field.\n\n"
-                "This is a normal vector layer, added to the project like any "
-                "other (e.g. a CSV or GeoPackage table with no geometry). "
-                "Leave it empty to suggest only the fields and values already "
-                "present in the layer being edited, with no lookup table at "
-                "all.\n\n"
+                "Picked from the QGIS Browser and read straight from its own "
+                "source - it is never added to this project's Layers panel "
+                "and never saved into the project file, so nothing extra "
+                "needs to travel with your project. Leave it unselected to "
+                "suggest only the fields and values already present in the "
+                "layer being edited, with no lookup table at all.\n\n"
                 "Use 'Export Settings' below to save this configuration - "
-                "including a portable reference to this layer's file - so it "
-                "can be shared with colleagues."
+                "including a portable reference to this dataset - so it can "
+                "be shared with colleagues."
             )
             heading = QLabel("<b>Required</b>", self.config)
             form.addRow(heading)
-            form.addRow("Lookup layer", self.cmb_layer)
+            form.addRow("Lookup dataset", self.layer_row)
 
             # (logical name, label, optional?)
             # Required first, then optional. Labels say "column" rather than
@@ -880,8 +993,6 @@ class SettingsDialog(QDialog):
                 "Read mode."
             )
 
-            self.cmb_layer.layerChanged.connect(self._on_layer_changed)
-
         self.cmb_mode = QComboBox(self.config)
         self.cmb_mode.addItem("Edit mode (show codes)", False)
         self.cmb_mode.addItem("Read mode (show descriptions)", True)
@@ -900,8 +1011,8 @@ class SettingsDialog(QDialog):
         # _mirror_label_tooltip), since hovering the parameter's NAME is
         # exactly as natural as hovering the control beside it.
         tooltip_widgets = [self.cmb_mode, self.chk_ac]
-        if self.cmb_layer is not None:
-            tooltip_widgets.append(self.cmb_layer)
+        if self.layer_row is not None:
+            tooltip_widgets.append(self.layer_row)
             tooltip_widgets.extend(self.field_combos.values())
         for widget in tooltip_widgets:
             widget.setAttribute(Qt.WidgetAttribute.WA_AlwaysShowToolTips, True)
@@ -987,6 +1098,13 @@ class SettingsDialog(QDialog):
         self.chk_ac.toggled.connect(self.config.setEnabled)
         self.chk_enabled.toggled.connect(ac_group.setEnabled)
 
+        #: The dataset picked via Browse... this dialog session - a standalone
+        #: QgsVectorLayer, never added to the project - and its portable
+        #: source description (see _describe_layer_source()). Not committed
+        #: to Settings until OK is pressed.
+        self._selected_layer = None
+        self._selected_source_info = None
+
         self._load()
 
         # Open at a height that comfortably fits the screen rather than the
@@ -1013,11 +1131,11 @@ class SettingsDialog(QDialog):
         - so clicking Export and then Cancelling this dialog still cancels,
         exactly as it always has.
         """
-        if self.cmb_layer is not None:
-            layer = self.cmb_layer.currentLayer()
+        if self.lbl_layer is not None:
+            layer_info = self._selected_source_info
             fields = {key: combo.currentField() for key, combo in self.field_combos.items()}
         else:
-            layer = Settings.autocomplete_layer()
+            layer_info = Settings.layer_source()
             fields = {key: Settings.field(key) for key in Settings.FIELD_KEYS}
         try:
             default_read_mode = bool(self.cmb_mode.currentData())
@@ -1031,7 +1149,7 @@ class SettingsDialog(QDialog):
             "default_read_mode": default_read_mode,
             "autocomplete_enabled": self.chk_ac.isChecked(),
             "autocomplete_fields": fields,
-            "autocomplete_layer": _describe_layer_source(layer) if layer is not None else None,
+            "autocomplete_layer": layer_info,
         }
 
     def _export_settings(self) -> None:
@@ -1316,25 +1434,123 @@ class SettingsDialog(QDialog):
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _apply_vector_filter(combo) -> None:
-        """Restrict the layer combo to vector layers across QGIS versions.
+    def _vector_layer_type_enum():
+        """The "vector" layer-type enum value, across QGIS versions.
 
-        The filter enum moved between QGIS releases, so try the modern location
+        The enum moved between QGIS releases, so try the modern location
         first and fall back rather than hard-failing.
         """
         try:
             from qgis.core import Qgis as _Qgis
 
-            combo.setFilters(_Qgis.LayerFilter.VectorLayer)
-            return
+            return _Qgis.LayerType.Vector
         except Exception:
             pass
         try:
-            from qgis.core import QgsMapLayerProxyModel
+            from qgis.core import QgsMapLayerType
 
-            combo.setFilters(QgsMapLayerProxyModel.Filter.VectorLayer)
+            return QgsMapLayerType.VectorLayer
         except Exception:
-            pass  # unfiltered is acceptable
+            return None
+
+    def _pick_layer_from_browser(self):
+        """Open the QGIS Browser to choose one dataset. Returns
+        ``(layer, source_info)`` - a standalone ``QgsVectorLayer``, never
+        added to the project, and its portable source description - or
+        ``(None, None)`` if cancelled or invalid.
+        """
+        try:
+            from qgis.gui import QgsDataSourceSelectDialog
+        except ImportError:
+            QMessageBox.warning(
+                self,
+                "Browse...",
+                "This QGIS build does not provide the Browser dataset picker.",
+            )
+            return None, None
+
+        layer_type = self._vector_layer_type_enum()
+        dlg = None
+        for attempt in (
+            lambda: QgsDataSourceSelectDialog(None, True, layer_type, self),
+            lambda: QgsDataSourceSelectDialog(None, True, layer_type),
+            lambda: QgsDataSourceSelectDialog(self),
+            lambda: QgsDataSourceSelectDialog(),
+        ):
+            try:
+                dlg = attempt()
+                break
+            except Exception:
+                continue
+        if dlg is None:
+            QMessageBox.warning(self, "Browse...", "Could not open the Browser dataset picker.")
+            return None, None
+
+        try:
+            dlg.setDescription(
+                "Select the lookup table (or any dataset) to use as the "
+                "autocomplete source. It is read directly from here - it "
+                "will not be added to your project."
+            )
+        except Exception:
+            pass
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None, None
+
+        picked = dlg.uri()
+        uri = getattr(picked, "uri", "") or ""
+        provider = getattr(picked, "providerKey", "") or "ogr"
+        name = getattr(picked, "name", "") or "lookup table"
+        if not uri:
+            QMessageBox.warning(self, "Browse...", "No usable dataset was selected.")
+            return None, None
+
+        try:
+            from qgis.core import QgsVectorLayer
+
+            layer = QgsVectorLayer(uri, name, provider)
+        except Exception as exc:
+            QMessageBox.warning(self, "Browse...", f"Could not open the selected dataset:\n{exc}")
+            return None, None
+
+        if not layer.isValid():
+            QMessageBox.warning(
+                self,
+                "Browse...",
+                f"'{name}' could not be opened as a table (invalid or unsupported source).",
+            )
+            return None, None
+
+        return layer, _describe_layer_source(layer)
+
+    def _browse_layer(self) -> None:
+        layer, info = self._pick_layer_from_browser()
+        if layer is None:
+            return
+        self._selected_layer = layer
+        self._selected_source_info = info
+        self._on_layer_changed(layer)
+        self._refresh_layer_label()
+
+    def _clear_layer(self) -> None:
+        self._selected_layer = None
+        self._selected_source_info = None
+        self._on_layer_changed(None)
+        self._refresh_layer_label()
+
+    def _refresh_layer_label(self) -> None:
+        if self._selected_layer is None:
+            self.lbl_layer.setText("(none selected)")
+            self.lbl_layer.setStyleSheet("color: gray;")
+            self.lbl_layer.setToolTip("")
+        else:
+            self.lbl_layer.setText(self._selected_layer.name() or "(unnamed)")
+            self.lbl_layer.setStyleSheet("")
+            try:
+                self.lbl_layer.setToolTip(self._selected_layer.source())
+            except Exception:
+                pass
 
     @staticmethod
     def _mirror_label_tooltip(form: QFormLayout, widget) -> None:
@@ -1378,13 +1594,15 @@ class SettingsDialog(QDialog):
             pass
         self.config.setEnabled(self.chk_ac.isChecked())
 
-        if self.cmb_layer is None:
+        if self.lbl_layer is None:
             return
 
         missing: List[str] = []
         layer = Settings.autocomplete_layer()
+        self._selected_layer = layer
+        self._selected_source_info = Settings.layer_source() if layer is not None else None
+        self._refresh_layer_label()
         if layer is not None:
-            self.cmb_layer.setLayer(layer)
             self._on_layer_changed(layer)
             try:
                 available = {f.name() for f in layer.fields()}
@@ -1397,10 +1615,10 @@ class SettingsDialog(QDialog):
                 if saved in available:
                     combo.setField(saved)
                 else:
-                    # Field was deleted from the layer since we saved it.
+                    # Field was deleted from the dataset since we saved it.
                     missing.append(f"{key} -> '{saved}'")
-        elif Settings.layer_id():
-            missing.append("the configured layer is no longer in this project")
+        elif Settings.has_layer_configured():
+            missing.append("the configured lookup dataset could not be loaded")
 
         if missing:
             self.lbl_warning.setText(
@@ -1419,10 +1637,9 @@ class SettingsDialog(QDialog):
 
     def _on_accept(self) -> None:
         """Validate, then persist and broadcast."""
-        if self.chk_ac.isChecked() and self.cmb_layer is not None:
-            layer = self.cmb_layer.currentLayer()
-            if layer is None:
-                self._complain("Select the layer that holds the autocomplete definitions.")
+        if self.chk_ac.isChecked() and self.lbl_layer is not None:
+            if self._selected_layer is None:
+                self._complain("Select the lookup table/dataset that holds the autocomplete definitions.")
                 return
             for key, label in (
                 ("field_names", "Field names column"),
@@ -1460,9 +1677,8 @@ class SettingsDialog(QDialog):
             Settings.set_default_read_mode(bool(self.cmb_mode.currentData()))
         except Exception:
             pass
-        if self.cmb_layer is None:
+        if self.lbl_layer is None:
             return
-        layer = self.cmb_layer.currentLayer()
-        Settings.set_layer_id(layer.id() if layer is not None else "")
+        Settings.set_layer_source(self._selected_source_info)
         for key, combo in self.field_combos.items():
             Settings.set_field(key, combo.currentField())

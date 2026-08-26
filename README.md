@@ -82,26 +82,27 @@ regardless of what the plugin folder itself is called.
 #### Sharing a pre-configured autocomplete source
 
 The Settings dialog's **Export Settings** / **Import Settings** buttons save
-and load the whole configuration - including the autocomplete lookup layer
-and its column mapping - as a JSON file. To hand a ready-made setup to
-colleagues:
+and load the whole configuration - including the autocomplete lookup dataset
+and its column mapping - as a JSON file. The lookup dataset itself is picked
+from the QGIS Browser and read directly from its own source: it is never
+added to the project's Layers panel and never saved into the project file.
+To hand a ready-made setup to colleagues:
 
-1. Configure the plugin normally, pointing the lookup layer at a data file
+1. Configure the plugin normally, pointing the lookup dataset at a data file
    copied *inside* the plugin's own install folder (e.g.
    `<plugin folder>/data/lookup.gpkg`).
-2. Click **Export Settings**. When the lookup layer's file lives inside that
+2. Click **Export Settings**. When the dataset's file lives inside that
    same folder, the exported file also records its path *relative* to it,
    not the absolute path on your own machine.
 3. Zip up the plugin folder, with the data file and the exported JSON file
    both included inside it.
 4. A colleague installs the zip, then opens **Settings** and clicks
    **Import Settings**, picking the JSON file bundled inside the plugin
-   folder. Its lookup layer is located and loaded automatically from the
-   relative path recorded in the file - reused if a matching layer is
-   already in the project, otherwise loaded fresh - wherever their profile
-   happens to install the plugin.
+   folder. Its lookup dataset is located and connected automatically from
+   the relative path recorded in the file, wherever their profile happens
+   to install the plugin.
 
-If the layer cannot be resolved, every other setting is still applied and
+If the dataset cannot be resolved, every other setting is still applied and
 the reason is reported clearly: **not found** (no file exists at the
 recorded path - it was not actually bundled, or ended up somewhere else) or
 **not accessible** (a file was found but could not be opened - permissions
@@ -110,7 +111,7 @@ because credentials are missing: usernames and passwords are deliberately
 never written into an exported file, so each colleague still needs their
 own valid login to that database).
 
-A lookup layer that lives outside the plugin folder (a database connection,
+A lookup dataset that lives outside the plugin folder (a database connection,
 or a file elsewhere on disk) is still exported for convenience, but only as
 an absolute path - portable only back to the same machine, not to a
 colleague's.
