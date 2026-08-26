@@ -12,7 +12,7 @@ about=QGIS's built-in editor (QScintilla) does not display right-to-left text co
     When a custom auto-complete source is configured, an optional Read Mode switch appears inside the editor. Read Mode shows the value descriptions instead of the stored codes, making a long expression far easier tounderstand, and never alters the expression itself. Where the same code has different meanings in different groups, Read Mode works out the right one automatically from the expression's own surrounding condition (e.g. "F_CODE" = 2300 AND "F_ATT" = 603), using an optional Group codes column - nothing about this is ever saved to the project. An optional second, alternative description per value adds a third switch position for a different wording of the same descriptions.
 
     The whole configuration, including the auto-complete source, can be exported to a file and imported again elsewhere - useful for sharing a ready-made setup with colleagues.
-version=1.7
+version=1.6
 author=Jossef Kanter
 email=jossefkan@gmail.com
 
