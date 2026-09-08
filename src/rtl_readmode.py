@@ -555,8 +555,8 @@ def force_ltr_paragraphs(text: str) -> str:
 
     Qt determines a QTextDocument paragraph's bidi base direction from its
     own first STRONG character (see RtlOverlayEditor's own comment on this -
-    it is exactly what lets a typed expression like ``"F_CODE" = 'בית כנסת'``
-    render correctly: the first strong character is the ``F`` of the field
+    it is exactly what lets a typed expression like ``"TYPE" = 'מבנה מגורים'``
+    render correctly: the first strong character is the ``T`` of the field
     name, so the paragraph resolves as left-to-right and the embedded Hebrew
     literal is simply an RTL "island" within it, in its correct place).
 
@@ -607,7 +607,7 @@ def _isolate(label: str) -> str:
     force_ltr_paragraphs() pins the overall PARAGRAPH direction, but that
     alone does not stop two adjacent RTL runs, separated only by a neutral
     character (a comma, a space, "="), from being treated as ONE combined
-    bidi run and reordered as a unit: in "מבנה דת, מבנה חקלאי", the comma
+    bidi run and reordered as a unit: in "מבנה מגורים, מבנה מסחרי", the comma
     between two Hebrew phrases resolves to the SAME direction as its
     neighbours, extending the RTL run across it - so the Unicode Bidi
     Algorithm can still visually swap the two phrases relative to each
@@ -659,11 +659,11 @@ def _advance_scope_stack(stack: List[list], text: str, start: int, end: int) -> 
     ``OR`` is crossed at that exact nesting depth. Critically, an ``OR``
     only ever touches ``stack[-1]`` - the CURRENT innermost scope - never an
     ancestor's: this is what makes
-    ``"F_CODE" = 2300 AND ("COUNTRY" = 1 OR "COUNTRY" = 2)`` still treat
-    both COUNTRY branches as governed by F_CODE (the OR is fully inside the
-    parenthesis, so it never touches the top-level run F_CODE sits in),
-    while ``"F_CODE" = 2300 OR "F_ATT" = 610`` does NOT treat 610 as
-    belonging to F_CODE's group (that OR IS at F_ATT's own top-level scope,
+    ``"TYPE" = 1000 AND ("COUNTRY" = 1 OR "COUNTRY" = 2)`` still treat
+    both COUNTRY branches as governed by TYPE (the OR is fully inside the
+    parenthesis, so it never touches the top-level run TYPE sits in),
+    while ``"TYPE" = 1000 OR "SUBTYPE" = 10`` does NOT treat 10 as
+    belonging to TYPE's group (that OR IS at SUBTYPE's own top-level scope,
     so it starts a new run there) - see ``_governing_values()``.
     """
     for structure_match in _STRUCTURE_RE.finditer(text, start, end):
@@ -725,14 +725,14 @@ def _governing_values(leaves: List[_ScopedLiteral], field: str, path: Tuple[Tupl
 
     A leaf at ``leaf.path`` can govern a literal at ``path`` exactly when
     ``leaf.path`` is a PREFIX of ``path`` - the SAME scope (flat AND
-    siblings, ``"F_CODE" = 2300 AND "F_ATT" = 603``) counts as a prefix of
-    itself, and a SHORTER, ANCESTOR scope (``"F_CODE" = 2300 AND (...
-    "F_ATT" = 603 ...)``) counts too. Each path element is itself a
+    siblings, ``"TYPE" = 1000 AND "SUBTYPE" = 10``) counts as a prefix of
+    itself, and a SHORTER, ANCESTOR scope (``"TYPE" = 1000 AND (...
+    "SUBTYPE" = 10 ...)``) counts too. Each path element is itself a
     ``(marker, run_index)`` pair (see ``_advance_scope_stack()``), so an
     intervening ``OR`` at either literal's own depth - which starts a new
     ``run_index`` there - breaks the prefix match and, with it, the
-    governing relationship: ``"F_CODE" = 2300 OR "F_ATT" = 603`` does NOT
-    let 2300 govern 603, even though both sit at the same nesting depth.
+    governing relationship: ``"TYPE" = 1000 OR "SUBTYPE" = 10`` does NOT
+    let 1000 govern 10, even though both sit at the same nesting depth.
     Comparisons on the SAME field are never governors of one another - a
     value only ever gets its group from a genuinely different field.
     """
@@ -755,8 +755,8 @@ def substitute_descriptions(
     """Replace value codes with descriptions, for display only.
 
     Each literal is attributed to the nearest **preceding** quoted field, which
-    is how the expression reads (``"F_ATT" IN ('610', '607')``). That is what
-    keeps ``"OTHER" = '610'`` untouched.
+    is how the expression reads (``"SUBTYPE" IN ('10', '11')``). That is what
+    keeps ``"OTHER" = '10'`` untouched.
 
     When a code has several meanings under the same field, its own
     surrounding context in THIS SAME expression decides which one,
@@ -841,7 +841,7 @@ def substitute_descriptions(
         # misleads when the description is numeric.
         #
         # Isolated (see _isolate()) so that two of these sitting next to each
-        # other - e.g. "2300, 2301" both becoming Hebrew descriptions inside
+        # other - e.g. "1000, 1001" both becoming Hebrew descriptions inside
         # an IN (...) list - never bidi-merge into one run and swap order
         # relative to each other, no matter how many of them there are.
         out.append(text[last_end:match.start()])
@@ -872,19 +872,19 @@ def _pick_label(
        only to head a suggestion-list group. If exactly one candidate's
        group_value also appears as some OTHER field's comparison value,
        anywhere in the SAME "AND scope" as this literal - either right
-       beside it (``"F_CODE" = 2300 AND "F_ATT" = 603``), or in an
+       beside it (``"TYPE" = 1000 AND "SUBTYPE" = 10``), or in an
        enclosing scope a parenthesised group of comparisons sits inside
-       (``"F_CODE" = 2300 AND (... "F_ATT" = 603 ...)``) - that candidate
+       (``"TYPE" = 1000 AND (... "SUBTYPE" = 10 ...)``) - that candidate
        is the one meant. See ``_governing_values()``.
     2. **Show every meaning**, joined by ``/``, whenever rule 1 finds no
        match, or more than one - never guess between two equally
        plausible readings.
 
-    A bare ``OR`` breaks rule 1's "same AND scope": ``"F_CODE" = 2300 OR
-    "F_ATT" = 603`` does NOT let 2300 govern 603, since an OR - not an AND -
-    joins them; ``"F_CODE" = 2300 AND ("COUNTRY" = 1 OR "COUNTRY" = 2)``
-    still lets 2300 govern both COUNTRY branches, since that OR sits fully
-    inside its own parenthesis, never touching the scope F_CODE itself sits
+    A bare ``OR`` breaks rule 1's "same AND scope": ``"TYPE" = 1000 OR
+    "SUBTYPE" = 10`` does NOT let 1000 govern 10, since an OR - not an AND -
+    joins them; ``"TYPE" = 1000 AND ("COUNTRY" = 1 OR "COUNTRY" = 2)``
+    still lets 1000 govern both COUNTRY branches, since that OR sits fully
+    inside its own parenthesis, never touching the scope TYPE itself sits
     in - see ``_advance_scope_stack()`` for exactly how that is tracked.
     This deliberately does not track a negated (``!=``) comparison at all -
     an accepted simplification: anything genuinely ambiguous - two
@@ -926,7 +926,7 @@ def _pick_label(
     # meant - show every meaning instead of guessing.
     #
     # Each candidate isolated individually (see _isolate()) before joining -
-    # otherwise two adjacent RTL meanings ("mosque / greenhouse" in Hebrew)
+    # otherwise two adjacent RTL meanings ("residential / commercial" in Hebrew)
     # could bidi-merge across the " / " separator and swap order, the same
     # problem a comma-separated IN (...) list has.
     descriptions = list(dict.fromkeys(description for description, _group in candidates))
