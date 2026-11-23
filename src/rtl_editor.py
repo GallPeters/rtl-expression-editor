@@ -47,7 +47,7 @@ Architecture
                             synchronisation, completion.
 ``BidiSyntaxHighlighter`` - QSyntaxHighlighter replicating QScintilla's colours.
 
-Author: Your Name
+Author: Jossef Kanter
 License: GPL-2.0-or-later
 """
 
@@ -209,9 +209,10 @@ LET_THEME_STYLE_OVERLAY = False
 OVERLAY_BACKGROUND = ""
 OVERLAY_FOREGROUND = ""
 
-#: Verbose logging.  Leave on until the plugin is confirmed working on your
-#: build; it makes every detection decision visible in the Log Messages panel.
-DEBUG = True
+#: Verbose logging of every detection decision to the Log Messages panel.
+#: Off by default: writing to the message log can raise the Log dock, which
+#: pulls keyboard focus off a modal dialog (see rtl_autocomplete.DEBUG_AC).
+DEBUG = False
 
 ENABLE_HIGHLIGHTING = True
 
@@ -1345,10 +1346,26 @@ class RtlOverlayEditor(QPlainTextEdit):
             # Keep the caret clearly visible against either background.
             self.setCursorWidth(2)
 
-            self.setReadOnly(bool(self._sci.isReadOnly()))
-            self.setEnabled(self._sci.isEnabled())
+            self._sync_read_only()
         except Exception as exc:
             _log(f"Could not fully mirror editor appearance: {exc}", Qgis.MessageLevel.Info)
+
+    def _sync_read_only(self) -> None:
+        """Mirror the covered editor's enabled/read-only state.
+
+        While read mode shows descriptions the overlay must stay read-only
+        whatever the covered editor says - otherwise typing into the preview
+        would push description text into the real expression.
+        """
+        try:
+            self.setEnabled(self._sci.isEnabled())
+            read_mode = getattr(self, "_read_mode", None)
+            if read_mode is not None and getattr(read_mode, "_active", False):
+                self.setReadOnly(True)
+            else:
+                self.setReadOnly(bool(self._sci.isReadOnly()))
+        except Exception:
+            pass
 
     def _install_highlighter(self) -> None:
         if not ENABLE_HIGHLIGHTING:
@@ -1655,11 +1672,7 @@ class RtlOverlayEditor(QPlainTextEdit):
             ):
                 self._sync_geometry()
             elif event_type == QEvent.Type.EnabledChange:
-                try:
-                    self.setEnabled(self._sci.isEnabled())
-                    self.setReadOnly(bool(self._sci.isReadOnly()))
-                except Exception:
-                    pass
+                self._sync_read_only()
             elif event_type in (
                 QEvent.Type.PaletteChange,
                 QEvent.Type.StyleChange,
@@ -1763,6 +1776,7 @@ class CodeEditorWatcher(QObject):
         super().__init__(parent)
         self._overlays: Dict[int, RtlOverlayEditor] = {}
         self._focus_connected = False
+        self._installed = False
         #: ids of widgets already reported as skipped, to keep the log readable
         self._reported: set = set()
 
@@ -1792,12 +1806,17 @@ class CodeEditorWatcher(QObject):
         if Settings is not None and not Settings.plugin_enabled():
             _log("RTL Expression Editor is disabled in settings.", Qgis.MessageLevel.Info)
             return
-        app.installEventFilter(self)
-        try:
-            app.focusChanged.connect(self._on_focus_changed)
-            self._focus_connected = True
-        except Exception as exc:
-            _log(f"focusChanged hook unavailable: {exc}", Qgis.MessageLevel.Info)
+        # Idempotent: every settings change calls install() again, which must
+        # not stack up duplicate focusChanged connections.
+        if not self._installed:
+            app.installEventFilter(self)
+            self._installed = True
+        if not self._focus_connected:
+            try:
+                app.focusChanged.connect(self._on_focus_changed)
+                self._focus_connected = True
+            except Exception as exc:
+                _log(f"focusChanged hook unavailable: {exc}", Qgis.MessageLevel.Info)
         self.scan_existing()
 
     def uninstall(self) -> None:
@@ -1807,6 +1826,7 @@ class CodeEditorWatcher(QObject):
                 app.removeEventFilter(self)
             except Exception:
                 pass
+            self._installed = False
             if self._focus_connected:
                 try:
                     app.focusChanged.disconnect(self._on_focus_changed)
@@ -2040,12 +2060,11 @@ class CodeEditorWatcher(QObject):
 
         self._overlays[key] = overlay
         names = self._meta_class_names(sci)
-        _log(
+        _dbg(
             f"overlay attached: cpp={names[0] if names else '?'} "
             f"objectName={sci.objectName()!r} "
             f"window={self._meta_class_names(sci.window())[:1]} "
-            f"size={sci.width()}x{sci.height()}",
-            Qgis.MessageLevel.Success,
+            f"size={sci.width()}x{sci.height()}"
         )
 
         # At QEvent.Show the parent's final layout geometry is not always
@@ -2064,7 +2083,7 @@ class CodeEditorWatcher(QObject):
 # Exposed so the plugin can be inspected and re-triggered from the QGIS Python
 # Console without restarting QGIS:
 #
-#     from rtl_bidi_editor import rtl_editor as m
+#     from rtl_expression_editor import rtl_editor as m
 #     m.rescan()
 # --------------------------------------------------------------------------- #
 
@@ -2138,10 +2157,21 @@ class RtlBidiEditorPlugin:
     def open_settings(self) -> None:
         if SettingsDialog is None:
             return
+        dialog = None
         try:
-            SettingsDialog(self.iface.mainWindow()).exec()
+            dialog = SettingsDialog(self.iface.mainWindow())
+            dialog.exec()
         except Exception as exc:
             _log(f"Settings dialog failed: {exc}", Qgis.MessageLevel.Warning)
+        finally:
+            # Parented to the main window, so it would otherwise live (and
+            # keep its lookup dataset open, locking the file on Windows)
+            # until QGIS exits.
+            if dialog is not None:
+                try:
+                    dialog.deleteLater()
+                except Exception:
+                    pass
 
     def apply_settings(self) -> None:
         """React to the master switch being toggled, without a restart.
@@ -2195,11 +2225,19 @@ class RtlBidiEditorPlugin:
             except Exception:
                 pass
         self._remove_menu()
-        if self._watcher is None:
-            return
-        try:
-            self._watcher.uninstall()
-        except Exception as exc:
-            _log(f"Unload error: {exc}", Qgis.MessageLevel.Warning)
-        finally:
-            self._watcher = None
+        if self._watcher is not None:
+            try:
+                self._watcher.uninstall()
+            except Exception as exc:
+                _log(f"Unload error: {exc}", Qgis.MessageLevel.Warning)
+            finally:
+                self._watcher = None
+        # Release module-level caches and signal connections, so a plugin
+        # reload leaves nothing behind - in particular no open handle on the
+        # lookup dataset.
+        for module_name in ("rtl_autocomplete", "rtl_readmode", "rtl_settings"):
+            try:
+                module = __import__(f"{__package__}.{module_name}", fromlist=["cleanup"])
+                module.cleanup()
+            except Exception:
+                pass

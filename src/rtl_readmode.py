@@ -516,6 +516,28 @@ _SCAN_RE = re.compile(
 _STRUCTURE_RE = re.compile(r"\(|\)|\bOR\b", re.IGNORECASE)
 
 
+#: Text between two literals that ends a field's "FIELD = value" context:
+#: a logical keyword, or a function call opening (any word directly followed
+#: by "(", except IN). After one of these, a literal no longer belongs to the
+#: field named before it - e.g. the 2 in ``"TYPE" = 1 AND round($area, 2)``.
+_CONTEXT_BREAK_RE = re.compile(
+    r"\b(?:AND|OR|THEN|ELSE|WHEN|END)\b|(?<![\w$])(?!IN\b)[A-Za-z_$][\w$]*\s*\(",
+    re.IGNORECASE,
+)
+_BETWEEN_TAIL_RE = re.compile(r"\bBETWEEN\s*$", re.IGNORECASE)
+_AND_ONLY_RE = re.compile(r"\s*AND\s*", re.IGNORECASE)
+
+
+def _breaks_field_context(gap: str, previous_gap: str) -> bool:
+    """Whether ``gap`` (text between two scanned tokens) ends the current
+    field's context. ``BETWEEN 1 AND 5`` is the one AND that does not."""
+    if not _CONTEXT_BREAK_RE.search(gap):
+        return False
+    if _AND_ONLY_RE.fullmatch(gap) and _BETWEEN_TAIL_RE.search(previous_gap):
+        return False
+    return True
+
+
 def normalize_code(text: str) -> str:
     """Strip one layer of matching outer quotes from a code value.
 
@@ -698,8 +720,13 @@ def _scan_literals_with_scope(text: str) -> List[_ScopedLiteral]:
     stack: List[list] = [[-1, 0]]
     current_field = ""
     scan_pos = 0
+    previous_gap = ""
     for match in _SCAN_RE.finditer(text):
         _advance_scope_stack(stack, text, scan_pos, match.start())
+        gap = text[scan_pos:match.start()]
+        if _breaks_field_context(gap, previous_gap):
+            current_field = ""
+        previous_gap = gap
         scan_pos = match.end()
 
         field = match.group("field")
@@ -785,6 +812,7 @@ def substitute_descriptions(
     current_field = ""
     stack: List[list] = [[-1, 0]]
     scan_pos = 0
+    previous_gap = ""
 
     for match in _SCAN_RE.finditer(text):
         # Tracks scope (paren nesting + AND-run, see _advance_scope_stack())
@@ -794,6 +822,10 @@ def substitute_descriptions(
         # must still advance scan_pos, or the next match's gap-scan would
         # re-process the same text twice.
         _advance_scope_stack(stack, text, scan_pos, match.start())
+        gap = text[scan_pos:match.start()]
+        if _breaks_field_context(gap, previous_gap):
+            current_field = ""
+        previous_gap = gap
         scan_pos = match.end()
 
         field = match.group("field")
@@ -957,10 +989,29 @@ class ReadModeController(QObject):
         self._switch: Optional[SlideSwitch] = None
         self._original: Optional[str] = None
         self._active = False
+        self._alt = False
         self._was_read_only = False
 
         if not self._feature_available():
             return
+
+        # Fresh descriptions for every newly opened dialog: the lookup
+        # dataset is the plugin's own standalone copy, so edits made to the
+        # same table elsewhere (e.g. as a project layer) emit no signal here.
+        DescriptionResolver.invalidate()
+
+        # QGIS can change the expression while read mode is showing (a
+        # double-clicked field or function in the Expression Builder lands
+        # in the covered editor, and the overlay then shows plain codes).
+        # Re-render the preview from the new text so the switch keeps
+        # telling the truth. Connected after the overlay's own sync slot, so
+        # it runs after it.
+        self._sci = getattr(editor, "_sci", None)
+        try:
+            if self._sci is not None:
+                self._sci.textChanged.connect(self._on_sci_text_changed)
+        except Exception:
+            self._sci = None
 
         try:
             self._switch = SlideSwitch(editor, mode_count=self._mode_count())
@@ -988,10 +1039,34 @@ class ReadModeController(QObject):
             if Settings.default_read_mode():
                 from qgis.PyQt.QtCore import QTimer
 
-                QTimer.singleShot(0, lambda: self._switch and self._switch.setMode(1))
+                QTimer.singleShot(0, self._apply_default_mode)
         except Exception as exc:
             _log(f"Read mode unavailable: {exc}", Qgis.MessageLevel.Warning)
             self._switch = None
+
+    def _apply_default_mode(self) -> None:
+        """Switch to read mode once the dialog has settled (if still open)."""
+        try:
+            if self._switch is not None and self._editor is not None:
+                self._switch.setMode(1)
+        except RuntimeError:
+            pass  # the dialog closed before the deferred call ran
+
+    def _on_sci_text_changed(self) -> None:
+        """Re-render the preview when QGIS changed the expression meanwhile."""
+        if not self._active or self._editor is None:
+            return
+        was_read_only = self._was_read_only
+        try:
+            self._original = None
+            self._active = False
+            self._enter_read_mode(alt=self._alt)
+        except Exception as exc:
+            _log(f"Read mode refresh failed: {exc}", Qgis.MessageLevel.Warning)
+        finally:
+            # Re-entering captured the preview's own read-only state; the
+            # state to restore on leaving is still the one from before.
+            self._was_read_only = was_read_only
 
     # -- availability ------------------------------------------------------ #
 
@@ -1075,7 +1150,16 @@ class ReadModeController(QObject):
         triggered.
         """
         editor = self._editor
+        document = editor.document()
         blocked = editor.blockSignals(True)
+        # Undo recording is switched off for the swap. Otherwise both the
+        # swap into the preview and the restore back to codes land on the
+        # undo stack, and Ctrl+Z after leaving read mode would bring the
+        # description text back - this time with signals live, pushing it
+        # into the real expression. (Disabling also clears the history,
+        # which is the price of never letting the preview be undone into.)
+        undo_was_enabled = document.isUndoRedoEnabled()
+        document.setUndoRedoEnabled(False)
         try:
             cursor = editor.textCursor()
             position = cursor.position()
@@ -1086,6 +1170,7 @@ class ReadModeController(QObject):
             cursor.setPosition(min(position, len(text)))
             editor.setTextCursor(cursor)
         finally:
+            document.setUndoRedoEnabled(undo_was_enabled)
             editor.blockSignals(blocked)
 
     def _enter_read_mode(self, alt: bool = False) -> None:
@@ -1128,6 +1213,7 @@ class ReadModeController(QObject):
         preview = force_ltr_paragraphs(preview)
 
         self._active = True
+        self._alt = alt
         self._set_text_silently(preview)
         editor.setReadOnly(True)
 
@@ -1163,6 +1249,12 @@ class ReadModeController(QObject):
         except Exception:
             pass
         try:
+            if getattr(self, "_sci", None) is not None:
+                self._sci.textChanged.disconnect(self._on_sci_text_changed)
+        except Exception:
+            pass
+        self._sci = None
+        try:
             if self._editor is not None:
                 self._editor.removeEventFilter(self)
                 self._reserve_strip(False)
@@ -1178,3 +1270,44 @@ class ReadModeController(QObject):
                 pass
             self._switch = None
         self._editor = None
+
+
+def cleanup() -> None:
+    """Drop the mapping cache and every signal connection (plugin unload).
+
+    QgsProject and the settings bus outlive the plugin module, so without
+    this a reload would leave the old module's resolver - and its handle on
+    the lookup dataset - connected and alive.
+    """
+    resolver = DescriptionResolver
+    resolver._cache.clear()
+    try:
+        BUS.changed.disconnect(resolver.invalidate)
+    except Exception:
+        pass
+    try:
+        from qgis.core import QgsProject
+
+        project = QgsProject.instance()
+        for signal_name in ("cleared", "readProject"):
+            try:
+                getattr(project, signal_name).disconnect(resolver.invalidate)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    if resolver._watched_layer is not None:
+        for signal_name in (
+            "dataChanged",
+            "featureAdded",
+            "featuresDeleted",
+            "attributeValueChanged",
+            "willBeDeleted",
+        ):
+            try:
+                getattr(resolver._watched_layer, signal_name).disconnect(resolver._on_layer_touched)
+            except Exception:
+                pass
+    resolver._watched_layer = None
+    resolver._watched_layer_id = ""
+    resolver._hooked = False

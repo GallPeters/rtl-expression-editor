@@ -24,7 +24,7 @@ class NormalizeCodeTests(unittest.TestCase):
     def test_strips_one_matching_pair_of_quotes(self):
         self.assertEqual(rm.normalize_code("'farm'"), "farm")
         self.assertEqual(rm.normalize_code('"farm"'), "farm")
-        self.assertEqual(rm.normalize_code(" '610' "), "610")
+        self.assertEqual(rm.normalize_code(" '5' "), "5")
 
     def test_leaves_an_unquoted_or_mismatched_value_untouched(self):
         self.assertEqual(rm.normalize_code("farm"), "farm")
@@ -41,17 +41,17 @@ class SubstituteDescriptionsTests(unittest.TestCase):
         )
 
     def test_leaves_unmapped_text_untouched(self):
-        expr = "\"OTHER\" = '610'"
+        expr = "\"OTHER\" = '5'"
         self.assertEqual(rm.substitute_descriptions(expr, {}), expr)
 
     def test_only_the_field_the_literal_follows_is_substituted(self):
-        # "OTHER" = '610' must stay untouched even though "F_ATT" also has a
-        # meaning for 610 elsewhere in the same expression.
-        mapping = {"f_att": {"610": [("mosque", "")]}}
-        expr = "\"OTHER\" = '610' AND \"F_ATT\" = '610'"
+        # "OTHER" = '5' must stay untouched even though "SUBTYPE" also has a
+        # meaning for 5 elsewhere in the same expression.
+        mapping = {"subtype": {"5": [("school", "")]}}
+        expr = "\"OTHER\" = '5' AND \"SUBTYPE\" = '5'"
         self.assertEqual(
             rm.substitute_descriptions(expr, mapping),
-            f"\"OTHER\" = '610' AND \"F_ATT\" = {iso('mosque')}",
+            f"\"OTHER\" = '5' AND \"SUBTYPE\" = {iso('school')}",
         )
 
     def test_an_ambiguous_code_shows_every_meaning_until_resolved(self):
@@ -60,9 +60,9 @@ class SubstituteDescriptionsTests(unittest.TestCase):
         # again on top - a harmless, valid nested isolate, not a double
         # substitution - see _isolate(). Neither candidate has a group
         # value here, so there is nothing to resolve it from.
-        mapping = {"code": {"610": [("mosque", ""), ("greenhouse", "")]}}
-        expr = "\"CODE\" = '610'"
-        joined = f'{iso("mosque")} / {iso("greenhouse")}'
+        mapping = {"code": {"5": [("school", ""), ("warehouse", "")]}}
+        expr = "\"CODE\" = '5'"
+        joined = f'{iso("school")} / {iso("warehouse")}'
         self.assertEqual(
             rm.substitute_descriptions(expr, mapping),
             f'"CODE" = {iso(joined)}',
@@ -111,56 +111,56 @@ class GroupContextScanningTests(unittest.TestCase):
     PREFIX of the other's - see _governing_values()'s own docstring."""
 
     def test_flat_and_siblings_share_the_same_scope_path(self):
-        leaves = rm._scan_literals_with_scope('"F_CODE" = 2300 AND "F_ATT" = 610')
+        leaves = rm._scan_literals_with_scope('"TYPE" = 20 AND "SUBTYPE" = 5')
         by_field = {leaf.field: leaf for leaf in leaves}
-        self.assertEqual(by_field["f_code"].path, by_field["f_att"].path)
+        self.assertEqual(by_field["type"].path, by_field["subtype"].path)
 
     def test_a_literal_inside_parens_gets_a_deeper_path_than_one_outside(self):
-        leaves = rm._scan_literals_with_scope('"F_CODE" = 2300 AND ("F_ATT" = 610)')
+        leaves = rm._scan_literals_with_scope('"TYPE" = 20 AND ("SUBTYPE" = 5)')
         by_field = {leaf.field: leaf for leaf in leaves}
-        self.assertLess(len(by_field["f_code"].path), len(by_field["f_att"].path))
+        self.assertLess(len(by_field["type"].path), len(by_field["subtype"].path))
 
     def test_a_bare_or_starts_a_fresh_run_at_its_own_scope_only(self):
         """The path element for the CURRENT scope changes across an OR -
         but an ancestor's does not, since the OR sits deeper than it."""
-        leaves = rm._scan_literals_with_scope('"F_CODE" = 2300 OR "F_ATT" = 610')
+        leaves = rm._scan_literals_with_scope('"TYPE" = 20 OR "SUBTYPE" = 5')
         by_field = {leaf.field: leaf for leaf in leaves}
-        self.assertNotEqual(by_field["f_code"].path, by_field["f_att"].path)
+        self.assertNotEqual(by_field["type"].path, by_field["subtype"].path)
 
         leaves = rm._scan_literals_with_scope(
-            '"F_CODE" = 2300 AND ("COUNTRY" = 1 OR "COUNTRY" = 2)'
+            '"TYPE" = 20 AND ("COUNTRY" = 1 OR "COUNTRY" = 2)'
         )
-        f_code = next(leaf for leaf in leaves if leaf.field == "f_code")
+        type = next(leaf for leaf in leaves if leaf.field == "type")
         countries = [leaf for leaf in leaves if leaf.field == "country"]
         self.assertEqual(len(countries), 2)
         for country in countries:
-            # Both COUNTRY branches still nest under F_CODE's own scope -
+            # Both COUNTRY branches still nest under TYPE's own scope -
             # the OR that tells them apart is fully inside their shared
-            # parenthesis, one level deeper than where F_CODE itself sits.
-            self.assertEqual(country.path[: len(f_code.path)], f_code.path)
+            # parenthesis, one level deeper than where TYPE itself sits.
+            self.assertEqual(country.path[: len(type.path)], type.path)
 
     def test_governing_values_includes_a_same_scope_sibling(self):
-        leaves = rm._scan_literals_with_scope('"F_CODE" = 2300 AND "F_ATT" = 610')
-        f_att = next(leaf for leaf in leaves if leaf.field == "f_att")
-        governing = rm._governing_values(leaves, "f_att", f_att.path)
-        self.assertIn("2300", governing)
+        leaves = rm._scan_literals_with_scope('"TYPE" = 20 AND "SUBTYPE" = 5')
+        subtype = next(leaf for leaf in leaves if leaf.field == "subtype")
+        governing = rm._governing_values(leaves, "subtype", subtype.path)
+        self.assertIn("20", governing)
 
     def test_governing_values_includes_an_enclosing_scopes_comparison(self):
-        leaves = rm._scan_literals_with_scope('"F_CODE" = 2300 AND ("F_ATT" = 610)')
-        f_att = next(leaf for leaf in leaves if leaf.field == "f_att")
-        governing = rm._governing_values(leaves, "f_att", f_att.path)
-        self.assertIn("2300", governing)
+        leaves = rm._scan_literals_with_scope('"TYPE" = 20 AND ("SUBTYPE" = 5)')
+        subtype = next(leaf for leaf in leaves if leaf.field == "subtype")
+        governing = rm._governing_values(leaves, "subtype", subtype.path)
+        self.assertIn("20", governing)
 
     def test_governing_values_reach_through_multiple_nested_levels(self):
-        leaves = rm._scan_literals_with_scope('"F_CODE" = 2300 AND (("F_ATT" = 610))')
-        target = next(leaf for leaf in leaves if leaf.field == "f_att")
-        governing = rm._governing_values(leaves, "f_att", target.path)
-        self.assertIn("2300", governing)
+        leaves = rm._scan_literals_with_scope('"TYPE" = 20 AND (("SUBTYPE" = 5))')
+        target = next(leaf for leaf in leaves if leaf.field == "subtype")
+        governing = rm._governing_values(leaves, "subtype", target.path)
+        self.assertIn("20", governing)
 
     def test_governing_values_never_includes_a_same_field_comparison(self):
-        leaves = rm._scan_literals_with_scope('"F_ATT" = 611 AND "F_ATT" = 610')
+        leaves = rm._scan_literals_with_scope('"SUBTYPE" = 611 AND "SUBTYPE" = 5')
         target = leaves[-1]
-        governing = rm._governing_values(leaves, "f_att", target.path)
+        governing = rm._governing_values(leaves, "subtype", target.path)
         self.assertNotIn("611", governing)
 
     def test_sibling_parenthesised_groups_never_govern_each_other(self):
@@ -169,43 +169,43 @@ class GroupContextScanningTests(unittest.TestCase):
         even with no explicit tracking of AND vs. OR: they simply never
         share a scope path at all."""
         leaves = rm._scan_literals_with_scope(
-            '("F_CODE" = 2300 AND "F_ATT" = 610) OR ("F_CODE" = 1400 AND "F_ATT" = 611)'
+            '("TYPE" = 20 AND "SUBTYPE" = 5) OR ("TYPE" = 30 AND "SUBTYPE" = 611)'
         )
-        first_att = next(leaf for leaf in leaves if leaf.field == "f_att" and leaf.code == "610")
-        governing = rm._governing_values(leaves, "f_att", first_att.path)
-        self.assertIn("2300", governing)
-        self.assertNotIn("1400", governing)
+        first_att = next(leaf for leaf in leaves if leaf.field == "subtype" and leaf.code == "5")
+        governing = rm._governing_values(leaves, "subtype", first_att.path)
+        self.assertIn("20", governing)
+        self.assertNotIn("30", governing)
 
     def test_a_bare_or_at_the_same_scope_breaks_governance(self):
         """An OR - not an AND - joins the two comparisons, so the first can
         no longer supply the second's group."""
-        leaves = rm._scan_literals_with_scope('"F_CODE" = 2300 OR "F_ATT" = 610')
-        f_att = next(leaf for leaf in leaves if leaf.field == "f_att")
-        governing = rm._governing_values(leaves, "f_att", f_att.path)
-        self.assertNotIn("2300", governing)
+        leaves = rm._scan_literals_with_scope('"TYPE" = 20 OR "SUBTYPE" = 5')
+        subtype = next(leaf for leaf in leaves if leaf.field == "subtype")
+        governing = rm._governing_values(leaves, "subtype", subtype.path)
+        self.assertNotIn("20", governing)
 
     def test_an_or_fully_inside_an_enclosing_parenthesis_does_not_break_it(self):
-        """The OR sits one level deeper than F_CODE itself - inside the
-        parenthesis - so it never touches the scope F_CODE governs."""
+        """The OR sits one level deeper than TYPE itself - inside the
+        parenthesis - so it never touches the scope TYPE governs."""
         leaves = rm._scan_literals_with_scope(
-            '"F_CODE" = 2300 AND ("COUNTRY" = 1 OR "COUNTRY" = 2)'
+            '"TYPE" = 20 AND ("COUNTRY" = 1 OR "COUNTRY" = 2)'
         )
         for code in ("1", "2"):
             country = next(leaf for leaf in leaves if leaf.field == "country" and leaf.code == code)
             governing = rm._governing_values(leaves, "country", country.path)
-            self.assertIn("2300", governing)
+            self.assertIn("20", governing)
 
     def test_two_or_separated_and_runs_never_govern_each_other(self):
-        """"F_CODE = 2300 AND F_ATT = 610 OR F_CODE = 2301 AND F_ATT = 611" -
+        """"TYPE = 20 AND SUBTYPE = 5 OR TYPE = 21 AND SUBTYPE = 611" -
         no parentheses at all, just a top-level OR splitting two flat AND
-        runs - each F_ATT still only sees its OWN run's F_CODE."""
+        runs - each SUBTYPE still only sees its OWN run's TYPE."""
         leaves = rm._scan_literals_with_scope(
-            '"F_CODE" = 2300 AND "F_ATT" = 610 OR "F_CODE" = 2301 AND "F_ATT" = 611'
+            '"TYPE" = 20 AND "SUBTYPE" = 5 OR "TYPE" = 21 AND "SUBTYPE" = 611'
         )
-        first = next(leaf for leaf in leaves if leaf.field == "f_att" and leaf.code == "610")
-        second = next(leaf for leaf in leaves if leaf.field == "f_att" and leaf.code == "611")
-        self.assertEqual(rm._governing_values(leaves, "f_att", first.path), {"2300"})
-        self.assertEqual(rm._governing_values(leaves, "f_att", second.path), {"2301"})
+        first = next(leaf for leaf in leaves if leaf.field == "subtype" and leaf.code == "5")
+        second = next(leaf for leaf in leaves if leaf.field == "subtype" and leaf.code == "611")
+        self.assertEqual(rm._governing_values(leaves, "subtype", first.path), {"20"})
+        self.assertEqual(rm._governing_values(leaves, "subtype", second.path), {"21"})
 
 
 class PickLabelGroupResolutionTests(unittest.TestCase):
@@ -220,64 +220,64 @@ class PickLabelGroupResolutionTests(unittest.TestCase):
         self.assertEqual(label, "Active")
 
     def test_resolves_via_a_flat_and_sibling_comparison(self):
-        text = '"F_CODE" = 2300 AND "F_ATT" = 610'
+        text = '"TYPE" = 20 AND "SUBTYPE" = 5'
         leaves = rm._scan_literals_with_scope(text)
-        target = next(leaf for leaf in leaves if leaf.field == "f_att")
-        candidates = [("mosque", "2300"), ("greenhouse", "1400")]
-        label = rm._pick_label(candidates, "f_att", target.path, leaves)
-        self.assertEqual(label, "mosque")
+        target = next(leaf for leaf in leaves if leaf.field == "subtype")
+        candidates = [("school", "20"), ("warehouse", "30")]
+        label = rm._pick_label(candidates, "subtype", target.path, leaves)
+        self.assertEqual(label, "school")
 
     def test_resolves_regardless_of_which_side_of_the_and_the_group_is_on(self):
-        text = '"F_ATT" = 610 AND "F_CODE" = 2300'
+        text = '"SUBTYPE" = 5 AND "TYPE" = 20'
         leaves = rm._scan_literals_with_scope(text)
-        target = next(leaf for leaf in leaves if leaf.field == "f_att")
-        candidates = [("mosque", "2300"), ("greenhouse", "1400")]
-        label = rm._pick_label(candidates, "f_att", target.path, leaves)
-        self.assertEqual(label, "mosque")
+        target = next(leaf for leaf in leaves if leaf.field == "subtype")
+        candidates = [("school", "20"), ("warehouse", "30")]
+        label = rm._pick_label(candidates, "subtype", target.path, leaves)
+        self.assertEqual(label, "school")
 
     def test_resolves_via_an_enclosing_parenthesised_groups_comparison(self):
-        text = '"F_CODE" = 2300 AND ("F_ATT" = 610)'
+        text = '"TYPE" = 20 AND ("SUBTYPE" = 5)'
         leaves = rm._scan_literals_with_scope(text)
-        target = next(leaf for leaf in leaves if leaf.field == "f_att")
-        candidates = [("mosque", "2300"), ("greenhouse", "1400")]
-        label = rm._pick_label(candidates, "f_att", target.path, leaves)
-        self.assertEqual(label, "mosque")
+        target = next(leaf for leaf in leaves if leaf.field == "subtype")
+        candidates = [("school", "20"), ("warehouse", "30")]
+        label = rm._pick_label(candidates, "subtype", target.path, leaves)
+        self.assertEqual(label, "school")
 
     def test_falls_back_to_every_meaning_when_no_group_matches(self):
-        text = '"F_ATT" = 610'
+        text = '"SUBTYPE" = 5'
         leaves = rm._scan_literals_with_scope(text)
         target = leaves[0]
-        candidates = [("mosque", "2300"), ("greenhouse", "1400")]
-        label = rm._pick_label(candidates, "f_att", target.path, leaves)
-        self.assertEqual(label, f'{iso("mosque")} / {iso("greenhouse")}')
+        candidates = [("school", "20"), ("warehouse", "30")]
+        label = rm._pick_label(candidates, "subtype", target.path, leaves)
+        self.assertEqual(label, f'{iso("school")} / {iso("warehouse")}')
 
     def test_falls_back_to_every_meaning_when_more_than_one_group_matches(self):
         """Genuinely ambiguous - both candidates' groups happen to be
         present in the surrounding context - never guess between them."""
-        text = '"F_CODE" = 2300 AND "OTHER_CODE" = 1400 AND "F_ATT" = 610'
+        text = '"TYPE" = 20 AND "OTHER_CODE" = 30 AND "SUBTYPE" = 5'
         leaves = rm._scan_literals_with_scope(text)
-        target = next(leaf for leaf in leaves if leaf.field == "f_att")
-        candidates = [("mosque", "2300"), ("greenhouse", "1400")]
-        label = rm._pick_label(candidates, "f_att", target.path, leaves)
-        self.assertEqual(label, f'{iso("mosque")} / {iso("greenhouse")}')
+        target = next(leaf for leaf in leaves if leaf.field == "subtype")
+        candidates = [("school", "20"), ("warehouse", "30")]
+        label = rm._pick_label(candidates, "subtype", target.path, leaves)
+        self.assertEqual(label, f'{iso("school")} / {iso("warehouse")}')
 
     def test_a_candidate_with_no_group_value_never_matches(self):
-        text = '"F_CODE" = 2300 AND "F_ATT" = 610'
+        text = '"TYPE" = 20 AND "SUBTYPE" = 5'
         leaves = rm._scan_literals_with_scope(text)
-        target = next(leaf for leaf in leaves if leaf.field == "f_att")
-        candidates = [("mosque", ""), ("greenhouse", "1400")]
-        label = rm._pick_label(candidates, "f_att", target.path, leaves)
-        # "2300" governs, but neither candidate's own group is "2300".
-        self.assertEqual(label, f'{iso("mosque")} / {iso("greenhouse")}')
+        target = next(leaf for leaf in leaves if leaf.field == "subtype")
+        candidates = [("school", ""), ("warehouse", "30")]
+        label = rm._pick_label(candidates, "subtype", target.path, leaves)
+        # "20" governs, but neither candidate's own group is "20".
+        self.assertEqual(label, f'{iso("school")} / {iso("warehouse")}')
 
     def test_alt_mode_resolves_the_same_way_then_renders_its_alternative(self):
-        text = '"F_CODE" = 2300 AND "F_ATT" = 610'
+        text = '"TYPE" = 20 AND "SUBTYPE" = 5'
         leaves = rm._scan_literals_with_scope(text)
-        target = next(leaf for leaf in leaves if leaf.field == "f_att")
-        candidates = [("mosque", "2300"), ("greenhouse", "1400")]
+        target = next(leaf for leaf in leaves if leaf.field == "subtype")
+        candidates = [("school", "20"), ("warehouse", "30")]
         label = rm._pick_label(
-            candidates, "f_att", target.path, leaves, mode="alt",
-            alt_for_code={"mosque": "מסגד", "greenhouse": "חממה"},
+            candidates, "subtype", target.path, leaves, mode="alt",
+            alt_for_code={"school": "מסגד", "warehouse": "חממה"},
         )
         self.assertEqual(label, "מסגד")
 
@@ -290,31 +290,31 @@ class SubstituteDescriptionsGroupResolutionTests(unittest.TestCase):
     same way again, straight from its own text and the lookup table."""
 
     def test_flat_and_pattern_resolves_the_ambiguous_code(self):
-        mapping = {"f_att": {"610": [("mosque", "2300"), ("greenhouse", "1400")]}}
-        expr = '"F_CODE" = 2300 AND "F_ATT" = 610'
+        mapping = {"subtype": {"5": [("school", "20"), ("warehouse", "30")]}}
+        expr = '"TYPE" = 20 AND "SUBTYPE" = 5'
         result = rm.substitute_descriptions(expr, mapping)
-        self.assertEqual(result, f'"F_CODE" = 2300 AND "F_ATT" = {iso("mosque")}')
+        self.assertEqual(result, f'"TYPE" = 20 AND "SUBTYPE" = {iso("school")}')
 
     def test_parenthesised_group_pattern_resolves_every_code_inside_it(self):
         mapping = {
-            "f_att": {
-                "610": [("mosque", "2300"), ("greenhouse", "1400")],
-                "611": [("church", "2300"), ("barn", "1400")],
+            "subtype": {
+                "5": [("school", "20"), ("warehouse", "30")],
+                "611": [("church", "20"), ("barn", "30")],
             }
         }
-        expr = '"F_CODE" = 2300 AND ("F_ATT" = 610 OR "F_ATT" = 611)'
+        expr = '"TYPE" = 20 AND ("SUBTYPE" = 5 OR "SUBTYPE" = 611)'
         result = rm.substitute_descriptions(expr, mapping)
         self.assertEqual(
             result,
-            f'"F_CODE" = 2300 AND ("F_ATT" = {iso("mosque")} OR "F_ATT" = {iso("church")})',
+            f'"TYPE" = 20 AND ("SUBTYPE" = {iso("school")} OR "SUBTYPE" = {iso("church")})',
         )
 
     def test_no_group_context_falls_back_to_showing_every_meaning(self):
-        mapping = {"f_att": {"610": [("mosque", "2300"), ("greenhouse", "1400")]}}
-        expr = '"F_ATT" = 610'
+        mapping = {"subtype": {"5": [("school", "20"), ("warehouse", "30")]}}
+        expr = '"SUBTYPE" = 5'
         result = rm.substitute_descriptions(expr, mapping)
-        joined = f'{iso("mosque")} / {iso("greenhouse")}'
-        self.assertEqual(result, f'"F_ATT" = {iso(joined)}')
+        joined = f'{iso("school")} / {iso("warehouse")}'
+        self.assertEqual(result, f'"SUBTYPE" = {iso(joined)}')
 
     def test_two_separate_groups_each_resolve_their_own_ambiguous_code(self):
         """The same code appearing twice, under two different groups in
@@ -322,65 +322,65 @@ class SubstituteDescriptionsGroupResolutionTests(unittest.TestCase):
         correctly each time - the whole point of reading it straight from
         each occurrence's own context instead of remembering one answer
         per code."""
-        mapping = {"f_att": {"610": [("mosque", "2300"), ("greenhouse", "1400")]}}
+        mapping = {"subtype": {"5": [("school", "20"), ("warehouse", "30")]}}
         expr = (
-            '("F_CODE" = 2300 AND "F_ATT" = 610) OR '
-            '("F_CODE" = 1400 AND "F_ATT" = 610)'
+            '("TYPE" = 20 AND "SUBTYPE" = 5) OR '
+            '("TYPE" = 30 AND "SUBTYPE" = 5)'
         )
         result = rm.substitute_descriptions(expr, mapping)
         self.assertEqual(
             result,
-            f'("F_CODE" = 2300 AND "F_ATT" = {iso("mosque")}) OR '
-            f'("F_CODE" = 1400 AND "F_ATT" = {iso("greenhouse")})',
+            f'("TYPE" = 20 AND "SUBTYPE" = {iso("school")}) OR '
+            f'("TYPE" = 30 AND "SUBTYPE" = {iso("warehouse")})',
         )
 
     def test_a_bare_or_between_the_two_fields_falls_back_to_showing_every_meaning(self):
-        """"F_CODE" = 2300 OR "F_ATT" = 610 - an OR, not an AND, joins them,
-        so 2300 must NOT be treated as 610's group."""
-        mapping = {"f_att": {"610": [("mosque", "2300"), ("greenhouse", "1400")]}}
-        expr = '"F_CODE" = 2300 OR "F_ATT" = 610'
+        """"TYPE" = 20 OR "SUBTYPE" = 5 - an OR, not an AND, joins them,
+        so 20 must NOT be treated as 5's group."""
+        mapping = {"subtype": {"5": [("school", "20"), ("warehouse", "30")]}}
+        expr = '"TYPE" = 20 OR "SUBTYPE" = 5'
         result = rm.substitute_descriptions(expr, mapping)
-        joined = f'{iso("mosque")} / {iso("greenhouse")}'
-        self.assertEqual(result, f'"F_CODE" = 2300 OR "F_ATT" = {iso(joined)}')
+        joined = f'{iso("school")} / {iso("warehouse")}'
+        self.assertEqual(result, f'"TYPE" = 20 OR "SUBTYPE" = {iso(joined)}')
 
     def test_two_or_separated_and_runs_each_resolve_their_own_code(self):
-        """"F_CODE" = 2300 AND "F_ATT" = 610 OR "F_CODE" = 2301 AND "F_ATT" =
-        610 - no parentheses at all: a top-level OR alone must split the two
+        """"TYPE" = 20 AND "SUBTYPE" = 5 OR "TYPE" = 21 AND "SUBTYPE" =
+        5 - no parentheses at all: a top-level OR alone must split the two
         flat AND runs, exactly as a pair of parenthesised groups would."""
-        mapping = {"f_att": {"610": [("mosque", "2300"), ("greenhouse", "2301")]}}
-        expr = '"F_CODE" = 2300 AND "F_ATT" = 610 OR "F_CODE" = 2301 AND "F_ATT" = 610'
+        mapping = {"subtype": {"5": [("school", "20"), ("warehouse", "21")]}}
+        expr = '"TYPE" = 20 AND "SUBTYPE" = 5 OR "TYPE" = 21 AND "SUBTYPE" = 5'
         result = rm.substitute_descriptions(expr, mapping)
         self.assertEqual(
             result,
-            f'"F_CODE" = 2300 AND "F_ATT" = {iso("mosque")} OR '
-            f'"F_CODE" = 2301 AND "F_ATT" = {iso("greenhouse")}',
+            f'"TYPE" = 20 AND "SUBTYPE" = {iso("school")} OR '
+            f'"TYPE" = 21 AND "SUBTYPE" = {iso("warehouse")}',
         )
 
     def test_an_or_fully_inside_a_parenthesised_group_does_not_break_governance(self):
-        """Every value in this expression belongs to F_CODE 2300's group,
+        """Every value in this expression belongs to TYPE 20's group,
         including two fields joined by an OR - but that OR sits entirely
-        inside its OWN parenthesis, never at the same scope as F_CODE
+        inside its OWN parenthesis, never at the same scope as TYPE
         itself, so it must not stop either COUNTRY branch from resolving."""
         mapping = {
-            "f_att": {"610": [("mosque", "2300"), ("greenhouse", "1400")]},
+            "subtype": {"5": [("school", "20"), ("warehouse", "30")]},
             "sensitivity": {
-                "610": [("high", "2300"), ("low", "1400")],
-                "603": [("medium", "2300"), ("minimal", "1400")],
+                "5": [("high", "20"), ("low", "30")],
+                "603": [("medium", "20"), ("minimal", "30")],
             },
             "country": {
-                "604": [("Israel", "2300"), ("Jordan", "1400")],
-                "603": [("Egypt", "2300"), ("Lebanon", "1400")],
+                "604": [("Israel", "20"), ("Jordan", "30")],
+                "603": [("Egypt", "20"), ("Lebanon", "30")],
             },
         }
         expr = (
-            '"F_CODE" = 2300 AND "F_ATT" = 610 AND "SENSITIVITY" IN (610,603) '
+            '"TYPE" = 20 AND "SUBTYPE" = 5 AND "SENSITIVITY" IN (5,603) '
             'AND ("COUNTRY" = 604 OR "COUNTRY" = 603)'
         )
         result = rm.substitute_descriptions(expr, mapping)
         self.assertEqual(
             result,
-            '"F_CODE" = 2300 AND "F_ATT" = '
-            f'{iso("mosque")} AND "SENSITIVITY" IN ({iso("high")},{iso("medium")}) '
+            '"TYPE" = 20 AND "SUBTYPE" = '
+            f'{iso("school")} AND "SENSITIVITY" IN ({iso("high")},{iso("medium")}) '
             f'AND ("COUNTRY" = {iso("Israel")} OR "COUNTRY" = {iso("Egypt")})',
         )
 
@@ -417,7 +417,7 @@ class ForceLtrParagraphsTests(unittest.TestCase):
         self.assertEqual(rm.force_ltr_paragraphs(""), "")
 
     def test_does_not_alter_any_visible_character(self):
-        original = "\"F_CODE\" IN (2300, 2301)"
+        original = "\"TYPE\" IN (20, 21)"
         result = rm.force_ltr_paragraphs(original)
         self.assertEqual(result.replace(rm._LRM, ""), original)
 
@@ -425,10 +425,10 @@ class ForceLtrParagraphsTests(unittest.TestCase):
         """The end-to-end scenario reported: a Hebrew field description
         replacing the field name must not cause the value description (or
         a whole IN-list) to visually reorder relative to it."""
-        mapping = {"f_code": {"2300": [("בית כנסת", "")], "2301": [("מבנה חקלאי", "")]}}
-        expr = "\"F_CODE\" IN (2300, 2301)"
+        mapping = {"type": {"20": [("בית כנסת", "")], "21": [("מבנה חקלאי", "")]}}
+        expr = "\"TYPE\" IN (20, 21)"
         substituted = rm.substitute_descriptions(
-            expr, mapping, field_descriptions={"f_code": "ישות"}
+            expr, mapping, field_descriptions={"type": "ישות"}
         )
         # Logical order must already be field-desc, then IN, then the list
         # in its original order - force_ltr_paragraphs() only pins how that
@@ -451,10 +451,10 @@ class BidiIsolationTests(unittest.TestCase):
     """
 
     def test_each_substituted_label_is_individually_isolated(self):
-        mapping = {"f_code": {"2300": [("בית כנסת", "")], "2301": [("מבנה חקלאי", "")]}}
-        result = rm.substitute_descriptions("\"F_CODE\" IN (2300, 2301)", mapping)
+        mapping = {"type": {"20": [("בית כנסת", "")], "21": [("מבנה חקלאי", "")]}}
+        result = rm.substitute_descriptions("\"TYPE\" IN (20, 21)", mapping)
         self.assertEqual(
-            result, f'"F_CODE" IN ({iso("בית כנסת")}, {iso("מבנה חקלאי")})'
+            result, f'"TYPE" IN ({iso("בית כנסת")}, {iso("מבנה חקלאי")})'
         )
 
     def test_stripping_the_isolate_markers_recovers_the_original_left_to_right_order(self):
@@ -464,15 +464,15 @@ class BidiIsolationTests(unittest.TestCase):
         regardless of how many RTL/LTR labels are involved or how they are
         nested."""
         mapping = {
-            "f_code": {
-                "2300": [("מבנה דת", "")],
-                "2301": [("מבנה חקלאי", "")],
+            "type": {
+                "20": [("מבנה דת", "")],
+                "21": [("מבנה חקלאי", "")],
                 "2302": [("בית ספר", "")],
             }
         }
-        expr = "\"F_CODE\" IN (2300, 2301, 2302)"
+        expr = "\"TYPE\" IN (20, 21, 2302)"
         result = rm.substitute_descriptions(
-            expr, mapping, field_descriptions={"f_code": "ישות"}
+            expr, mapping, field_descriptions={"type": "ישות"}
         )
         stripped = result.replace(rm._FSI, "").replace(rm._PDI, "")
         self.assertEqual(stripped, "ישות IN (מבנה דת, מבנה חקלאי, בית ספר)")
@@ -483,19 +483,19 @@ class BidiIsolationTests(unittest.TestCase):
         must still read in their original left-to-right sequence once the
         isolate markers are stripped."""
         mapping = {
-            "f_code": {"2300": [("מבנה דת", "")]},
+            "type": {"20": [("מבנה דת", "")]},
             "f_type": {"1": [("פעיל", "")], "2": [("לא פעיל", "")]},
         }
-        expr = "(\"F_CODE\" = 2300) AND (\"F_TYPE\" IN (1, 2))"
+        expr = "(\"TYPE\" = 20) AND (\"F_TYPE\" IN (1, 2))"
         result = rm.substitute_descriptions(
-            expr, mapping, field_descriptions={"f_code": "ישות", "f_type": "סוג"}
+            expr, mapping, field_descriptions={"type": "ישות", "f_type": "סוג"}
         )
         stripped = result.replace(rm._FSI, "").replace(rm._PDI, "")
         self.assertEqual(stripped, "(ישות = מבנה דת) AND (סוג IN (פעיל, לא פעיל))")
 
     def test_ambiguous_meanings_joined_by_slash_are_each_isolated_too(self):
-        mapping = {"code": {"610": [("מסגד", ""), ("חממה", "")]}}
-        result = rm.substitute_descriptions("\"CODE\" = '610'", mapping)
+        mapping = {"code": {"5": [("מסגד", ""), ("חממה", "")]}}
+        result = rm.substitute_descriptions("\"CODE\" = '5'", mapping)
         joined = f'{iso("מסגד")} / {iso("חממה")}'
         self.assertEqual(result, f'"CODE" = {iso(joined)}')
         stripped = result.replace(rm._FSI, "").replace(rm._PDI, "")
@@ -809,7 +809,7 @@ class ReadModeControllerModeCountTests(unittest.TestCase):
         """End-to-end through the real controller and a real lookup layer:
         two rows sharing one code, distinguished by group_code, resolved
         correctly straight from the expression's own surrounding
-        "F_CODE" = ... context - no choice remembered anywhere."""
+        "TYPE" = ... context - no choice remembered anywhere."""
         from .utils import make_layer
         from qgis.PyQt.QtCore import QVariant
 
@@ -824,22 +824,78 @@ class ReadModeControllerModeCountTests(unittest.TestCase):
                 ("table", QVariant.String),
             ],
             [
-                {"field_name": "F_ATT", "value": "610", "description": "mosque", "group_code": "2300", "table": "context"},
-                {"field_name": "F_ATT", "value": "610", "description": "greenhouse", "group_code": "1400", "table": "context"},
+                {"field_name": "SUBTYPE", "value": "5", "description": "school", "group_code": "20", "table": "context"},
+                {"field_name": "SUBTYPE", "value": "5", "description": "warehouse", "group_code": "30", "table": "context"},
             ],
         )
         # Not added to the project - see the note in DescriptionResolverTests.setUp.
         Settings.set_layer_for_testing(ambiguous_layer)
         Settings.set_field("group_code", "group_code")
         rm.DescriptionResolver.invalidate()
-        editor = self._make_editor('"F_CODE" = 2300 AND "F_ATT" = 610')
+        editor = self._make_editor('"TYPE" = 20 AND "SUBTYPE" = 5')
         controller = rm.ReadModeController(editor)
         try:
             controller._switch.setMode(1)  # edit -> read
-            self.assertIn("mosque", editor.toPlainText())
-            self.assertNotIn("greenhouse", editor.toPlainText())
+            self.assertIn("school", editor.toPlainText())
+            self.assertNotIn("warehouse", editor.toPlainText())
         finally:
             controller.teardown()
+
+
+class ReadModeSafetyTests(ReadModeControllerModeCountTests):
+    """Read mode must never be able to leak description text into the
+    real expression, and must follow changes QGIS makes meanwhile."""
+
+    def test_undo_after_leaving_read_mode_does_not_restore_descriptions(self):
+        original = "\"STATUS\" = '1'"
+        editor = self._make_editor(original)
+        controller = rm.ReadModeController(editor)
+        try:
+            controller._switch.setMode(1)  # edit -> read
+            self.assertIn("Active", editor.toPlainText())
+            controller._switch.setMode(0)  # read -> edit
+            editor.undo()
+            editor.undo()
+            self.assertNotIn("Active", editor.toPlainText())
+            self.assertEqual(editor.toPlainText(), original)
+        finally:
+            controller.teardown()
+
+    def test_editor_is_writable_again_after_a_refresh_while_reading(self):
+        editor = self._make_editor("\"STATUS\" = '1'")
+        controller = rm.ReadModeController(editor)
+        try:
+            controller._switch.setMode(1)
+            # Simulates QGIS changing the expression while read mode shows.
+            controller._on_sci_text_changed()
+            self.assertTrue(editor.isReadOnly())
+            controller._switch.setMode(0)
+            self.assertFalse(editor.isReadOnly())
+        finally:
+            controller.teardown()
+
+
+class FieldContextBoundaryTests(unittest.TestCase):
+    """A number only gets a field's description while it still belongs to
+    that field's comparison."""
+
+    MAPPING = {"status": {"1": [("Active", "")], "2": [("Inactive", "")]}}
+
+    def test_numbers_inside_a_function_call_are_left_alone(self):
+        result = rm.substitute_descriptions('"STATUS" = 1 AND round($area, 2) > 1', self.MAPPING)
+        self.assertIn("round($area, 2) > 1", result)
+        self.assertEqual(result.count("Active"), 1)
+        self.assertNotIn("Inactive", result)
+
+    def test_in_lists_still_substitute_every_value(self):
+        result = rm.substitute_descriptions('"STATUS" IN (1, 2)', self.MAPPING)
+        self.assertIn("Active", result)
+        self.assertIn("Inactive", result)
+
+    def test_between_keeps_both_bounds_on_the_field(self):
+        result = rm.substitute_descriptions('"STATUS" BETWEEN 1 AND 2', self.MAPPING)
+        self.assertIn("Active", result)
+        self.assertIn("Inactive", result)
 
 
 class PurgeLegacyProjectEntriesTests(unittest.TestCase):

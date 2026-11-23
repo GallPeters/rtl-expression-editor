@@ -24,8 +24,15 @@ the database.  A full-table scan never happens, which is why no background
 
 **Per-key memoisation.**  Results are cached under
 ``(field_name, table_context)``.  Repeated Ctrl+Space on the same field costs
-nothing.  The cache is dropped when settings change, when the source layer's
-data changes, or when the layer is removed from the project.
+nothing.  The cache is dropped when settings change, when the lookup data
+changes, and whenever a new expression dialog opens (so edits made to the
+lookup table elsewhere are picked up).
+
+**Replacing QScintilla's own completion.**  The covered editor's native
+autocompletion and call tips are switched off (see ``RtlOverlayEditor``); this
+module supplies the same sources - fields, functions, variables (from the
+dialog's own expression context, so @map_scale and friends are included),
+operators - plus values from a custom lookup source.
 """
 
 from __future__ import annotations
@@ -52,20 +59,61 @@ LOG_TAG = "RTL Expression Editor"
 #: field selector turning into an unbounded read.
 QUERY_LIMIT = 2000
 
-#: Maximum items shown in the popup at once.
-MAX_DISPLAYED = 500
+#: Maximum items shown in the popup at once. Large enough that no group is
+#: ever cut off (the full list holds every function, variable and operator,
+#: and a lookup field may return up to QUERY_LIMIT values).
+MAX_DISPLAYED = 5000
 
 #: Vertical breathing room between the caret's text line and any popup
 #: placed above or below it, so neither the call tip nor the suggestion
 #: list sits close enough to overlap the very text it is describing.
 POPUP_VERTICAL_GAP = 10
 
-#: Characters that make up a value token being typed before the cursor.
-_TOKEN_RE = re.compile(r"[A-Za-z0-9_\-.]+$")
+#: Word characters, Unicode-aware: ``\w`` covers Hebrew/Arabic letters and
+#: digits; the explicit ranges add their combining marks (niqqud, harakat),
+#: which ``\w`` alone does not match.
+_WORD_CLASS = r"\w\u0591-\u05C7\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED"
 
-#: A single character that continues a token rather than ending it - used to
-#: decide whether a just-typed key should close the completion popup.
-_CONTINUATION_CHAR_RE = re.compile(r"[A-Za-z0-9_\-.]")
+#: A word being typed before the cursor outside any quotes: a function,
+#: operator or variable name. ``$`` belongs to names like ``$area`` and a
+#: leading ``@`` to variables, so both are part of the token - otherwise
+#: accepting ``@map_scale`` after typing ``@ma`` would leave ``@@map_scale``.
+_TOKEN_RE = re.compile(rf"@?[{_WORD_CLASS}$]*$")
+
+#: A single character that continues an unquoted token rather than ending it -
+#: used to decide whether a just-typed key should close the completion popup.
+_CONTINUATION_CHAR_RE = re.compile(rf"[{_WORD_CLASS}$@]")
+
+#: Text typed so far inside an unterminated field name / string literal.
+_OPEN_FIELD_TOKEN_RE = re.compile(r'"([^"\n]*)$')
+_OPEN_VALUE_TOKEN_RE = re.compile(r"'([^'\n]*)$")
+
+#: A plain number, inserted bare into a numeric field.
+_NUMBER_RE = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?")
+
+#: Unicode bidi isolates (FSI ... PDI). Wrapping each part of a label in its
+#: own isolate keeps "value (description)" in that visual order even when
+#: one part is Hebrew/Arabic and the other is not.
+_FSI = "\u2068"
+_PDI = "\u2069"
+_BIDI_CONTROL_RE = re.compile("[\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+
+
+def _isolate(text: str) -> str:
+    """Wrap ``text`` in a bidi isolate (no-op for empty text)."""
+    return f"{_FSI}{text}{_PDI}" if text else ""
+
+
+def _labelled(primary: str, secondary: str = "") -> str:
+    """``primary (secondary)`` with each part bidi-isolated."""
+    if not secondary:
+        return _isolate(primary)
+    return f"{_isolate(primary)} ({_isolate(secondary)})"
+
+
+def plain_text(text: str) -> str:
+    """``text`` without bidi control characters - for comparisons and tests."""
+    return _BIDI_CONTROL_RE.sub("", text or "")
 
 #: A field name in double quotes, e.g. "COUNTRY".
 _QUOTED_FIELD_RE = re.compile(r'"([^"\n]+)"')
@@ -193,13 +241,16 @@ class AutocompleteEntry:
         value = _unquote_for_display(self.value)
         description = _unquote_for_display(self.description)
         if description:
-            return f"{value} ({description})"
+            return _labelled(value, description)
         return value
 
     @property
     def filter_text(self) -> str:
-        """Text typing is matched against: unquoted value plus description."""
-        return f"{_unquote_for_display(self.value)} {_unquote_for_display(self.description)}"
+        """Text typing is matched against: value, description and label."""
+        return plain_text(
+            f"{_unquote_for_display(self.value)} "
+            f"{_unquote_for_display(self.description)} {self.display_text}"
+        )
 
     @property
     def group_label(self) -> str:
@@ -207,7 +258,7 @@ class AutocompleteEntry:
         code = _unquote_for_display(self.group_code)
         description = _unquote_for_display(self.group_description)
         if code and description:
-            return f"{code} ({description})"
+            return _labelled(code, description)
         return code or description or ""
 
 
@@ -233,6 +284,10 @@ _OPERATORS = (
 #: session, and building signatures for several hundred functions on every
 #: keypress would be wasteful.
 _FUNCTION_CACHE: Optional[List[tuple]] = None
+#: QgsExpression.functionCount() when the cache was built - a Python
+#: function registered later (Function Editor, another plugin) changes it,
+#: which rebuilds the cache so the new function is offered too.
+_FUNCTION_CACHE_COUNT = -1
 
 
 def builtin_functions() -> List[tuple]:
@@ -249,8 +304,12 @@ def builtin_functions() -> List[tuple]:
     so the autocomplete popup groups them identically instead of lumping every
     function under one generic heading.
     """
-    global _FUNCTION_CACHE
-    if _FUNCTION_CACHE is not None:
+    global _FUNCTION_CACHE, _FUNCTION_CACHE_COUNT
+    try:
+        count = int(QgsExpression.functionCount())
+    except Exception:
+        count = -1
+    if _FUNCTION_CACHE is not None and count == _FUNCTION_CACHE_COUNT:
         return _FUNCTION_CACHE
 
     functions: List[tuple] = []
@@ -260,6 +319,13 @@ def builtin_functions() -> List[tuple]:
                 name = function.name()
                 if not name or name.startswith("_"):
                     continue
+                try:
+                    # Hidden from the Expression Builder too (e.g. $scale,
+                    # superseded by @map_scale).
+                    if function.isDeprecated():
+                        continue
+                except Exception:
+                    pass
 
                 params: List[str] = []
                 try:
@@ -280,6 +346,9 @@ def builtin_functions() -> List[tuple]:
                     help_html = ""
                 try:
                     group = function.group() or GROUP_FUNCTIONS
+                    # The raw id (e.g. "GeometryGroup") -> the translated
+                    # name the Expression Builder shows ("Geometry").
+                    group = QgsExpression.group(group) or group
                 except Exception:
                     group = GROUP_FUNCTIONS
                 functions.append((name, signature, help_html, len(params), group, params))
@@ -290,39 +359,155 @@ def builtin_functions() -> List[tuple]:
 
     functions.sort(key=lambda item: item[0].lower())
     _FUNCTION_CACHE = functions
+    _FUNCTION_CACHE_COUNT = count
     return functions
 
 
-def builtin_variables(layer=None) -> List[str]:
-    """Variable names from the global, project and layer scopes.
-
-    Covers @map_scale, @atlas_feature, project variables and any custom ones,
-    correctly scoped, without hard-coding a list that would go stale.
-    """
+def _meta_class_names(obj) -> List[str]:
+    """The object's real C++ class chain, most-derived first."""
     names: List[str] = []
-    seen = set()
+    try:
+        meta = obj.metaObject()
+        while meta is not None and len(names) < 32:
+            names.append(meta.className())
+            meta = meta.superClass()
+    except Exception:
+        pass
+    return names
 
-    def add_scope(scope) -> None:
-        if scope is None:
+
+def _typed(node):
+    """``node`` re-wrapped as its real QGIS class, when PyQt exposes less.
+
+    A widget created in C++ is often wrapped as a plain base class
+    (``QWidget``, ``QsciScintilla``) because the sip lookup across the
+    ``qgis._gui`` / ``PyQt6`` module boundary fails - so the Expression
+    Builder widget shows up as a ``QWidget`` without ``layer()`` or
+    ``expressionContext()``. ``sip.cast`` to the class named by the C++
+    meta-object restores the real API.
+    """
+    try:
+        import qgis.gui as qgis_gui
+        from qgis.PyQt import sip
+    except Exception:
+        return node
+    for name in _meta_class_names(node):
+        if not name.startswith("Qgs"):
+            continue
+        cls = getattr(qgis_gui, name, None)
+        if cls is None:
+            continue
+        if isinstance(node, cls):
+            return node
+        try:
+            return sip.cast(node, cls)
+        except Exception:
+            return node
+    return node
+
+
+def _ancestors(widget, max_depth: int = 20):
+    """``widget`` and its parents, each re-wrapped by ``_typed``."""
+    node = widget
+    depth = 0
+    while node is not None and depth < max_depth:
+        yield _typed(node)
+        try:
+            node = node.parentWidget()
+        except Exception:
+            return
+        depth += 1
+
+
+def dialog_expression_context(widget):
+    """The expression context of the dialog hosting ``widget``, or None.
+
+    This is the same context the Expression Builder lists its own variables
+    from, so it carries everything that dialog really knows about: map
+    settings (@map_scale, @map_extent...), atlas and layout variables,
+    symbology variables (@symbol_color...), form variables and so on.
+    """
+    if widget is None:
+        return None
+    for node in _ancestors(widget):
+        getter = getattr(node, "expressionContext", None)
+        if not callable(getter):
+            continue
+        try:
+            context = getter()
+        except Exception:
+            continue
+        if context is not None and hasattr(context, "variableNames"):
+            return context
+    return None
+
+
+def _canvas_map_settings_scope():
+    """A scope for the main map canvas (@map_scale, @map_extent, ...)."""
+    try:
+        from qgis.core import QgsExpressionContextUtils
+        from qgis.utils import iface
+
+        if iface is None or iface.mapCanvas() is None:
+            return None
+        return QgsExpressionContextUtils.mapSettingsScope(iface.mapCanvas().mapSettings())
+    except Exception:
+        return None
+
+
+def variable_descriptions(layer=None, widget=None) -> Dict[str, str]:
+    """``variable name -> help text`` for every variable in scope.
+
+    Sources, merged in order (first description wins):
+
+    * the hosting dialog's own expression context, when it has one - the
+      exact list the Expression Builder shows;
+    * the global, project and layer scopes;
+    * the main map canvas's map settings scope, so @map_scale and the other
+      map variables are always offered even where a dialog has no context
+      of its own (e.g. the Layer Filter).
+
+    Hidden variables (names starting with "_") are skipped, as QGIS does.
+    """
+    found: Dict[str, str] = {}
+
+    def add(container) -> None:
+        if container is None:
             return
         try:
-            for name in scope.variableNames():
-                if name and name not in seen:
-                    seen.add(name)
-                    names.append(name)
+            getter = getattr(container, "filteredVariableNames", None)
+            names = getter() if callable(getter) else container.variableNames()
         except Exception:
-            pass
+            return
+        for name in names:
+            if not name or name.startswith("_"):
+                continue
+            if found.get(name):
+                continue
+            description = ""
+            try:
+                description = container.description(name) or ""
+            except Exception:
+                pass
+            found[name] = description
 
+    add(dialog_expression_context(widget))
     try:
         from qgis.core import QgsExpressionContextUtils, QgsProject
 
-        add_scope(QgsExpressionContextUtils.globalScope())
-        add_scope(QgsExpressionContextUtils.projectScope(QgsProject.instance()))
+        add(QgsExpressionContextUtils.globalScope())
+        add(QgsExpressionContextUtils.projectScope(QgsProject.instance()))
         if layer is not None:
-            add_scope(QgsExpressionContextUtils.layerScope(layer))
+            add(QgsExpressionContextUtils.layerScope(layer))
     except Exception as exc:
         _dbg(f"Could not enumerate variables: {exc}")
+    add(_canvas_map_settings_scope())
+    return found
 
+
+def builtin_variables(layer=None, widget=None) -> List[str]:
+    """Sorted variable names in scope - see ``variable_descriptions``."""
+    names = list(variable_descriptions(layer, widget))
     names.sort(key=str.lower)
     return names
 
@@ -553,18 +738,18 @@ def _find_context_layer(widget):
 
     Two strategies, in order of reliability:
 
-    1. Walk up from the Scintilla widget for an ancestor exposing ``layer()``.
-       This is the same technique the editor already uses to harvest field
-       names, so no new assumption is introduced. It covers the Expression
-       Builder and the Field Calculator.
+    1. Walk up from the Scintilla widget for an ancestor exposing ``layer()``
+       (the Expression Builder widget, also used by the Field Calculator).
     2. Fall back to ``iface.activeLayer()``. The Query Builder does not expose
        its layer to Python, but it is always opened from the layer that is
        active in the layer tree, so this is accurate in practice.
     """
     try:
-        node = widget
-        depth = 0
-        while node is not None and depth < 10:
+        # _ancestors() re-wraps each widget as its real QGIS class - without
+        # that, the Expression Builder widget is seen as a plain QWidget with
+        # no layer(), and the lookup silently fell through to the active
+        # layer even when the dialog was opened for a different one.
+        for node in _ancestors(widget):
             getter = getattr(node, "layer", None)
             if callable(getter):
                 try:
@@ -573,8 +758,6 @@ def _find_context_layer(widget):
                         return candidate
                 except Exception:
                     pass
-            node = node.parentWidget() if hasattr(node, "parentWidget") else None
-            depth += 1
     except Exception:
         pass
 
@@ -673,6 +856,57 @@ def resolve_table_candidates(widget) -> List[str]:
 
     _dbg(f"Autocomplete table context: {candidates}")
     return candidates
+
+
+def _field_entry(name: str, description: str = "") -> AutocompleteEntry:
+    """A field-name suggestion, inserted as a properly quoted reference."""
+    try:
+        reference = QgsExpression.quotedColumnRef(name)
+    except Exception:
+        reference = f'"{name}"'
+    return AutocompleteEntry(
+        value=reference,
+        group_code=GROUP_FIELDS,
+        display_text=_labelled(name, description) if description else name,
+        insert_text=reference,
+    )
+
+
+def field_is_numeric(layer, field_name: str) -> Optional[bool]:
+    """True/False for a field of ``layer``; None when it cannot be told."""
+    if layer is None or not field_name:
+        return None
+    try:
+        fields = layer.fields()
+        index = fields.lookupField(field_name)
+        if index < 0:
+            return None
+        return bool(fields.at(index).isNumeric())
+    except Exception:
+        return None
+
+
+def value_literal(raw: str, numeric: Optional[bool] = None) -> str:
+    """The expression literal to insert for a lookup value.
+
+    * Already single-quoted in the lookup table (``'farm'``) -> inserted as is.
+    * A number going into a numeric field -> bare (``12``).
+    * Anything else -> a quoted, escaped string (``'farm'``, ``'O''Hara'``).
+
+    When the target field's type is unknown, numbers stay bare and text is
+    quoted.
+    """
+    value = (raw or "").strip()
+    if len(value) >= 2 and value[0] == value[-1] == "'":
+        return value
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        value = value[1:-1]
+    if numeric is not False and _NUMBER_RE.fullmatch(value):
+        return value
+    try:
+        return QgsExpression.quotedString(value)
+    except Exception:
+        return "'" + value.replace("'", "''") + "'"
 
 
 # --------------------------------------------------------------------------- #
@@ -1126,8 +1360,8 @@ class AutocompleteCache(QObject):
             # Deduplicate on the whole entry, not on the value alone.
             #
             # A value is legitimately allowed to repeat under different groups or
-            # with a different description - e.g. code 610 meaning 'mosque' in
-            # group 2300 and 'greenhouse' in group 2301. Keying only on the value
+            # with a different description - e.g. code 5 meaning 'school' in
+            # group 20 and 'warehouse' in group 21. Keying only on the value
             # discarded the second row, and where that row was a group's only
             # member the entire group disappeared from the popup.
             #
@@ -1189,6 +1423,41 @@ def cache() -> AutocompleteCache:
     if _CACHE is None:
         _CACHE = AutocompleteCache()
     return _CACHE
+
+
+def cleanup() -> None:
+    """Release the shared cache and its signal connections (plugin unload)."""
+    global _CACHE, _FUNCTION_CACHE
+    instance = _CACHE
+    _CACHE = None
+    _FUNCTION_CACHE = None
+    if instance is None:
+        return
+    try:
+        BUS.changed.disconnect(instance.invalidate)
+    except Exception:
+        pass
+    try:
+        instance._memo.clear()
+        if instance._watched_layer is not None:
+            for signal_name in (
+                "dataChanged",
+                "featureAdded",
+                "featuresDeleted",
+                "attributeValueChanged",
+                "willBeDeleted",
+            ):
+                try:
+                    getattr(instance._watched_layer, signal_name).disconnect(
+                        instance._on_layer_touched
+                    )
+                except Exception:
+                    pass
+        instance._watched_layer = None
+        instance._watched_layer_id = ""
+        instance.deleteLater()
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -1452,6 +1721,13 @@ class CustomAutocompleteController(QObject):
         #: stays closed even though the caret may still be enclosed by the
         #: same (now multi-line) call.
         self._suppress_call_tip_once = False
+        # A newly opened dialog starts from fresh lookup data: the lookup
+        # dataset is the plugin's own standalone copy, so edits made to the
+        # same table elsewhere (e.g. as a project layer) emit no signal here.
+        try:
+            cache().invalidate()
+        except Exception:
+            pass
         try:
             editor.installEventFilter(self)
         except Exception as exc:
@@ -1893,7 +2169,7 @@ class CustomAutocompleteController(QObject):
             return True
 
         text = event.text()
-        if text and not _CONTINUATION_CHAR_RE.match(text):
+        if text and self._ends_token(text):
             # A boundary character - space, punctuation, an operator, the
             # closing quote - ends the token, so the list closes immediately
             # rather than waiting to find nothing matches. Matches QGIS's own
@@ -1909,6 +2185,37 @@ class CustomAutocompleteController(QObject):
         self._forward_to_editor(event)
         self._refilter_soon()
         return True
+
+    def _ends_token(self, text: str) -> bool:
+        """Whether typing ``text`` ends the token being completed.
+
+        Inside quotes (a field name or a string value) only the closing
+        quote or a line break ends it - spaces and any letters, Hebrew and
+        Arabic included, are part of a name like "street name" or a value
+        like 'בית ספר'. Outside quotes, anything that is not a word
+        character ends it.
+        """
+        if self._field_mode:
+            return text in ('"', "\n", "\r")
+        if self._value_mode:
+            return text in ("'", "\n", "\r")
+        return not _CONTINUATION_CHAR_RE.match(text)
+
+    def _ensure_popup(self) -> AutocompletePopup:
+        """The suggestion list, created on first use."""
+        if self._popup is None:
+            self._popup = AutocompletePopup(self._editor)
+            self._popup.itemClicked.connect(lambda _i: self.accept_current())
+            # Filter the popup as well as the editor: as a Qt.Popup window it
+            # holds the keyboard and mouse grabs (see eventFilter).
+            self._popup.installEventFilter(self)
+            # The popup is a parentless top-level window, so closing the
+            # dialog would not delete it - tie its lifetime to the editor.
+            try:
+                self._editor.destroyed.connect(self._popup.deleteLater)
+            except Exception:
+                pass
+        return self._popup
 
     def _forward_to_editor(self, event) -> None:
         """Re-send a key event to the editor.
@@ -2013,15 +2320,17 @@ class CustomAutocompleteController(QObject):
                 return
             text_before = text[:position]
             kind = suggestion_context(text_before)
-            if kind == "mixed" and not self._current_token():
+            if kind == "mixed":
                 # Fields and values are anchored to a delimiter the user just
                 # typed ('"' or "'"), so showing them immediately makes sense
                 # even with nothing typed yet. The full function/variable/
                 # operator list has no such anchor - opening it on every
                 # keystroke that is not building a word (a space, an
-                # operator, a digit with no prefix) would be far too noisy,
-                # so it waits for an actual prefix to narrow it by.
-                return
+                # operator, a number) would be far too noisy, so it waits
+                # for an actual word prefix to narrow it by.
+                token = self._current_token("mixed")
+                if not token or token[0].isdigit():
+                    return
             self.trigger(auto=True)
         except Exception as exc:
             _dbg(f"Auto-trigger failed: {exc}")
@@ -2070,7 +2379,7 @@ class CustomAutocompleteController(QObject):
             # dataset's own Table description column, e.g. "buildings (מבנים)".
             name = self._layer_display_name(layer)
             description = cache().lookup_table_description(tables) if usable else ""
-            self._popup_title = f"{name} ({description})" if name and description else name
+            self._popup_title = _labelled(name, description) if name and description else name
             return self._field_entries(layer, usable, tables)
         if kind == "values":
             # Typing a value: the title is WHICH field it belongs to. Set to
@@ -2082,13 +2391,13 @@ class CustomAutocompleteController(QObject):
             if entries:
                 field = self._field_name
                 description = cache().lookup_field_description(field, tables) if usable else ""
-                self._popup_title = f"{field} ({description})" if field and description else field
+                self._popup_title = _labelled(field, description) if field and description else field
             return entries
         if kind == "variables":
             self._popup_title = ""
-            return self._variable_entries(layer)
+            return self._variable_entries(layer, probe)
         self._popup_title = ""
-        return self._full_entries(layer)
+        return self._full_entries(layer, probe, usable, tables)
 
     @staticmethod
     def _layer_display_name(layer) -> str:
@@ -2129,19 +2438,7 @@ class CustomAutocompleteController(QObject):
                 _dbg(f"Field-name lookup failed: {exc}")
         if not names:
             names = context_field_names(layer)
-        return [
-            AutocompleteEntry(
-                value=f'"{name}"',
-                group_code=GROUP_FIELDS,
-                display_text=(
-                    f"{name} ({descriptions[name.lower()]})"
-                    if name.lower() in descriptions
-                    else name
-                ),
-                insert_text=f'"{name}"',
-            )
-            for name in names
-        ]
+        return [_field_entry(name, descriptions.get(name.lower(), "")) for name in names]
 
     def _value_entries(
         self, text_before: str, layer, usable: bool, tables: Sequence[str]
@@ -2159,12 +2456,19 @@ class CustomAutocompleteController(QObject):
                 _dbg(f"Value lookup failed: {exc}")
                 found = []
             if found:
-                entries = []
-                for entry in found:
-                    if not entry.group_code and not entry.group_description:
-                        entry.group_code = GROUP_VALUES
-                    entries.append(entry)
-                return entries
+                numeric = field_is_numeric(layer, field_name)
+                # Copies, so the shared cache's own entries are never mutated.
+                return [
+                    AutocompleteEntry(
+                        value=entry.value,
+                        description=entry.description,
+                        group_code=entry.group_code
+                        or ("" if entry.group_description else GROUP_VALUES),
+                        group_description=entry.group_description,
+                        insert_text=value_literal(entry.value, numeric),
+                    )
+                    for entry in found
+                ]
 
         # No configured table, or nothing in it for this field: fall back to
         # the first few distinct, non-null values already in the layer.
@@ -2175,29 +2479,42 @@ class CustomAutocompleteController(QObject):
         ]
 
     @staticmethod
-    def _variable_entries(layer) -> List[AutocompleteEntry]:
+    def _variable_entries(layer, probe=None) -> List[AutocompleteEntry]:
+        """Variables in scope, with their help text as the tooltip."""
+        descriptions = variable_descriptions(layer, probe)
         return [
             AutocompleteEntry(
                 value=f"@{name}",
                 group_code=GROUP_VARIABLES,
                 display_text=f"@{name}",
                 insert_text=f"@{name}",
+                help_text=descriptions.get(name, ""),
             )
-            for name in builtin_variables(layer)
+            for name in sorted(descriptions, key=str.lower)
         ]
 
     @staticmethod
-    def _full_entries(layer) -> List[AutocompleteEntry]:
-        """Everything that is not a field or a value.
+    def _full_entries(
+        layer, probe=None, usable: bool = False, tables: Sequence[str] = ()
+    ) -> List[AutocompleteEntry]:
+        """Everything available without a quote typed first.
 
-        Grouped exactly like the Expression Builder's own tree: each function
-        under its real category (Aggregates, Arrays, Color, Conditionals,
-        Geometry, Operators, ...), reported by QgsExpression itself, plus
-        Variables and Operators as their own groups.
+        Grouped exactly like the Expression Builder's own tree: the current
+        layer's fields, each function under its real category (Aggregates,
+        Arrays, Color, Conditionals, Geometry, ...), reported by QgsExpression
+        itself, plus Variables and Operators as their own groups.
         """
-        entries: List[AutocompleteEntry] = list(
-            CustomAutocompleteController._variable_entries(layer)
-        )
+        descriptions: Dict[str, str] = {}
+        if usable:
+            try:
+                descriptions = cache().lookup_field_descriptions(tables)
+            except Exception:
+                descriptions = {}
+        entries: List[AutocompleteEntry] = [
+            _field_entry(name, descriptions.get(name.lower(), ""))
+            for name in context_field_names(layer)
+        ]
+        entries.extend(CustomAutocompleteController._variable_entries(layer, probe))
 
         for name, _signature, help_html, param_count, group, _params in builtin_functions():
             entries.append(
@@ -2223,38 +2540,12 @@ class CustomAutocompleteController(QObject):
         entries.sort(key=lambda e: (e.group_label.lower(), e.display.lower()))
         return entries
 
-    def _offer_field_names(self) -> None:
-        """Populate the popup with field names rather than values."""
-        editor = self._editor
-        sci = getattr(editor, "_sci", None)
-        tables = resolve_table_candidates(sci if sci is not None else editor)
-
-        try:
-            names = cache().lookup_field_names(tables)
-        except Exception as exc:
-            _dbg(f"Field-name lookup raised: {exc}")
-            names = []
-
-        if not names:
-            self._notice(
-                "No field names defined"
-                + (f" for table '{tables[0]}'" if tables else "")
-            )
-            return
-
-        self._field_mode = True
-        self._entries = [AutocompleteEntry(value=n) for n in names]
-        self._refilter(show=True)
-
     def _notice(self, text: str) -> None:
         """Show a transient explanatory popup instead of failing silently."""
         try:
-            if self._popup is None:
-                self._popup = AutocompletePopup(self._editor)
-                self._popup.itemClicked.connect(lambda _i: self.accept_current())
-                self._popup.installEventFilter(self)
+            popup = self._ensure_popup()
             self._entries = []
-            self._popup.show_notice(text)
+            popup.show_notice(text)
         except Exception:
             pass
 
@@ -2281,49 +2572,67 @@ class CustomAutocompleteController(QObject):
         except Exception:
             pass
 
-    def _current_token(self) -> str:
-        """The partial value already typed immediately before the caret."""
+    def _current_token(self, kind: str = "") -> str:
+        """The partial text already typed immediately before the caret.
+
+        Inside quotes it is everything since the opening quote - spaces and
+        Hebrew/Arabic letters included - so a value like 'בית ספר' or a
+        field like "street name" is matched and replaced as a whole. Outside
+        quotes it is the word being typed, with a leading ``@`` or ``$``.
+        ``kind`` defaults to the context of the list currently open.
+        """
         editor = self._editor
         if editor is None:
             return ""
+        if not kind:
+            kind = "fields" if self._field_mode else ("values" if self._value_mode else "mixed")
         cursor = editor.textCursor()
         line = cursor.block().text()[: cursor.positionInBlock()]
+        if kind == "fields":
+            match = _OPEN_FIELD_TOKEN_RE.search(line)
+            return match.group(1) if match else ""
+        if kind == "values":
+            match = _OPEN_VALUE_TOKEN_RE.search(line)
+            return match.group(1) if match else ""
         match = _TOKEN_RE.search(line)
         return match.group(0) if match else ""
+
+    @staticmethod
+    def _matches(entries: Sequence[AutocompleteEntry], token: str) -> List[AutocompleteEntry]:
+        """Entries matching ``token``: prefix matches if any, else substring.
+
+        A leading ``@`` is optional on either side, so typing ``map`` offers
+        ``@map_scale`` just as ``@map`` does.
+        """
+        token = plain_text(token).casefold()
+        if not token:
+            return list(entries)
+        bare_token = token.lstrip("@")
+
+        def key(entry: AutocompleteEntry) -> str:
+            return plain_text(_unquote_for_display(entry.value)).casefold()
+
+        prefix = [
+            e for e in entries
+            if key(e).startswith(token) or (bare_token and key(e).lstrip("@").startswith(bare_token))
+        ]
+        if prefix:
+            return prefix
+        return [e for e in entries if bare_token in e.filter_text.casefold()]
 
     def _refilter(self, show: bool = False) -> None:
         """Apply the typed prefix and repopulate, hiding when nothing matches."""
         if self._editor is None or not self._entries:
             return
-        token = self._current_token().lower()
-        if token:
-            subset = [
-                e
-                for e in self._entries
-                if _unquote_for_display(e.value).lower().startswith(token)
-            ]
-            if not subset:
-                subset = [
-                    e
-                    for e in self._entries
-                    if token in e.filter_text.lower()
-                ]
-        else:
-            subset = list(self._entries)
-
+        subset = self._matches(self._entries, self._current_token())
         if not subset:
             self.hide_popup()
             return
 
-        if self._popup is None:
-            self._popup = AutocompletePopup(self._editor)
-            self._popup.itemClicked.connect(lambda _i: self.accept_current())
-            # Filter the popup as well as the editor: as a Qt.Popup window it
-            # holds the keyboard and mouse grabs (see eventFilter).
-            self._popup.installEventFilter(self)
-        self._popup.populate(subset, self._popup_title)
-        if show or self._popup.isVisible():
-            self._popup.show_at_cursor()
+        popup = self._ensure_popup()
+        popup.populate(subset, self._popup_title)
+        if show or popup.isVisible():
+            popup.show_at_cursor()
 
     def accept_current(self) -> None:
         """Insert the selected value - only the value, never the description."""
@@ -2350,40 +2659,25 @@ class CustomAutocompleteController(QObject):
         token_len = len(self._current_token())
         text = editor.toPlainText()
         caret_pos = editor.textCursor().position()
+        start = caret_pos - token_len
+        end = caret_pos
 
-        # _current_token() only matches word characters, so it never includes
-        # the quote the user typed to open the token - e.g. after typing
-        # `"N`, the token is just "N". That opening quote is always consumed
-        # along with it when one is found, for either of two reasons:
-        #
-        # * a field entry supplies its own matching pair of quotes, so
-        #   leaving the old one behind would duplicate it: `""NAME"` instead
-        #   of `"NAME"`.
-        # * a numeric value's insert_text has no quotes at all (bare digits
-        #   need none), so the user's own opening quote would otherwise be
-        #   left dangling: `'605` instead of `605`.
+        # Inside quotes the token never includes the opening quote itself.
+        # The inserted text brings its own quoting (a field reference is
+        # '"NAME"', a text value is "'abc'", a number is bare), so the user's
+        # opening quote is replaced along with the token - and a closing
+        # quote already sitting right after the caret is consumed too,
+        # instead of being doubled or left dangling.
         quote_char = '"' if self._field_mode else ("'" if self._value_mode else None)
-        remove_len = token_len
-        quote_start = caret_pos - token_len - 1
-        if quote_char and quote_start >= 0 and text[quote_start] == quote_char:
-            remove_len += 1
-
-        # Close the quote for the user unless one is already sitting to the
-        # right of the caret - the same courtesy every editor extends when
-        # completing a bracketed or quoted token.
-        if quote_char and insert_text.endswith(quote_char):
-            after = text[caret_pos:caret_pos + 1]
-            if after == quote_char:
-                insert_text = insert_text[:-1]
+        if quote_char and start - 1 >= 0 and text[start - 1] == quote_char:
+            start -= 1
+            if text[end:end + 1] == quote_char:
+                end += 1
 
         cursor = editor.textCursor()
         cursor.beginEditBlock()
-        if remove_len:
-            cursor.movePosition(
-                QTextCursor.MoveOperation.Left,
-                QTextCursor.MoveMode.KeepAnchor,
-                remove_len,
-            )
+        cursor.setPosition(start)
+        cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
         cursor.insertText(insert_text)
         cursor.endEditBlock()
         if caret_offset:
@@ -2453,6 +2747,11 @@ class CustomAutocompleteController(QObject):
                 point = self._call_tip_point()
                 if self._call_tip is None:
                     self._call_tip = CallTipPopup(editor)
+                    try:
+                        # Parentless window - delete it with the editor.
+                        editor.destroyed.connect(self._call_tip.deleteLater)
+                    except Exception:
+                        pass
                 self._call_tip.show_body(body, point)
                 return
             self._hide_call_tip()
@@ -2590,7 +2889,7 @@ def force_complete() -> None:
 
     Open the Expression Builder or Layer Filter, click into the editor, then::
 
-        from rtl_bidi_editor.rtl_autocomplete import force_complete
+        from rtl_expression_editor.rtl_autocomplete import force_complete
         force_complete()
     """
     from qgis.PyQt.QtWidgets import QApplication, QPlainTextEdit
@@ -2643,7 +2942,7 @@ def diagnose(field_name: str = "") -> None:
     Run from the QGIS Python Console with the layer you are filtering selected
     in the layer tree::
 
-        from rtl_bidi_editor.rtl_autocomplete import diagnose
+        from rtl_expression_editor.rtl_autocomplete import diagnose
         diagnose("COUNTRY")
 
     Uses print() rather than the message log on purpose, so it cannot raise the

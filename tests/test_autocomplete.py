@@ -70,10 +70,20 @@ class BuiltinFunctionsAndVariablesComeFromTheLiveApiTests(unittest.TestCase):
         self.assertTrue(plugin_names.issubset(live_names))
 
     def test_function_groups_match_qgsexpressions_own_groups(self):
-        live_groups = {f.name(): f.group() for f in QgsExpression.Functions()}
+        """Same groups as the Expression Builder, by their translated name
+        (e.g. "Geometry", never the raw id "GeometryGroup")."""
+        live_groups = {
+            f.name(): QgsExpression.group(f.group()) or f.group()
+            for f in QgsExpression.Functions()
+        }
         for name, _sig, _help, _count, group, _params in ac.builtin_functions():
             if name in live_groups:
                 self.assertEqual(group, live_groups[name] or ac.GROUP_FUNCTIONS)
+
+    def test_deprecated_functions_are_not_offered(self):
+        deprecated = {f.name() for f in QgsExpression.Functions() if f.isDeprecated()}
+        plugin_names = {name for name, *_rest in ac.builtin_functions()}
+        self.assertFalse(deprecated & plugin_names)
 
     def test_functions_carry_their_real_parameter_names(self):
         by_name = {name: params for name, _s, _h, _c, _g, params in ac.builtin_functions()}
@@ -174,7 +184,7 @@ class WithALookupTableTests(unittest.TestCase):
         self.assertEqual(len(entries), 2)
         by_value = {entry.value: entry for entry in entries}
         self.assertEqual(by_value["1"].description, "Active")
-        self.assertEqual(by_value["1"].group_label, "G1 (State)")
+        self.assertEqual(ac.plain_text(by_value["1"].group_label), "G1 (State)")
 
     def test_a_table_not_matching_the_current_layer_returns_nothing(self):
         self.assertEqual(ac.cache().lookup("STATUS", ["some_other_table"]), [])
@@ -301,13 +311,13 @@ class PopupTitleDescriptionEnrichmentTests(unittest.TestCase):
     def test_fields_title_is_enriched_with_the_table_description(self):
         self._set_text_and_cursor('"', 1)
         self.controller.trigger()
-        self.assertEqual(self.controller._popup_title, "context (הקשר)")
+        self.assertEqual(ac.plain_text(self.controller._popup_title), "context (הקשר)")
 
     def test_values_title_is_enriched_with_the_field_description(self):
         text = "\"STATUS\" = '"
         self._set_text_and_cursor(text, len(text))
         self.controller.trigger()
-        self.assertEqual(self.controller._popup_title, "STATUS (מצב)")
+        self.assertEqual(ac.plain_text(self.controller._popup_title), "STATUS (מצב)")
 
     def test_title_has_no_parenthetical_when_no_description_is_configured(self):
         Settings.set_field("table_description", "")
@@ -323,7 +333,7 @@ class PopupTitleDescriptionEnrichmentTests(unittest.TestCase):
         description too, e.g. "STATUS (מצב)" next to "COUNTRY (מדינה)"."""
         self._set_text_and_cursor('"', 1)
         self.controller.trigger()
-        displayed = {entry.display_text for entry in self.controller._entries}
+        displayed = {ac.plain_text(entry.display_text) for entry in self.controller._entries}
         self.assertIn("STATUS (מצב)", displayed)
         self.assertIn("COUNTRY (מדינה)", displayed)
 
@@ -427,6 +437,157 @@ class AcceptCurrentInsertsOnlyTheValueTests(unittest.TestCase):
         self.assertNotIn("\n", result)
         self.assertNotIn("/*", result)
         self.assertTrue(result.startswith('"STATUS" = '))
+
+
+class VariableSuggestionTests(unittest.TestCase):
+    """Variables come from the dialog's own expression context, so map
+    variables such as @map_scale are offered - and accepting one never
+    doubles the "@"."""
+
+    def setUp(self):
+        from qgis.core import QgsExpressionContext, QgsExpressionContextUtils, QgsMapSettings
+
+        reset_plugin_settings()
+        context = QgsExpressionContext()
+        context.appendScope(QgsExpressionContextUtils.globalScope())
+        context.appendScope(QgsExpressionContextUtils.mapSettingsScope(QgsMapSettings()))
+        self.context = context
+        self.editor = QPlainTextEdit()
+        # Stands in for the Expression Builder's expressionContext().
+        self.editor.expressionContext = lambda: self.context
+        self.controller = ac.CustomAutocompleteController(self.editor)
+
+    def tearDown(self):
+        self.controller.teardown()
+        reset_plugin_settings()
+
+    def _set_text(self, text: str) -> None:
+        self.editor.setPlainText(text)
+        cursor = self.editor.textCursor()
+        cursor.setPosition(len(text))
+        self.editor.setTextCursor(cursor)
+
+    def _accept(self, value: str) -> None:
+        popup = self.controller._popup
+        row = next(r for r in range(popup.count()) if popup.item(r).data(ac.VALUE_ROLE) == value)
+        popup.setCurrentRow(row)
+        self.controller.accept_current()
+
+    def test_map_scale_is_offered_from_the_dialog_context(self):
+        self.assertIn("map_scale", ac.builtin_variables(None, self.editor))
+
+    def test_typing_at_sign_offers_map_scale(self):
+        self._set_text("@")
+        self.controller.trigger()
+        values = {entry.value for entry in self.controller._entries}
+        self.assertIn("@map_scale", values)
+
+    def test_accepting_a_variable_does_not_double_the_at_sign(self):
+        self._set_text("@map_s")
+        self.controller.trigger()
+        self._accept("@map_scale")
+        self.assertEqual(self.editor.toPlainText(), "@map_scale")
+
+    def test_variables_are_found_without_the_at_sign_in_the_full_list(self):
+        self._set_text("map_sc")
+        self.controller.trigger()
+        self._accept("@map_scale")
+        self.assertEqual(self.editor.toPlainText(), "@map_scale")
+
+    def test_hidden_variables_are_not_offered(self):
+        names = ac.builtin_variables(None, self.editor)
+        self.assertFalse([name for name in names if name.startswith("_")])
+
+
+class RtlAndQuotedTokenTests(unittest.TestCase):
+    """Typing inside quotes: Hebrew letters and spaces are part of the
+    token, so accepting replaces everything typed since the quote."""
+
+    def setUp(self):
+        reset_plugin_settings()
+        self.layer = make_context_layer(("NAME", "COUNTRY"))
+        provider = self.layer.dataProvider()
+        for value in ("בית ספר", "בית חולים", "New York"):
+            feature = QgsFeature(self.layer.fields())
+            feature.setAttribute("NAME", value)
+            provider.addFeature(feature)
+        QgsProject.instance().addMapLayer(self.layer)
+        self.editor = QPlainTextEdit()
+        self.editor.layer = lambda: self.layer
+        self.controller = ac.CustomAutocompleteController(self.editor)
+
+    def tearDown(self):
+        self.controller.teardown()
+        QgsProject.instance().removeMapLayer(self.layer.id())
+        reset_plugin_settings()
+
+    def _set_text(self, text: str, position: int = -1) -> None:
+        self.editor.setPlainText(text)
+        cursor = self.editor.textCursor()
+        cursor.setPosition(len(text) if position < 0 else position)
+        self.editor.setTextCursor(cursor)
+
+    def test_hebrew_partial_value_with_a_space_is_matched_and_replaced(self):
+        self._set_text('"NAME" = \'בית ס')
+        self.controller.trigger()
+        matches = self.controller._matches(
+            self.controller._entries, self.controller._current_token()
+        )
+        self.assertEqual([entry.value for entry in matches], ["'בית ספר'"])
+        self.controller.accept_current()
+        self.assertEqual(self.editor.toPlainText(), '"NAME" = \'בית ספר\'')
+
+    def test_latin_value_with_a_space_is_replaced_whole(self):
+        self._set_text('"NAME" = \'New Y')
+        self.controller.trigger()
+        self.controller.accept_current()
+        self.assertEqual(self.editor.toPlainText(), '"NAME" = \'New York\'')
+
+    def test_a_closing_quote_after_the_caret_is_not_doubled(self):
+        text = '"NAME" = \'New Y\''
+        self._set_text(text, len(text) - 1)
+        self.controller.trigger()
+        self.controller.accept_current()
+        self.assertEqual(self.editor.toPlainText(), '"NAME" = \'New York\'')
+
+    def test_hebrew_letters_and_spaces_do_not_end_a_value_token(self):
+        self.controller._field_mode = False
+        self.controller._value_mode = True
+        self.assertFalse(self.controller._ends_token("ב"))
+        self.assertFalse(self.controller._ends_token(" "))
+        self.assertTrue(self.controller._ends_token("\'"))
+
+    def test_hebrew_letters_continue_an_unquoted_token(self):
+        self.controller._field_mode = False
+        self.controller._value_mode = False
+        self.assertFalse(self.controller._ends_token("ש"))
+        self.assertTrue(self.controller._ends_token(" "))
+
+    def test_the_full_list_includes_the_layers_fields(self):
+        self._set_text("NA")
+        self.controller.trigger()
+        values = {entry.value for entry in self.controller._entries}
+        self.assertIn('"NAME"', values)
+
+
+class ValueLiteralTests(unittest.TestCase):
+    """Lookup values are inserted as valid literals for the target field."""
+
+    def test_text_is_quoted(self):
+        self.assertEqual(ac.value_literal("farm"), "'farm'")
+
+    def test_embedded_quotes_are_escaped(self):
+        self.assertEqual(ac.value_literal("O'Hara"), "'O''Hara'")
+
+    def test_an_already_quoted_value_is_kept(self):
+        self.assertEqual(ac.value_literal("'farm'"), "'farm'")
+
+    def test_numbers_stay_bare_for_numeric_or_unknown_fields(self):
+        self.assertEqual(ac.value_literal("12", numeric=True), "12")
+        self.assertEqual(ac.value_literal("12", numeric=None), "12")
+
+    def test_numbers_are_quoted_for_text_fields(self):
+        self.assertEqual(ac.value_literal("12", numeric=False), "'12'")
 
 
 if __name__ == "__main__":

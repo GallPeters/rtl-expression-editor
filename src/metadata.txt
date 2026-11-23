@@ -2,17 +2,17 @@
 name=RTL Expression Editor
 qgisMinimumVersion=4.0
 qgisMaximumVersion=4.99
-description=Fixes right-to-left (Hebrew and Arabic) text rendering in the Expression Builder and allows custom autocomplete sources.
-about=QGIS's built-in editor (QScintilla) does not display right-to-left text correctly, especially when RTL and left-to-right text are mixed. Glyphs overlap and the text cursor jumps to the wrong place, which makes Hebrew or Arabic expressions and layer filters hard to read and almost impossible to edit.
+description=Correct right-to-left (Hebrew, Arabic) text in QGIS expression and filter editors, with smart autocomplete from your own lookup tables.
+about=QGIS's built-in expression editor cannot display right-to-left text properly: when Hebrew or Arabic is mixed with English, letters overlap and the cursor jumps around.
 
-    This plugin places an enhanced editor directly above the original one. The enhanced editor renders mixed RTL and LTR text correctly while staying fully sync-hronized with the original editor beneath it, so all existing QGIS functionality keeps working: the field, function and operator tools, validation, value previews and syntax highlighting. Matching brackets are highlighted as well. Nothing in QGIS is modified or replaced.
+    This plugin places an editor that handles mixed-direction text correctly on top of the original one and keeps the two in sync. All QGIS tools keep working as usual: field and function lists, validation, preview and syntax highlighting.
 
-    The plugin also offers an optional advanced auto-complete system. Choose any table or dataset - picked straight from the QGIS Browser, without adding it to your project - and its fields as the source of allowed values, with optional descriptions, groups and group descriptions. Press Ctrl+Space to complete either a field name or a value, and the suggestions adapt automatically to the field being queried and to the layer you are working on.
+    It also replaces QGIS's autocomplete. Press Ctrl+Space (or just type) to get fields, values, functions, variables and operators. You can add your own lookup table, for example road types with their descriptions, so the suggested values come with readable labels.
 
-    When a custom auto-complete source is configured, an optional Read Mode switch appears inside the editor. Read Mode shows the value descriptions instead of the stored codes, making a long expression far easier tounderstand, and never alters the expression itself. Where the same code has different meanings in different groups, Read Mode works out the right one automatically from the expression's own surrounding condition, using an optional Group codes column - nothing about this is ever saved to the project. An optional second, alternative description per value adds a third switch position for a different wording of the same descriptions.
+    With a lookup table configured, a Read mode switch shows the descriptions instead of the stored codes. The expression itself is never changed.
 
-    The whole configuration, including the auto-complete source, can be exported to a file and imported again elsewhere - useful for sharing a ready-made setup with colleagues.
-version=1.6
+    Settings can be exported to a file and shared with colleagues.
+version=1.7
 author=Jossef Kanter
 email=jossefkan@gmail.com
 
@@ -20,7 +20,7 @@ tracker=https://github.com/GallPeters/rtl-expression-editor
 repository=https://github.com/GallPeters/rtl-expression-editor
 
 # Optional metadata
-tags=rtl,hebrew,arabic,expression,filter,editor,expression 
+tags=rtl,hebrew,arabic,bidi,expression,filter,editor,autocomplete
 homepage=https://github.com/GallPeters/rtl-expression-editor
 icon=icon.png
 experimental=False
@@ -28,43 +28,44 @@ deprecated=False
 hasProcessingProvider=no
 server=False
 changelog=
+** v1.7 (23.11.2026):
+  - Fixed: @map_scale and other map, atlas and layout variables were missing from the suggestions.
+  - Fixed: typing Hebrew or Arabic, or a value with spaces, closed the suggestion list or left duplicate text after accepting.
+  - Fixed: accepting @variables or $functions doubled the @ or $ sign.
+  - Fixed: text values from a lookup table were inserted without quotes.
+  - Fixed: suggestions sometimes came from the active layer instead of the layer being edited.
+  - Fixed: after leaving Read mode, Undo could bring the descriptions back into the expression.
+  - Fixed: Read mode now updates when QGIS inserts a field or function, and numbers inside function calls are no longer labelled.
+  - Fixed: clicking OK in Settings while the lookup table was unreachable erased its configuration; an unreachable table is now retried automatically.
+  - Fixed: the lookup file stayed locked after closing Settings or unloading the plugin.
+  - Improved: the suggestion list includes the layer's fields, shows variable help, follows the Expression Builder's group names, hides deprecated functions and is no longer cut off.
+  - Improved: no more log messages on every dialog.
+
 ** v1.6 (26.08.2026):
-  - Changed: the autocomplete lookup table is now picked straight from the QGIS Browser as a dataset, instead of being chosen from - and needing to be added to - the project's own layers. It is read directly from its own source and is never added to the project, so it no longer appears in the Layers panel or gets saved into the project file. A configuration saved by an earlier version is upgraded automatically the first time it is used.
-  - Changed: Read mode now works out a code with several meanings directly from the expression's own surrounding group condition instead of remembering a choice you picked - showing every meaning only when that context is missing or ambiguous. A surrounding AND joins the two into one group correctly; a surrounding OR (or two AND-runs split by one) keeps them apart, exactly as the expression itself does.
-  - Removed: saving a picked description to the project file, and the "Clear & Scan" / "Reset Legacy Entries" Settings buttons that maintained it - nothing about Read mode is ever saved to the project any more.
-  - Added: any such entry left behind by an earlier version is removed automatically the first time the plugin activates.
+  - Changed: the lookup table is picked from the QGIS Browser and is no longer added to the project.
+  - Changed: Read mode works out codes with several meanings from the expression itself; nothing is saved to the project.
+  - Removed: the "Clear & Scan" and "Reset Legacy Entries" buttons.
 
 ** v1.5 (19.08.2026):
-  - Added: suggestion-list titles with optional Table/Field description columns (also shown in Read mode); an optional Alternative value description, giving Read mode a third switch position; Export/Import Settings as a JSON file.
-  - Added: "Clear & Scan" and "Reset Legacy Entries" buttons in a new "Maintenance" group in Settings, alongside Run Tests, to clean up remembered value/description choices no longer in use.
-  - Improved: the Edit/Read mode switch is now a real slider; the Settings window is resizable with detailed tooltips; Run Tests stays responsive and never touches your open project.
-  - Fixed: a Hebrew description could reverse an expression's left-to-right layout in Read mode; remembered choices now stay in sync with edits and with layer removal instead of only accumulating; copying or cutting an expression could leak a hidden internal tracking id onto the clipboard.
+  - Added: titles and table/field descriptions in the suggestion list, an alternative description for Read mode, and Export/Import Settings.
+  - Improved: a real Edit/Read slider and a resizable Settings window with tooltips.
+  - Fixed: Hebrew descriptions reversing the expression layout in Read mode; hidden text leaking to the clipboard.
 
 ** v1.4 (12.08.2026):
-  - Added: Ctrl+Space (and automatic suggestions while typing) for fields, functions, variables and values, with signatures and help - works even without a configured lookup table.
-  - Added: a function helper showing the name and arguments while typing inside a call, with the current argument highlighted, following the caret and the window.
-  - Added: whole-word occurrence highlighting, including while using Find; Enter/Shift+Enter in the Ctrl+H replace bar to replace one or all occurrences; a setting for how many values are suggested without a lookup table.
-  - Added: a full test suite, plus a "Run Tests" button in Settings for development checkouts.
-  - Improved: the suggestion list is grouped like the Expression Builder's own categories and shows functions by name only; the suggestion list and function helper sit clear of the text instead of overlapping it.
-  - Fixed: a crash that could break autocomplete, duplicated quotes on accepting a suggestion, duplicate scrollbars, a suggestion-list flash on Linux, the function helper getting stuck on screen or the suggestion list closing the whole window instead of itself, and Enter in the Ctrl+H replace field sometimes replacing every occurrence instead of just the current one.
+  - Added: autocomplete for fields, functions, variables and values, and a function helper showing the current argument.
+  - Added: highlighting of matching words, Enter/Shift+Enter in the replace bar, and a test suite.
+  - Fixed: several autocomplete, popup and replace-bar issues.
 
 ** v1.3 (10.08.2026):
-  - Improved: the suggestion list now shows values without their surrounding quotes.
-  - Improved: clearer labels in the settings window, with required options listed first.
-  - Improved: read mode and the suggestion list now show values without surrounding quotes
-  - Fixed: read mode now handles code and description columns whose values include quotes.
-  - Fixed transparent background issue in the editor.
+  - Improved: values are shown without quotes in the suggestion list and Read mode.
+  - Fixed: quoted values in Read mode, and a transparent editor background.
 
 ** v1.2 (06.08.2026):
-  - Added: a Settings dialog with an enable/disable switch.
-  - Added: optional autocomplete from project layer values.
-  - Added: Read mode to display value descriptions instead of codes.
-  - Added: project-specific storage for custom value descriptions.
+  - Added: Settings dialog, autocomplete from a lookup table, and Read mode.
 
 ** v1.1 (03.08.2026):
-  - Added: RTL window now follows the original window's position and size.
-  - Added: syntax highlighting.
-  - Fixed: Removed the Apply and Cancel buttons.
+  - Added: the editor follows the original window's position and size; syntax highlighting.
+  - Removed: the extra Apply and Cancel buttons.
 
 ** v1.0 (26.07.2026):
   - Initial release.

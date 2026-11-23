@@ -124,6 +124,12 @@ BUS = _SettingsBus()
 #: served stale.
 _LAYER_CACHE: list = []
 
+#: Seconds before a lookup dataset that failed to load is tried again. A
+#: share that was not mounted yet, or a database that was briefly down,
+#: recovers on its own instead of staying off for the rest of the session -
+#: without retrying an unreachable server on every keystroke.
+_LAYER_RETRY_SECONDS = 30.0
+
 #: Testing-only override for Settings.autocomplete_layer() - see
 #: set_layer_for_testing().
 _TEST_LAYER_OVERRIDE: list = []
@@ -209,7 +215,7 @@ class Settings:
 
         Use this to distinguish "never saved" from "saved but unreadable":
 
-            from rtl_bidi_editor.rtl_settings import Settings; Settings.dump()
+            from rtl_expression_editor.rtl_settings import Settings; Settings.dump()
         """
         print("=" * 68)
         print("RTL Expression Editor - raw stored settings")
@@ -340,11 +346,13 @@ class Settings:
             layer = QgsProject.instance().mapLayer(legacy_id)
         except Exception:
             layer = None
-        cls._set("ac/layer_id", "")  # consumed either way - never looked at again
         if layer is None:
+            # Not in the project currently open - keep the id, so the
+            # migration can still happen once that project is opened.
             return None
         info = _describe_layer_source(layer)
         cls.set_layer_source(info)
+        cls._set("ac/layer_id", "")  # migrated - never looked at again
         return info
 
     #: Logical name -> settings key for every field selector.
@@ -445,11 +453,17 @@ class Settings:
         if info is None:
             return None
 
+        import time
+
         key = json.dumps(info, sort_keys=True)
         if _LAYER_CACHE and _LAYER_CACHE[0] == key:
-            return _LAYER_CACHE[1]
+            layer, loaded_at = _LAYER_CACHE[1], _LAYER_CACHE[2]
+            if layer is not None:
+                return layer
+            if time.monotonic() - loaded_at < _LAYER_RETRY_SECONDS:
+                return None
         layer, _warning = _load_layer_from_description(info)
-        _LAYER_CACHE[:] = [key, layer]
+        _LAYER_CACHE[:] = [key, layer, time.monotonic()]
         return layer
 
     @classmethod
@@ -523,9 +537,9 @@ class Settings:
 
         warnings: List[str] = []
 
-        plugin_enabled = bool(data.get("plugin_enabled", True))
-        default_read_mode = bool(data.get("default_read_mode", False))
-        ac_enabled = bool(data.get("autocomplete_enabled", False))
+        plugin_enabled = _as_bool(data.get("plugin_enabled", True))
+        default_read_mode = _as_bool(data.get("default_read_mode", False))
+        ac_enabled = _as_bool(data.get("autocomplete_enabled", False))
 
         try:
             max_values = int(data.get("max_suggested_values", 10))
@@ -575,6 +589,23 @@ class Settings:
 
         BUS.changed.emit()
         return warnings
+
+
+def _as_bool(value) -> bool:
+    """A JSON value as a boolean - "false", "0", "no" and "off" are False."""
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "false", "0", "no", "off")
+    return bool(value)
+
+
+def cleanup() -> None:
+    """Release the cached lookup dataset (plugin unload).
+
+    Dropping the standalone layer closes its file handle - on Windows an
+    open handle would keep the dataset locked until QGIS exits.
+    """
+    _LAYER_CACHE.clear()
+    _TEST_LAYER_OVERRIDE.clear()
 
 
 def _describe_layer_source(layer) -> dict:
@@ -632,8 +663,18 @@ def _describe_layer_source(layer) -> dict:
     # is a query string ("Point?crs=...&field=...") and a database URI is
     # "key=value ..." pairs, neither of which is a path to make relative.
     looks_like_path = bool(path_part) and not any(ch in path_part for ch in "?=&")
+    if not looks_like_path and path_part:
+        # "&" and "=" are legal in file names (e.g. a folder named "R&D") -
+        # an existing file is a file, whatever characters its path holds.
+        try:
+            looks_like_path = Path(path_part).is_file()
+        except Exception:
+            pass
     if not looks_like_path:
         info["kind"] = "connection"
+        # The connection string below is stored whole, so no separate
+        # suffix may be appended to it again on load.
+        info["uri_suffix"] = ""
         try:
             from qgis.core import QgsDataSourceUri
 
@@ -1540,7 +1581,15 @@ class SettingsDialog(QDialog):
         self._refresh_layer_label()
 
     def _refresh_layer_label(self) -> None:
-        if self._selected_layer is None:
+        if self._selected_layer is None and self._selected_source_info:
+            name = str(self._selected_source_info.get("name") or "lookup dataset")
+            self.lbl_layer.setText(f"{name} (unavailable)")
+            self.lbl_layer.setStyleSheet("color: #b7791f;")
+            self.lbl_layer.setToolTip(
+                "The configured dataset could not be opened right now. It is "
+                "kept; use Clear to remove it or Browse to pick another."
+            )
+        elif self._selected_layer is None:
             self.lbl_layer.setText("(none selected)")
             self.lbl_layer.setStyleSheet("color: gray;")
             self.lbl_layer.setToolTip("")
@@ -1600,25 +1649,34 @@ class SettingsDialog(QDialog):
         missing: List[str] = []
         layer = Settings.autocomplete_layer()
         self._selected_layer = layer
-        self._selected_source_info = Settings.layer_source() if layer is not None else None
+        # Kept even when the dataset cannot be opened right now (an offline
+        # share, a database that is down): saving the dialog must not erase
+        # a configuration that is only temporarily unreachable.
+        self._selected_source_info = Settings.layer_source()
         self._refresh_layer_label()
+        # Always repopulated - also with None - so selectors never keep a
+        # previous dataset's columns after an import.
+        self._on_layer_changed(layer)
         if layer is not None:
-            self._on_layer_changed(layer)
             try:
                 available = {f.name() for f in layer.fields()}
             except Exception:
                 available = set()
             for key, combo in self.field_combos.items():
                 saved = Settings.field(key)
-                if not saved:
-                    continue
-                if saved in available:
-                    combo.setField(saved)
-                else:
+                if saved and saved not in available:
                     # Field was deleted from the dataset since we saved it.
                     missing.append(f"{key} -> '{saved}'")
+                    saved = ""
+                try:
+                    combo.setField(saved)
+                except Exception:
+                    pass
         elif Settings.has_layer_configured():
-            missing.append("the configured lookup dataset could not be loaded")
+            missing.append(
+                "the configured lookup dataset could not be loaded right now "
+                "(it is kept - saving will not remove it)"
+            )
 
         if missing:
             self.lbl_warning.setText(
@@ -1637,10 +1695,15 @@ class SettingsDialog(QDialog):
 
     def _on_accept(self) -> None:
         """Validate, then persist and broadcast."""
-        if self.chk_ac.isChecked() and self.lbl_layer is not None:
-            if self._selected_layer is None:
-                self._complain("Select the lookup table/dataset that holds the autocomplete definitions.")
-                return
+        if (
+            self.chk_ac.isChecked()
+            and self.lbl_layer is not None
+            and self._selected_layer is None
+            and self._selected_source_info is None
+        ):
+            self._complain("Select the lookup table/dataset that holds the autocomplete definitions.")
+            return
+        if self.chk_ac.isChecked() and self.lbl_layer is not None and self._selected_layer is not None:
             for key, label in (
                 ("field_names", "Field names column"),
                 ("value", "Values column"),
@@ -1680,5 +1743,10 @@ class SettingsDialog(QDialog):
         if self.lbl_layer is None:
             return
         Settings.set_layer_source(self._selected_source_info)
+        if self._selected_layer is None and self._selected_source_info is not None:
+            # Configured but unreachable right now: the column selectors are
+            # empty only because the dataset could not be opened - keep the
+            # saved column mapping as it is.
+            return
         for key, combo in self.field_combos.items():
             Settings.set_field(key, combo.currentField())

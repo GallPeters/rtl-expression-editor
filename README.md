@@ -1,6 +1,6 @@
 # RTL Expression Editor
 
-Fix right-to-left (Hebrew, Arabic, and more) text rendering in QGIS expressions and filters.
+Correct right-to-left (Hebrew, Arabic) text in QGIS expression and filter editors, with smart autocomplete from your own lookup tables.
 
 **Without** RTL Expression Editor:
 
@@ -14,154 +14,80 @@ Fix right-to-left (Hebrew, Arabic, and more) text rendering in QGIS expressions 
 <img width="566" height="449" alt="image" src="https://github.com/user-attachments/assets/48b54cee-95a3-4763-ad69-dce87587e5df" />
 </kbd>
 
-
-
 ## What it does
 
-QGIS's built-in editor doesn't render RTL and mixed text correctly. This plugin opens a companion editor window that does — and keeps both in sync. Edit in either window; the other updates automatically.
+- **Correct RTL text.** QGIS's built-in editor cannot display mixed Hebrew/Arabic and English text properly. The plugin places an editor that can on top of the original one and keeps the two in sync. All QGIS tools keep working: field and function lists, validation, preview and syntax highlighting.
+- **Autocomplete.** Replaces QGIS's own suggestion list. It offers fields, values, functions, variables (including `@map_scale`) and operators, with help text and a function argument helper.
+- **Your own values.** Optionally, use a lookup table so that values come with descriptions.
+- **Read mode.** Shows those descriptions in place of the stored codes. The expression itself is never changed.
 
-## Supported dialogs
-
-- Expression Builder
-- Layer Filter / Query Builder
-- Other dialogs with a QGIS code editor may also work
+Works in the Expression Builder, Field Calculator, Select by Expression and Layer Filter (Query Builder).
 
 ## Installation
 
-1. Install from the QGIS Plugin Repository.
-2. Restart QGIS.
-3. Enable **RTL Companion Editor** in Plugin Manager.
+1. Install **RTL Expression Editor** from the QGIS Plugin Repository (*Plugins → Manage and Install Plugins*).
+2. Open any expression or filter dialog. The editor appears automatically.
 
-### Installing from source instead
+Settings are under *Plugins → RTL Text Editor → Settings…*.
 
-Everything QGIS needs to load the plugin lives in `src/` - `__init__.py`,
-`metadata.txt`, `LICENSE`, `icon.png` and every `rtl_*.py` module, all as
-direct siblings of each other. That's the important part: QGIS's plugin
-loader requires `__init__.py` to sit next to `rtl_editor.py` and friends, not
-one directory above them.
+## Autocomplete
 
-So install by copying (or zipping) `src/`'s **contents** - not the `src`
-folder itself - into a folder named however you like inside your QGIS
-profile's plugin directory, e.g.:
+| Type             | Shows                                  |
+| ---------------- | -------------------------------------- |
+| `"`              | field names                            |
+| `'` after a field | values of that field                  |
+| `@`              | variables                              |
+| a word           | fields, functions, variables, operators |
 
-```
-<QGIS profile>/python/plugins/rtl_expression_editor/__init__.py
-<QGIS profile>/python/plugins/rtl_expression_editor/metadata.txt
-<QGIS profile>/python/plugins/rtl_expression_editor/rtl_editor.py
-...
-```
+Press **Ctrl+Space** to open the list at any time (**Ctrl+J** also works if your keyboard layout takes Ctrl+Space). Use the arrow keys to move through the list, **Enter** or **Tab** to accept and **Esc** to close.
 
-Copying the repository root (or `src/` as a nested subfolder) instead
-produces `ModuleNotFoundError: No module named
-'<plugin folder>.rtl_editor'` - `__init__.py`'s `from .rtl_editor import ...`
-only resolves when the two are direct siblings. `releases/` holds the actual
-`src/`-contents-only zips built for past versions, as a reference for the
-expected layout.
+Without a lookup table, values come from the layer's own data. The number of values is set in Settings.
 
-#### Installing with the tests too
+## Using a lookup table
 
-The `tests/` folder at the repository root is a sibling of `src/`, not part
-of it, precisely so a normal install (above) never pulls it in. To install
-*with* it instead - so the Settings dialog's **Run Tests** button shows up -
-copy `tests/` in as well, nested **inside** the same plugin folder, alongside
-the modules it just tested:
+A lookup table is any table QGIS can open (GeoPackage, CSV, PostGIS…) with one row per allowed value. Choose it in **Settings → Custom Autocomplete → Browse…**. It is read directly from its source and never added to your project.
 
-```
-<QGIS profile>/python/plugins/rtl_expression_editor/__init__.py
-<QGIS profile>/python/plugins/rtl_expression_editor/rtl_editor.py
-...
-<QGIS profile>/python/plugins/rtl_expression_editor/tests/__init__.py
-<QGIS profile>/python/plugins/rtl_expression_editor/tests/run_all.py
-...
-```
+Example, for a `roads` layer with `type` and `subtype` fields:
 
-The tests locate the plugin's modules by looking for `rtl_editor.py` next to
-them rather than assuming any particular folder name, so this works
-regardless of what the plugin folder itself is called.
+| table | field  | value | description | group |
+| ----- | ------ | ----- | ----------- | ----- |
+| roads | type   | 1     | Highway     |       |
+| roads | type   | 2     | Street      |       |
+| roads | subtype | 11   | Toll road   | 1     |
+| roads | subtype | 21   | Main street | 2     |
 
-#### Sharing a pre-configured autocomplete source
+Map its columns in Settings:
 
-The Settings dialog's **Export Settings** / **Import Settings** buttons save
-and load the whole configuration - including the autocomplete lookup dataset
-and its column mapping - as a JSON file. The lookup dataset itself is picked
-from the QGIS Browser and read directly from its own source: it is never
-added to the project's Layers panel and never saved into the project file.
-To hand a ready-made setup to colleagues:
+- **Field names column** and **Values column**: required.
+- **Value description column**: the label shown next to each value and in Read mode.
+- **Table names column**: limits rows to the layer being edited (matched by its source table name).
+- **Group codes / Group descriptions columns**: group the suggestions. They also let Read mode choose the right description when one code has different meanings in different groups. For example, in `"type" = 1 AND "subtype" = 11` the subtype is read in group `1`.
+- **Alternative value description**, **Table description** and **Field description** columns are optional extra labels.
 
-1. Configure the plugin normally, pointing the lookup dataset at a data file
-   copied *inside* the plugin's own install folder (e.g.
-   `<plugin folder>/data/lookup.gpkg`).
-2. Click **Export Settings**. When the dataset's file lives inside that
-   same folder, the exported file also records its path *relative* to it,
-   not the absolute path on your own machine.
-3. Zip up the plugin folder, with the data file and the exported JSON file
-   both included inside it.
-4. A colleague installs the zip, then opens **Settings** and clicks
-   **Import Settings**, picking the JSON file bundled inside the plugin
-   folder. Its lookup dataset is located and connected automatically from
-   the relative path recorded in the file, wherever their profile happens
-   to install the plugin.
+## Read mode
 
-If the dataset cannot be resolved, every other setting is still applied and
-the reason is reported clearly: **not found** (no file exists at the
-recorded path - it was not actually bundled, or ended up somewhere else) or
-**not accessible** (a file was found but could not be opened - permissions
-or an unsupported format - or a database connection failed, most often
-because credentials are missing: usernames and passwords are deliberately
-never written into an exported file, so each colleague still needs their
-own valid login to that database).
+With value descriptions configured, a switch appears in the editor's bottom-left corner:
 
-A lookup dataset that lives outside the plugin folder (a database connection,
-or a file elsewhere on disk) is still exported for convenience, but only as
-an absolute path - portable only back to the same machine, not to a
-colleague's.
+- **Edit**: the normal expression.
+- **Read**: codes are replaced by their descriptions (read-only).
+- **Alternative**: the alternative descriptions, if configured.
 
-## Usage
+## Sharing settings
 
-1. Open a supported dialog (e.g. `Layer → Filter / Query Builder`).
-2. A floating RTL editor window appears automatically.
-3. Edit text in either window — they stay synchronized.
-4. Use the original QGIS dialog buttons to apply your result.
+**Export Settings…** saves the whole configuration, including the lookup table, to a JSON file. **Import Settings…** loads it.
+
+To share a ready-made setup, put the lookup file inside the plugin folder before exporting. Its path is then stored relative to the plugin folder and works on any machine. Database passwords are never exported, so each user needs their own login.
+
+## Installing from source
+
+Copy the **contents** of `src/` (not the folder itself) into a folder in your QGIS profile's plugin directory, e.g. `<profile>/python/plugins/rtl_expression_editor/`. `releases/` holds ready-made zips.
 
 ## Running the tests
 
-The `tests/` folder covers the editor and its sync with the core editor,
-autocomplete (with and without a configured lookup table), the function
-helper, read mode, occurrence highlighting, the replace-bar shortcuts and the
-plugin's own load/unload cycle. It's never run automatically - these are
-developer/QA tests, run on demand - and only ships when you choose to include
-it (see "Installing with the tests too" above); a normal packaged release is
-just `src/`'s contents.
-
-`tests/` locates the plugin's own modules by looking for `rtl_editor.py`
-next to it rather than assuming a folder name, so running it works the same
-way in either place it can legitimately be:
-
-* at the repository root, a sibling of `src/` (this repository's own
-  development layout);
-* nested inside an installed plugin folder, alongside `rtl_editor.py` (an
-  "installed with tests" copy).
-
-From the QGIS Python Console, with either of those somewhere on disk:
-
-```python
-import sys
-sys.path.insert(0, r"<path to the folder CONTAINING tests/>")
-from tests import run_all
-run_all.main()
-```
-
-From a shell, using QGIS's own Python interpreter (the exact launcher name
-depends on the platform/QGIS build, e.g. `python-qgis-qt6.bat` on Windows,
-`python3` inside `qgis --code` on Linux), run from that same folder:
+Copy `tests/` next to the plugin files (or keep the repository layout) and run, with QGIS's Python:
 
 ```
-python3 -m tests.run_all
+python -m tests.run_all
 ```
 
-The plugin's own Settings dialog also gets a **Run Tests** button under a
-"Developer" section whenever `tests/` is found either nested inside the
-running plugin's own directory or as a sibling of it one level up - covering
-both layouts above automatically - and shows a pass/fail summary plus the
-full log. It's simply absent for a normal end-user install, which has no
-`tests/` anywhere nearby.
+When `tests/` is present, Settings also shows a **Run Tests** button.
